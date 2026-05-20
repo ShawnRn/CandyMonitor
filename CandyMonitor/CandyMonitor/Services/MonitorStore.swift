@@ -288,6 +288,13 @@ final class MonitorStore {
         loadSessions()
     }
 
+    func renameSession(_ session: ChargingSession, title: String) {
+        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        session.customTitle = trimmedTitle.isEmpty ? nil : trimmedTitle
+        try? modelContext?.save()
+        loadSessions()
+    }
+
     func exportSelectedSessionCSV() {
         guard let session = selectedSession else { return }
         exportSessionCSV(session)
@@ -301,7 +308,7 @@ final class MonitorStore {
         let samples = samples(for: session)
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.commaSeparatedText]
-        panel.nameFieldStringValue = "\(session.deviceName)-\(session.portName)-full-charge.csv"
+        panel.nameFieldStringValue = "\(session.displayTitle)-full-charge.csv"
         panel.canCreateDirectories = true
 
         if panel.runModal() == .OK, let url = panel.url {

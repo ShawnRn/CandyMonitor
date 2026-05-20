@@ -1691,26 +1691,28 @@ private struct SessionsView: View {
         HStack(spacing: 0) {
             VStack(spacing: 0) {
                 HeaderBar(title: "充电记录", subtitle: "\(store.sessions.count) 条会话")
-                List(selection: Binding(
-                    get: { store.selectedSession?.id },
-                    set: { id in
-                        if let id, let session = store.sessions.first(where: { $0.id == id }) {
-                            store.selectSession(session)
+                ScrollView {
+                    LazyVStack(spacing: 8) {
+                    ForEach(store.sessions, id: \.id) { session in
+                            Button {
+                                store.selectSession(session)
+                            } label: {
+                                SessionRow(
+                                    session: session,
+                                    isSelected: store.selectedSession?.id == session.id
+                                )
+                            }
+                            .buttonStyle(.plain)
                         }
                     }
-                )) {
-                    ForEach(store.sessions, id: \.id) { session in
-                        SessionRow(session: session)
-                            .tag(session.id)
-                            .contentShape(Rectangle())
-                            .onTapGesture {
-                                store.selectSession(session)
-                            }
-                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 12)
                 }
-                .listStyle(.sidebar)
+                .scrollContentBackground(.hidden)
+                .background(Color(nsColor: .controlBackgroundColor))
             }
             .frame(width: 310)
+            .background(Color(nsColor: .controlBackgroundColor))
 
             Divider()
 
@@ -1721,11 +1723,12 @@ private struct SessionsView: View {
 
 private struct SessionRow: View {
     let session: ChargingSession
+    let isSelected: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack {
-                Text("\(session.deviceName) · \(session.portName)")
+                Text(session.displayTitle)
                     .font(.subheadline.weight(.semibold))
                     .lineLimit(1)
                 Spacer()
@@ -1742,17 +1745,27 @@ private struct SessionRow: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
-        .padding(.vertical, 6)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(isSelected ? Color.secondary.opacity(0.16) : Color.clear, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }
 
 private struct SessionDetailView: View {
     let store: MonitorStore
+    @State private var renamingSession: ChargingSession?
 
     var body: some View {
         VStack(spacing: 0) {
             if let session = store.selectedSession {
-                HeaderBar(title: "\(session.deviceName) · \(session.portName)", subtitle: sessionSubtitle(session)) {
+                HeaderBar(title: session.displayTitle, subtitle: sessionSubtitle(session)) {
+                    Button {
+                        renamingSession = session
+                    } label: {
+                        Label("重命名", systemImage: "pencil")
+                    }
                     if session.endedAt == nil {
                         Button("结束记录") {
                             store.stopSession(session)
@@ -1783,6 +1796,9 @@ private struct SessionDetailView: View {
                 ContentUnavailableView("暂无充电记录", systemImage: "chart.xyaxis.line", description: Text("连接设备并开始充电后，会自动生成完整曲线。"))
             }
         }
+        .sheet(item: $renamingSession) { session in
+            RenameSessionSheet(store: store, session: session)
+        }
     }
 
     private func sessionSubtitle(_ session: ChargingSession) -> String {
@@ -1797,6 +1813,50 @@ private struct SessionDetailView: View {
         let minutes = seconds / 60
         if minutes < 60 { return "\(minutes)m" }
         return "\(minutes / 60)h \(minutes % 60)m"
+    }
+}
+
+private struct RenameSessionSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let store: MonitorStore
+    let session: ChargingSession
+    @State private var title: String
+
+    init(store: MonitorStore, session: ChargingSession) {
+        self.store = store
+        self.session = session
+        _title = State(initialValue: session.displayTitle)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("重命名充电记录")
+                    .font(.title3.weight(.semibold))
+                Text("\(session.startedAt.formatted(date: .abbreviated, time: .shortened)) · \(session.portName)")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            TextField("记录名称", text: $title)
+                .textFieldStyle(.roundedBorder)
+
+            HStack {
+                Spacer()
+                Button("取消") {
+                    dismiss()
+                }
+                Button("保存") {
+                    store.renameSession(session, title: title)
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(24)
+        .frame(width: 420)
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 }
 
