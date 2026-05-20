@@ -46,9 +46,9 @@ releases/CandyMonitor_<version>_x86_64.dmg
 1. Launch CandyMonitor.
 2. Click the add button in the toolbar.
 3. Enter a device name and MCP SSE URL.
-4. CandyMonitor validates the endpoint before saving it to the macOS keychain.
+4. CandyMonitor validates the endpoint before saving it to the local encrypted app store.
 
-MCP URLs are stored in Keychain under the `CandyMonitor.MCPURL` service.
+MCP URLs are stored under `~/Library/Application Support/CandyMonitor/mcp-vault/` as AES-GCM encrypted, lightly obfuscated files. They are not written to SwiftData or the macOS keychain.
 
 ## Release Workflow
 
@@ -73,5 +73,4 @@ This project follows the same high-level flow as MotrixMac:
 
 - `connected` means a device/load is detected on a port.
 - `status_bitmask` from MCP means a port is currently charging.
-- Port switch state requires an `enable` field from the device status stream. If the MCP endpoint does not expose it, CandyMonitor shows the state as unknown and offers explicit open/close actions.
-
+- Port switch state requires an `enable` field from the device status stream. If the MCP endpoint does not expose it, CandyMonitor hides port switch controls and only shows live telemetry.

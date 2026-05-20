@@ -482,6 +482,7 @@ struct ChartSamplePoint: Identifiable, Hashable {
     let timestamp: Date
     let portIndex: Int
     let portName: String
+    let connected: Bool
     let powerW: Double
     let voltageV: Double
     let currentA: Double

@@ -289,7 +289,13 @@ private struct NativeMonitorView: View {
     }
 
     private var filteredSamples: [ChartSamplePoint] {
-        store.recentSamples.filter { effectivePortIDs.contains($0.portIndex) }
+        store.recentSamples
+            .filter { effectivePortIDs.contains($0.portIndex) }
+            .sorted { $0.timestamp < $1.timestamp }
+    }
+
+    private var lineSamples: [ChartLinePoint] {
+        segmentedChartPoints(from: filteredSamples)
     }
 
     var body: some View {
@@ -397,22 +403,23 @@ private struct NativeMonitorView: View {
             portFilterBar
 
             ZStack(alignment: .topLeading) {
-                Chart(filteredSamples) { sample in
+                Chart(lineSamples) { point in
                     LineMark(
-                        x: .value("Time", sample.timestamp),
-                        y: .value(metric.title, metric.displayValue(sample))
+                        x: .value("Time", point.sample.timestamp),
+                        y: .value(metric.title, metric.displayValue(point.sample)),
+                        series: .value("Segment", point.seriesID)
                     )
-                    .foregroundStyle(by: .value("Port", sample.portName))
+                    .foregroundStyle(by: .value("Port", point.sample.portName))
                     .lineStyle(StrokeStyle(lineWidth: 2.5, lineCap: .round, lineJoin: .round))
-                    .interpolationMethod(.catmullRom)
+                    .interpolationMethod(.linear)
 
-                    if hoveredLiveSample?.id == sample.id {
-                        RuleMark(x: .value("Time", sample.timestamp))
+                    if hoveredLiveSample?.id == point.sample.id {
+                        RuleMark(x: .value("Time", point.sample.timestamp))
                             .foregroundStyle(CandyTheme.syrup.opacity(0.42))
                             .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 4]))
                         PointMark(
-                            x: .value("Time", sample.timestamp),
-                            y: .value(metric.title, metric.displayValue(sample))
+                            x: .value("Time", point.sample.timestamp),
+                            y: .value(metric.title, metric.displayValue(point.sample))
                         )
                         .foregroundStyle(CandyTheme.syrup)
                         .symbolSize(90)
@@ -948,7 +955,13 @@ private struct MonitorView: View {
     }
 
     private var filteredSamples: [ChartSamplePoint] {
-        store.recentSamples.filter { effectivePortIDs.contains($0.portIndex) }
+        store.recentSamples
+            .filter { effectivePortIDs.contains($0.portIndex) }
+            .sorted { $0.timestamp < $1.timestamp }
+    }
+
+    private var lineSamples: [ChartLinePoint] {
+        segmentedChartPoints(from: filteredSamples)
     }
 
     var body: some View {
@@ -1030,22 +1043,23 @@ private struct MonitorView: View {
             }
 
             ZStack(alignment: .topLeading) {
-                Chart(filteredSamples) { sample in
+                Chart(lineSamples) { point in
                     LineMark(
-                        x: .value("Time", sample.timestamp),
-                        y: .value(metric.title, metric.displayValue(sample))
+                        x: .value("Time", point.sample.timestamp),
+                        y: .value(metric.title, metric.displayValue(point.sample)),
+                        series: .value("Segment", point.seriesID)
                     )
-                    .foregroundStyle(by: .value("Port", sample.portName))
+                    .foregroundStyle(by: .value("Port", point.sample.portName))
                     .lineStyle(StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
                     .interpolationMethod(.linear)
 
-                    if hoveredLiveSample?.id == sample.id {
-                        RuleMark(x: .value("Time", sample.timestamp))
+                    if hoveredLiveSample?.id == point.sample.id {
+                        RuleMark(x: .value("Time", point.sample.timestamp))
                             .foregroundStyle(CandyTheme.berry.opacity(0.45))
                             .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 4]))
                         PointMark(
-                            x: .value("Time", sample.timestamp),
-                            y: .value(metric.title, metric.displayValue(sample))
+                            x: .value("Time", point.sample.timestamp),
+                            y: .value(metric.title, metric.displayValue(point.sample))
                         )
                         .foregroundStyle(CandyTheme.berry)
                         .symbolSize(90)
@@ -1247,6 +1261,38 @@ private enum ChartMetric: String, CaseIterable, Identifiable {
     private static let idleCurrentDeadband = 0.05
 }
 
+private struct ChartLinePoint: Identifiable {
+    let id: String
+    let sample: ChartSamplePoint
+    let seriesID: String
+}
+
+private func segmentedChartPoints(from samples: [ChartSamplePoint]) -> [ChartLinePoint] {
+    let grouped = Dictionary(grouping: samples) { $0.portIndex }
+    var points: [ChartLinePoint] = []
+
+    for portIndex in grouped.keys.sorted() {
+        let sortedSamples = (grouped[portIndex] ?? []).sorted { $0.timestamp < $1.timestamp }
+        var segment = 0
+        var previous: ChartSamplePoint?
+
+        for sample in sortedSamples {
+            if let previous,
+               sample.timestamp.timeIntervalSince(previous.timestamp) > 4 || sample.connected != previous.connected {
+                segment += 1
+            }
+            points.append(ChartLinePoint(
+                id: "\(sample.id.uuidString)-\(segment)",
+                sample: sample,
+                seriesID: "\(sample.portName)-\(segment)"
+            ))
+            previous = sample
+        }
+    }
+
+    return points
+}
+
 private struct FilterChip: View {
     let title: String
     let isSelected: Bool
@@ -1427,7 +1473,7 @@ private struct PortDetailSheet: View {
 
                     detailCard {
                         HStack {
-                            Label("充电口开关", systemImage: "shippingbox")
+                            Label(port.portSwitchState == nil ? "实时端口数据" : "充电口开关", systemImage: port.portSwitchState == nil ? "waveform.path.ecg" : "shippingbox")
                                 .font(.title3.weight(.semibold))
                                 .foregroundStyle(CandyTheme.caramel)
                             Spacer()
@@ -1438,46 +1484,18 @@ private struct PortDetailSheet: View {
                                     Label(portSwitchState ? "关闭" : "开启", systemImage: portSwitchState ? "power.circle" : "power.circle.fill")
                                 }
                                 .buttonStyle(SoftButtonStyle(prominent: portSwitchState == false, destructive: portSwitchState))
-                            } else if port.connected {
-                                HStack(spacing: 8) {
-                                    Label("已接入", systemImage: "checkmark.circle.fill")
-                                        .font(.caption.weight(.semibold))
-                                        .foregroundStyle(.green)
-                                        .padding(.horizontal, 10)
-                                        .padding(.vertical, 7)
-                                        .background(.green.opacity(0.12), in: Capsule())
-
-                                    Button {
-                                        pendingPowerState = false
-                                    } label: {
-                                        Label("关闭端口", systemImage: "power.circle")
-                                    }
-                                    .buttonStyle(SoftButtonStyle(destructive: true))
-                                }
                             } else {
-                                HStack(spacing: 8) {
-                                    Button {
-                                        pendingPowerState = true
-                                    } label: {
-                                        Label("开启端口", systemImage: "power.circle.fill")
-                                    }
-                                    .buttonStyle(SoftButtonStyle())
-
-                                    Button {
-                                        pendingPowerState = false
-                                    } label: {
-                                        Label("关闭端口", systemImage: "power.circle")
-                                    }
-                                    .buttonStyle(SoftButtonStyle(destructive: true))
-                                }
+                                StatusPill(text: "开关状态未上报", color: .secondary)
                             }
                         }
 
-                        Text(portSwitchHelpText)
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
+                        if let portSwitchHelpText {
+                            Text(portSwitchHelpText)
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
 
-                        Divider()
+                            Divider()
+                        }
 
                         LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 3), spacing: 18) {
                             PortDetailMetric(title: "电压(V)", value: String(format: "%.2f", Double(port.detail?.voutMV ?? 0) / 1000))
@@ -1526,15 +1544,9 @@ private struct PortDetailSheet: View {
         port.port.connectorType.uppercased().contains("C") ? "USB-\(port.port.displayName)" : "USB-A"
     }
 
-    private var portSwitchHelpText: String {
-        let prefix: String
-        if let portSwitchState = port.portSwitchState {
-            prefix = portSwitchState ? "当前充电口已开启。" : "当前充电口已关闭。"
-        } else if port.connected {
-            prefix = "当前端口正在供电，MCP 未单独上报开关位。"
-        } else {
-            prefix = "当前 MCP 未上报充电口开关状态。"
-        }
+    private var portSwitchHelpText: String? {
+        guard let portSwitchState = port.portSwitchState else { return nil }
+        let prefix = portSwitchState ? "当前充电口已开启。" : "当前充电口已关闭。"
         return "\(prefix)开则充电口可用，关则充电口不可用。执行后 CandyMonitor 会重新读取设备状态。"
     }
 
@@ -1704,6 +1716,8 @@ private struct FlowChips: View {
 
 private struct SessionsView: View {
     let store: MonitorStore
+    @State private var selectedSessionIDs = Set<UUID>()
+    @State private var isConfirmingBulkDelete = false
 
     var body: some View {
         Group {
@@ -1721,19 +1735,47 @@ private struct SessionsView: View {
             } else {
                 HStack(spacing: 0) {
                     VStack(spacing: 0) {
-                        HeaderBar(title: "充电记录", subtitle: "\(store.sessions.count) 条会话")
+                        HeaderBar(title: "充电记录", subtitle: "\(store.sessions.count) 条会话") {
+                            HStack(spacing: 8) {
+                                if selectedSessionIDs.isEmpty == false {
+                                    Button("取消选择") {
+                                        selectedSessionIDs.removeAll()
+                                    }
+                                    .buttonStyle(SoftButtonStyle())
+
+                                    Button(role: .destructive) {
+                                        isConfirmingBulkDelete = true
+                                    } label: {
+                                        Label("删除 \(selectedSessionIDs.count)", systemImage: "trash")
+                                    }
+                                    .buttonStyle(SoftButtonStyle(destructive: true))
+                                }
+                            }
+                        }
                         ScrollView {
                             LazyVStack(spacing: 8) {
                                 ForEach(store.sessions, id: \.id) { session in
-                                    Button {
-                                        store.selectSession(session)
-                                    } label: {
-                                        SessionRow(
-                                            session: session,
-                                            isSelected: store.selectedSession?.id == session.id
-                                        )
+                                    HStack(spacing: 8) {
+                                        Button {
+                                            toggleSelection(for: session)
+                                        } label: {
+                                            Image(systemName: selectedSessionIDs.contains(session.id) ? "checkmark.circle.fill" : "circle")
+                                                .font(.system(size: 17, weight: .semibold))
+                                                .foregroundStyle(selectedSessionIDs.contains(session.id) ? CandyTheme.syrup : .secondary)
+                                                .frame(width: 22, height: 22)
+                                        }
+                                        .buttonStyle(.plain)
+
+                                        Button {
+                                            store.selectSession(session)
+                                        } label: {
+                                            SessionRow(
+                                                session: session,
+                                                isSelected: store.selectedSession?.id == session.id
+                                            )
+                                        }
+                                        .buttonStyle(.plain)
                                     }
-                                    .buttonStyle(.plain)
                                 }
                             }
                             .padding(.horizontal, 10)
@@ -1750,6 +1792,26 @@ private struct SessionsView: View {
                     SessionDetailView(store: store)
                 }
             }
+        }
+        .onChange(of: store.sessions.map(\.id)) { _, ids in
+            selectedSessionIDs = selectedSessionIDs.intersection(Set(ids))
+        }
+        .alert("删除选中的充电记录？", isPresented: $isConfirmingBulkDelete) {
+            Button("删除", role: .destructive) {
+                store.deleteSessions(ids: selectedSessionIDs)
+                selectedSessionIDs.removeAll()
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("会同时删除这些记录下的采样点，操作不可撤销。")
+        }
+    }
+
+    private func toggleSelection(for session: ChargingSession) {
+        if selectedSessionIDs.contains(session.id) {
+            selectedSessionIDs.remove(session.id)
+        } else {
+            selectedSessionIDs.insert(session.id)
         }
     }
 }
@@ -2132,13 +2194,19 @@ private struct ControlConsoleView: View {
                             .font(.callout.monospacedDigit())
                             .foregroundStyle(.secondary)
                         Spacer()
-                        HStack(spacing: 6) {
-                            Button("开启") { pending = .port(port.port.index, true) }
-                                .buttonStyle(SoftButtonStyle())
-                                .disabled(port.portSwitchState == true)
-                            Button("关闭", role: .destructive) { pending = .port(port.port.index, false) }
-                                .buttonStyle(SoftButtonStyle(destructive: true))
-                                .disabled(port.portSwitchState == false)
+                        if let portSwitchState = port.portSwitchState {
+                            HStack(spacing: 6) {
+                                Button("开启") { pending = .port(port.port.index, true) }
+                                    .buttonStyle(SoftButtonStyle())
+                                    .disabled(portSwitchState == true)
+                                Button("关闭", role: .destructive) { pending = .port(port.port.index, false) }
+                                    .buttonStyle(SoftButtonStyle(destructive: true))
+                                    .disabled(portSwitchState == false)
+                            }
+                        } else {
+                            Text("无法控制")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
                         }
                     }
                     .padding(.horizontal, 12)
@@ -2348,13 +2416,19 @@ private struct SettingsView: View {
                         HStack(alignment: .top, spacing: 16) {
                             SettingsCard(title: "设备身份", icon: "powerplug.portrait", subtitle: "这里决定侧栏里看到的名字；保存时会重新连接 MCP 并读取机器信息。") {
                                 LabeledContent("显示名称") {
-                                    TextField("例如 Shawn’s Mirror", text: $editingName)
-                                        .textFieldStyle(.roundedBorder)
-                                        .frame(maxWidth: 360)
-                                        .focused($focusedField, equals: .name)
-                                        .onSubmit {
+                                    HStack(spacing: 8) {
+                                        TextField("例如 Shawn’s Mirror", text: $editingName)
+                                            .textFieldStyle(.roundedBorder)
+                                            .frame(maxWidth: 360)
+                                            .focused($focusedField, equals: .name)
+                                            .onSubmit {
+                                                commitName(device)
+                                            }
+                                        Button("保存") {
                                             commitName(device)
                                         }
+                                        .buttonStyle(SoftButtonStyle(prominent: editingName.trimmingCharacters(in: .whitespacesAndNewlines) != device.name))
+                                    }
                                 }
                                 LabeledContent("产品序列") {
                                     Text(device.psn ?? "尚未读取")
@@ -2366,7 +2440,7 @@ private struct SettingsView: View {
                                 }
                             }
 
-                            SettingsCard(title: "MCP 连接", icon: "network", subtitle: "CandyMonitor 通过这个 SSE 地址连接小电拼；地址存入 Keychain，不写进数据库明文。") {
+                            SettingsCard(title: "MCP 连接", icon: "network", subtitle: "CandyMonitor 通过这个 SSE 地址连接小电拼；地址会加密保存在本机应用目录，不再触发钥匙串授权。") {
                                 TextField("https://.../sse", text: $editingURL)
                                     .textFieldStyle(.roundedBorder)
                                 HStack {

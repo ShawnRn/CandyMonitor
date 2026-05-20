@@ -263,6 +263,7 @@ final class MonitorStore {
                 timestamp: sample.timestamp,
                 portIndex: sample.portIndex,
                 portName: sample.portName,
+                connected: sample.connected,
                 powerW: sample.powerW,
                 voltageV: Double(sample.voltageMV) / 1000,
                 currentA: Double(sample.currentMA) / 1000,
@@ -300,31 +301,46 @@ final class MonitorStore {
     }
 
     func deleteSession(_ session: ChargingSession) {
-        guard let modelContext else { return }
-        let sessionID = session.id
-        let targetSession = fetchSession(id: sessionID) ?? session
-        let descriptor = FetchDescriptor<PortSample>(
-            predicate: #Predicate { sample in
-                sample.sessionID == sessionID
+        deleteSessions(ids: [session.id])
+    }
+
+    func deleteSessions(ids: Set<UUID>) {
+        guard let modelContext, ids.isEmpty == false else { return }
+        var deletedIDs = Set<UUID>()
+
+        for sessionID in ids {
+            guard let targetSession = fetchSession(id: sessionID) else { continue }
+            let descriptor = FetchDescriptor<PortSample>(
+                predicate: #Predicate { sample in
+                    sample.sessionID == sessionID
+                }
+            )
+            let samples = (try? modelContext.fetch(descriptor)) ?? []
+            for sample in samples {
+                modelContext.delete(sample)
             }
-        )
-        let samples = (try? modelContext.fetch(descriptor)) ?? []
-        for sample in samples {
-            modelContext.delete(sample)
+
+            activeSessions.removeValue(forKey: sessionKey(deviceID: targetSession.deviceID, port: targetSession.portIndex))
+            knownProtocols[sessionID] = nil
+            if lowPowerSessionPrompt?.id == sessionID {
+                lowPowerSessionPrompt = nil
+            }
+            modelContext.delete(targetSession)
+            deletedIDs.insert(sessionID)
         }
 
-        activeSessions.removeValue(forKey: sessionKey(deviceID: targetSession.deviceID, port: targetSession.portIndex))
-        knownProtocols[sessionID] = nil
-        if selectedSession?.id == sessionID {
-            selectedSession = sessions.first { $0.id != sessionID }
+        if let selected = selectedSession, deletedIDs.contains(selected.id) {
+            selectedSession = nil
+            selectedSessionSamples = []
         }
-        if lowPowerSessionPrompt?.id == sessionID {
-            lowPowerSessionPrompt = nil
-        }
-        modelContext.delete(targetSession)
-        logger.info("session_deleted port=\(targetSession.portIndex, privacy: .public)")
+
+        logger.info("sessions_deleted count=\(deletedIDs.count, privacy: .public)")
         try? modelContext.save()
         loadSessions()
+        if selectedSession == nil {
+            selectedSession = sessions.first
+            loadSelectedSessionSamples()
+        }
     }
 
     func renameSession(_ session: ChargingSession, title: String) {
@@ -567,6 +583,7 @@ final class MonitorStore {
                 timestamp: now,
                 portIndex: port.port.index,
                 portName: port.port.name,
+                connected: port.connected,
                 powerW: detail.powerW,
                 voltageV: Double(detail.voutMV) / 1000,
                 currentA: Double(detail.ioutMA) / 1000,

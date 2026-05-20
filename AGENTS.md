@@ -5,7 +5,7 @@
 - `CandyMonitor/CandyMonitor.xcodeproj` is the Xcode project.
 - `CandyMonitor/CandyMonitor/ContentView.swift` currently contains the main SwiftUI surface, including sidebar, monitor dashboard, port detail sheet, sessions, control console, and settings.
 - `CandyMonitor/CandyMonitor/Models/DomainModels.swift` contains SwiftData models, MCP response models, and UI view-state structs.
-- `CandyMonitor/CandyMonitor/Services/` contains MCP networking, persistence orchestration, CSV export, and keychain access.
+- `CandyMonitor/CandyMonitor/Services/` contains MCP networking, persistence orchestration, CSV export, and local encrypted credential storage.
 - `CandyMonitor/CandyMonitor/Assets.xcassets/Mirror4C1ADevice.imageset/` contains the trimmed product render used in the topology panel.
 
 ## Build And Run
@@ -37,6 +37,7 @@ The release script creates separate DMGs for `arm64` and `x86_64` under `release
 - `ChargingStatus.status_bitmask` means ports currently charging, not whether a port is enabled.
 - The mini-program uses `portsStatus[portId].enable` for the actual port switch. The current MCP wrapper does not expose that field. If MCP starts returning `enable` in `get_port_details`, `PortViewState.portSwitchState` will use it automatically.
 - Do not infer port switch state from voltage, power, `connected`, or `status_bitmask`; Type-C ports can be enabled while idle and still show tiny VBUS readings.
+- If `enable` is absent, keep port switch controls hidden in the UI instead of offering speculative open/close actions.
 
 ## UI Conventions
 
