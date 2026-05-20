@@ -395,9 +395,7 @@ struct PortDetail: Codable, Identifiable, Hashable, Sendable {
     }
 
     var hasNegotiatedLoad: Bool {
-        connected ||
-        powerW >= 0.05 ||
-        LocalizedTelemetry.protocolLabel(fcProtocol) != "未充电"
+        connected
     }
 }
 
@@ -476,7 +474,7 @@ struct PortViewState: Identifiable, Hashable {
         guard connected else { return "未接入" }
         return powerW > 0.5 ? "正在供电" : "已接入"
     }
-    var connected: Bool { charging || detail?.hasNegotiatedLoad == true }
+    var connected: Bool { charging || detail?.connected == true }
 }
 
 struct ChartSamplePoint: Identifiable, Hashable {

@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import Observation
+import os
 import SwiftData
 import UniformTypeIdentifiers
 
@@ -43,9 +44,10 @@ final class MonitorStore {
     @ObservationIgnored private var modelContext: ModelContext?
     @ObservationIgnored private var clients: [UUID: MCPClient] = [:]
     @ObservationIgnored private var pollingTask: Task<Void, Never>?
-    @ObservationIgnored private var activeSessions: [String: ChargingSession] = [:]
+    @ObservationIgnored private var activeSessions: [String: UUID] = [:]
     @ObservationIgnored private var knownProtocols: [UUID: Set<String>] = [:]
     @ObservationIgnored private let selectedDeviceDefaultsKey = "CandyMonitor.SelectedDeviceID"
+    @ObservationIgnored private let logger = Logger(subsystem: "com.shawnrain.CandyMonitor", category: "MonitorStore")
 
     var selectedDevice: MirrorDevice? {
         guard let selectedDeviceID else { return nil }
@@ -98,10 +100,13 @@ final class MonitorStore {
         guard let modelContext else { return }
         let descriptor = FetchDescriptor<ChargingSession>(sortBy: [SortDescriptor(\.startedAt, order: .reverse)])
         sessions = (try? modelContext.fetch(descriptor)) ?? []
-        if let selectedSession, sessions.contains(where: { $0.id == selectedSession.id }) == false {
-            self.selectedSession = sessions.first
-        } else if selectedSession == nil {
+        if let selectedSession {
+            self.selectedSession = sessions.first { $0.id == selectedSession.id } ?? sessions.first
+        } else {
             selectedSession = sessions.first
+        }
+        if let lowPowerSessionPrompt {
+            self.lowPowerSessionPrompt = sessions.first { $0.id == lowPowerSessionPrompt.id }
         }
         restoreActiveSessions()
         loadSelectedSessionSamples()
@@ -179,6 +184,14 @@ final class MonitorStore {
         restartPollingIfNeeded()
     }
 
+    func renameDevice(_ device: MirrorDevice, name: String) {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmedName.isEmpty == false, device.name != trimmedName else { return }
+        device.name = trimmedName
+        try? modelContext?.save()
+        loadDevices()
+    }
+
     func mcpURL(for device: MirrorDevice) -> String {
         (try? KeychainStore.loadMCPURL(account: device.keychainAccount)) ?? ""
     }
@@ -216,7 +229,7 @@ final class MonitorStore {
     private func restoreActiveSessions() {
         activeSessions.removeAll()
         for session in sessions where session.endedAt == nil {
-            activeSessions[sessionKey(deviceID: session.deviceID, port: session.portIndex)] = session
+            activeSessions[sessionKey(deviceID: session.deviceID, port: session.portIndex)] = session.id
             if session.protocolSummary.isEmpty == false {
                 knownProtocols[session.id] = Set(session.protocolSummary.components(separatedBy: " / "))
             }
@@ -279,16 +292,43 @@ final class MonitorStore {
     }
 
     func stopSession(_ session: ChargingSession, reason: String = "manual") {
-        guard session.endedAt == nil else { return }
-        session.endedAt = Date()
-        session.endReason = reason
-        activeSessions.removeValue(forKey: sessionKey(deviceID: session.deviceID, port: session.portIndex))
+        guard let session = fetchSession(id: session.id), session.endedAt == nil else { return }
+        end(session, at: Date(), reason: reason)
         lowPowerSessionPrompt = nil
         try? modelContext?.save()
         loadSessions()
     }
 
+    func deleteSession(_ session: ChargingSession) {
+        guard let modelContext else { return }
+        let sessionID = session.id
+        let targetSession = fetchSession(id: sessionID) ?? session
+        let descriptor = FetchDescriptor<PortSample>(
+            predicate: #Predicate { sample in
+                sample.sessionID == sessionID
+            }
+        )
+        let samples = (try? modelContext.fetch(descriptor)) ?? []
+        for sample in samples {
+            modelContext.delete(sample)
+        }
+
+        activeSessions.removeValue(forKey: sessionKey(deviceID: targetSession.deviceID, port: targetSession.portIndex))
+        knownProtocols[sessionID] = nil
+        if selectedSession?.id == sessionID {
+            selectedSession = sessions.first { $0.id != sessionID }
+        }
+        if lowPowerSessionPrompt?.id == sessionID {
+            lowPowerSessionPrompt = nil
+        }
+        modelContext.delete(targetSession)
+        logger.info("session_deleted port=\(targetSession.portIndex, privacy: .public)")
+        try? modelContext.save()
+        loadSessions()
+    }
+
     func renameSession(_ session: ChargingSession, title: String) {
+        guard let session = fetchSession(id: session.id) else { return }
         let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         session.customTitle = trimmedTitle.isEmpty ? nil : trimmedTitle
         try? modelContext?.save()
@@ -511,8 +551,16 @@ final class MonitorStore {
     private func recordSamples(deviceID: UUID, deviceName: String, ports: [PortViewState], at now: Date) -> Bool {
         guard let modelContext else { return false }
         var didMutateStore = false
+        var observedKeys = Set<String>()
+        var attachedKeys = Set<String>()
 
         for port in ports {
+            let key = sessionKey(deviceID: deviceID, port: port.port.index)
+            observedKeys.insert(key)
+            if port.connected {
+                attachedKeys.insert(key)
+            }
+
             guard let detail = port.detail else { continue }
 
             recentSamples.append(ChartSamplePoint(
@@ -525,14 +573,18 @@ final class MonitorStore {
                 temperatureScore: temperatureScore(detail.dieTemperature)
             ))
 
-            let key = sessionKey(deviceID: deviceID, port: port.port.index)
-            let shouldRecord = detail.powerW >= 0.5 || activeSessions[key] != nil
+            let isAttached = port.connected
+            let shouldRecord = isAttached || activeSessions[key] != nil
             guard shouldRecord else { continue }
 
             var event: String?
-            var session = activeSessions[key]
+            let activeSessionID = activeSessions[key]
+            var session = activeSessionID.flatMap { fetchSession(id: $0) }
+            if activeSessionID != nil, session == nil {
+                activeSessions.removeValue(forKey: key)
+            }
 
-            if session == nil, detail.connected, detail.powerW >= 0.5 {
+            if session == nil, isAttached {
                 let newSession = ChargingSession(
                     deviceID: deviceID,
                     deviceName: deviceName,
@@ -542,16 +594,18 @@ final class MonitorStore {
                     startedAt: now
                 )
                 modelContext.insert(newSession)
-                activeSessions[key] = newSession
+                activeSessions[key] = newSession.id
                 session = newSession
                 event = "session_started"
                 knownProtocols[newSession.id] = []
                 didMutateStore = true
+                logger.info("session_started port=\(port.port.index, privacy: .public) power=\(detail.powerW, privacy: .public)")
             }
 
-            if detail.connected == false, let session {
+            if isAttached == false, let session {
                 event = "device_disconnected"
                 end(session, at: now, reason: "device_disconnected")
+                didMutateStore = true
             }
 
             if let session, let battery = port.batteryPercent, battery >= 99 {
@@ -567,7 +621,7 @@ final class MonitorStore {
                 timestamp: now,
                 portIndex: port.port.index,
                 portName: port.port.name,
-                connected: detail.connected,
+                connected: isAttached,
                 protocolName: detail.fcProtocol,
                 voltageMV: detail.voutMV,
                 currentMA: detail.ioutMA,
@@ -586,6 +640,15 @@ final class MonitorStore {
             }
         }
 
+        for (key, sessionID) in Array(activeSessions) where observedKeys.contains(key) && attachedKeys.contains(key) == false {
+            guard let session = fetchSession(id: sessionID), session.deviceID == deviceID else {
+                activeSessions.removeValue(forKey: key)
+                continue
+            }
+            end(session, at: now, reason: "device_disconnected")
+            didMutateStore = true
+        }
+
         let cutoff = Date().addingTimeInterval(-60 * 20)
         recentSamples.removeAll { $0.timestamp < cutoff }
         return didMutateStore
@@ -599,6 +662,18 @@ final class MonitorStore {
         if lowPowerSessionPrompt?.id == session.id {
             lowPowerSessionPrompt = nil
         }
+        logger.info("session_ended port=\(session.portIndex, privacy: .public) reason=\(reason, privacy: .public)")
+    }
+
+    private func fetchSession(id: UUID) -> ChargingSession? {
+        guard let modelContext else { return nil }
+        var descriptor = FetchDescriptor<ChargingSession>(
+            predicate: #Predicate { session in
+                session.id == id
+            }
+        )
+        descriptor.fetchLimit = 1
+        return try? modelContext.fetch(descriptor).first
     }
 
     private func updateStats(session: ChargingSession, with sample: PortSample) {

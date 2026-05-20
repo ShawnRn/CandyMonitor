@@ -1438,6 +1438,22 @@ private struct PortDetailSheet: View {
                                     Label(portSwitchState ? "关闭" : "开启", systemImage: portSwitchState ? "power.circle" : "power.circle.fill")
                                 }
                                 .buttonStyle(SoftButtonStyle(prominent: portSwitchState == false, destructive: portSwitchState))
+                            } else if port.connected {
+                                HStack(spacing: 8) {
+                                    Label("已接入", systemImage: "checkmark.circle.fill")
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(.green)
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 7)
+                                        .background(.green.opacity(0.12), in: Capsule())
+
+                                    Button {
+                                        pendingPowerState = false
+                                    } label: {
+                                        Label("关闭端口", systemImage: "power.circle")
+                                    }
+                                    .buttonStyle(SoftButtonStyle(destructive: true))
+                                }
                             } else {
                                 HStack(spacing: 8) {
                                     Button {
@@ -1514,6 +1530,8 @@ private struct PortDetailSheet: View {
         let prefix: String
         if let portSwitchState = port.portSwitchState {
             prefix = portSwitchState ? "当前充电口已开启。" : "当前充电口已关闭。"
+        } else if port.connected {
+            prefix = "当前端口正在供电，MCP 未单独上报开关位。"
         } else {
             prefix = "当前 MCP 未上报充电口开关状态。"
         }
@@ -1688,35 +1706,50 @@ private struct SessionsView: View {
     let store: MonitorStore
 
     var body: some View {
-        HStack(spacing: 0) {
-            VStack(spacing: 0) {
-                HeaderBar(title: "充电记录", subtitle: "\(store.sessions.count) 条会话")
-                ScrollView {
-                    LazyVStack(spacing: 8) {
-                    ForEach(store.sessions, id: \.id) { session in
-                            Button {
-                                store.selectSession(session)
-                            } label: {
-                                SessionRow(
-                                    session: session,
-                                    isSelected: store.selectedSession?.id == session.id
-                                )
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 12)
+        Group {
+            if store.sessions.isEmpty {
+                VStack(spacing: 0) {
+                    HeaderBar(title: "充电记录", subtitle: "0 条会话")
+                    ContentUnavailableView(
+                        "暂无充电记录",
+                        systemImage: "chart.xyaxis.line",
+                        description: Text("接入设备并开始充电后，会自动生成完整曲线。")
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
-                .scrollContentBackground(.hidden)
-                .background(Color(nsColor: .controlBackgroundColor))
+                .background(Color(nsColor: .windowBackgroundColor))
+            } else {
+                HStack(spacing: 0) {
+                    VStack(spacing: 0) {
+                        HeaderBar(title: "充电记录", subtitle: "\(store.sessions.count) 条会话")
+                        ScrollView {
+                            LazyVStack(spacing: 8) {
+                                ForEach(store.sessions, id: \.id) { session in
+                                    Button {
+                                        store.selectSession(session)
+                                    } label: {
+                                        SessionRow(
+                                            session: session,
+                                            isSelected: store.selectedSession?.id == session.id
+                                        )
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 12)
+                        }
+                        .scrollContentBackground(.hidden)
+                        .background(Color(nsColor: .controlBackgroundColor))
+                    }
+                    .frame(width: 310)
+                    .background(Color(nsColor: .controlBackgroundColor))
+
+                    Divider()
+
+                    SessionDetailView(store: store)
+                }
             }
-            .frame(width: 310)
-            .background(Color(nsColor: .controlBackgroundColor))
-
-            Divider()
-
-            SessionDetailView(store: store)
         }
     }
 }
@@ -1756,6 +1789,7 @@ private struct SessionRow: View {
 private struct SessionDetailView: View {
     let store: MonitorStore
     @State private var renamingSession: ChargingSession?
+    @State private var deletingSession: ChargingSession?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1770,6 +1804,11 @@ private struct SessionDetailView: View {
                         Button("结束记录") {
                             store.stopSession(session)
                         }
+                    }
+                    Button(role: .destructive) {
+                        deletingSession = session
+                    } label: {
+                        Label("删除", systemImage: "trash")
                     }
                     Button {
                         store.exportSelectedSessionCSV()
@@ -1798,6 +1837,22 @@ private struct SessionDetailView: View {
         }
         .sheet(item: $renamingSession) { session in
             RenameSessionSheet(store: store, session: session)
+        }
+        .alert("删除充电记录？", isPresented: Binding(
+            get: { deletingSession != nil },
+            set: { if !$0 { deletingSession = nil } }
+        )) {
+            Button("删除", role: .destructive) {
+                if let deletingSession {
+                    store.deleteSession(deletingSession)
+                }
+                deletingSession = nil
+            }
+            Button("取消", role: .cancel) {
+                deletingSession = nil
+            }
+        } message: {
+            Text("会同时删除这条记录下的采样点，操作不可撤销。")
         }
     }
 
@@ -2262,11 +2317,17 @@ private enum PendingControl: Identifiable {
     }
 }
 
+private enum SettingsField: Hashable {
+    case name
+    case url
+}
+
 private struct SettingsView: View {
     let store: MonitorStore
     @State private var editingName = ""
     @State private var editingURL = ""
     @State private var isSaving = false
+    @FocusState private var focusedField: SettingsField?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -2290,6 +2351,10 @@ private struct SettingsView: View {
                                     TextField("例如 Shawn’s Mirror", text: $editingName)
                                         .textFieldStyle(.roundedBorder)
                                         .frame(maxWidth: 360)
+                                        .focused($focusedField, equals: .name)
+                                        .onSubmit {
+                                            commitName(device)
+                                        }
                                 }
                                 LabeledContent("产品序列") {
                                     Text(device.psn ?? "尚未读取")
@@ -2363,6 +2428,10 @@ private struct SettingsView: View {
         }
         .onAppear(perform: load)
         .onChange(of: store.selectedDeviceID) { _, _ in load() }
+        .onChange(of: focusedField) { oldValue, newValue in
+            guard oldValue == .name, newValue != .name, let device = store.selectedDevice else { return }
+            commitName(device)
+        }
     }
 
     private func load() {
@@ -2375,6 +2444,11 @@ private struct SettingsView: View {
         isSaving = true
         defer { isSaving = false }
         try? await store.updateDevice(device, name: editingName, sseURLString: editingURL)
+    }
+
+    private func commitName(_ device: MirrorDevice) {
+        store.renameDevice(device, name: editingName)
+        editingName = store.selectedDevice?.name ?? editingName
     }
 }
 
