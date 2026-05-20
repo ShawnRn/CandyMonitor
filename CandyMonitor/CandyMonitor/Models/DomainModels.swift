@@ -222,17 +222,17 @@ final class PortSample {
     var id: UUID
     var sessionID: UUID?
     var deviceID: UUID
-    var deviceName: String
+    var deviceName: String?
     var timestamp: Date
     var portIndex: Int
     var portName: String
-    var connected: Bool
+    var connected: Bool?
     var protocolName: String
     var voltageMV: Int
     var currentMA: Int
     var powerW: Double
-    var temperature: String
-    var sessionChargeMWh: Int
+    var temperature: String?
+    var sessionChargeMWh: Int?
     var batteryPercent: Double?
     var event: String?
 
@@ -240,17 +240,17 @@ final class PortSample {
         id: UUID = UUID(),
         sessionID: UUID?,
         deviceID: UUID,
-        deviceName: String,
+        deviceName: String? = nil,
         timestamp: Date = Date(),
         portIndex: Int,
         portName: String,
-        connected: Bool,
+        connected: Bool? = nil,
         protocolName: String,
         voltageMV: Int,
         currentMA: Int,
         powerW: Double,
-        temperature: String,
-        sessionChargeMWh: Int,
+        temperature: String? = nil,
+        sessionChargeMWh: Int? = nil,
         batteryPercent: Double? = nil,
         event: String? = nil
     ) {

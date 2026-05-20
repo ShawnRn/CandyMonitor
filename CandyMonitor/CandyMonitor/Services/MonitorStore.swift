@@ -87,10 +87,26 @@ final class MonitorStore {
         }
     }
 
+    func reloadPersistedState() {
+        guard modelContext != nil else { return }
+        loadDevices()
+        loadSessions()
+    }
+
     func loadDevices() {
         guard let modelContext else { return }
         let descriptor = FetchDescriptor<MirrorDevice>(sortBy: [SortDescriptor(\.createdAt, order: .forward)])
-        devices = (try? modelContext.fetch(descriptor)) ?? []
+        do {
+            devices = try modelContext.fetch(descriptor)
+        } catch {
+            logger.error("device_fetch_failed \(error.localizedDescription, privacy: .public)")
+            devices = []
+        }
+        if devices.isEmpty {
+            restoreDevicesFromRegistryIfNeeded()
+        } else {
+            DeviceRegistry.save(devices)
+        }
         if selectedDeviceID == nil,
            let persistedID = UserDefaults.standard.string(forKey: selectedDeviceDefaultsKey).flatMap(UUID.init(uuidString:)),
            devices.contains(where: { $0.id == persistedID }) {
@@ -158,6 +174,7 @@ final class MonitorStore {
         try modelContext.save()
         clients[device.id] = client
         loadDevices()
+        DeviceRegistry.save(devices)
         selectedDeviceID = device.id
         UserDefaults.standard.set(device.id.uuidString, forKey: selectedDeviceDefaultsKey)
         selectedSection = .monitor
@@ -188,6 +205,7 @@ final class MonitorStore {
         try modelContext?.save()
         clients[device.id] = client
         loadDevices()
+        DeviceRegistry.save(devices)
         restartPollingIfNeeded()
     }
 
@@ -197,6 +215,7 @@ final class MonitorStore {
         device.name = trimmedName
         try? modelContext?.save()
         loadDevices()
+        DeviceRegistry.save(devices)
     }
 
     func mcpURL(for device: MirrorDevice) -> String {
@@ -221,6 +240,7 @@ final class MonitorStore {
         try? modelContext.save()
 
         devices.removeAll { $0.id == device.id }
+        DeviceRegistry.save(devices)
         selectedDeviceID = devices.first?.id
         if let selectedDeviceID {
             UserDefaults.standard.set(selectedDeviceID.uuidString, forKey: selectedDeviceDefaultsKey)
@@ -231,6 +251,37 @@ final class MonitorStore {
         recentSamples = []
         loadSessions()
         restartPollingIfNeeded()
+    }
+
+    private func restoreDevicesFromRegistryIfNeeded() {
+        guard let modelContext else { return }
+        let records = DeviceRegistry.load()
+            .filter { KeychainStore.hasMCPURL(account: $0.keychainAccount) }
+        guard records.isEmpty == false else { return }
+
+        let restoredDevices = records.map { record in
+            MirrorDevice(
+                id: record.id,
+                name: record.name,
+                keychainAccount: record.keychainAccount,
+                psn: record.psn,
+                model: record.model,
+                productFamily: record.productFamily,
+                maxPowerBudget: record.maxPowerBudget,
+                createdAt: record.createdAt,
+                lastSeenAt: record.lastSeenAt
+            )
+        }
+        for device in restoredDevices {
+            modelContext.insert(device)
+        }
+        do {
+            try modelContext.save()
+            devices = restoredDevices.sorted { $0.createdAt < $1.createdAt }
+            logger.info("devices_restored_from_registry count=\(restoredDevices.count, privacy: .public)")
+        } catch {
+            logger.error("device_registry_restore_failed \(error.localizedDescription, privacy: .public)")
+        }
     }
 
     private func restoreActiveSessions() {
@@ -270,11 +321,11 @@ final class MonitorStore {
                 timestamp: sample.timestamp,
                 portIndex: sample.portIndex,
                 portName: sample.portName,
-                connected: sample.connected,
+                connected: sample.connected == true,
                 powerW: sample.powerW,
                 voltageV: Double(sample.voltageMV) / 1000,
                 currentA: Double(sample.currentMA) / 1000,
-                temperatureScore: temperatureScore(sample.temperature)
+                temperatureScore: temperatureScore(sample.temperature ?? "")
             )
         }
     }
@@ -781,6 +832,67 @@ final class MonitorStore {
         case "warm": 3
         default: 0
         }
+    }
+}
+
+@MainActor
+private enum DeviceRegistry {
+    static func save(_ devices: [MirrorDevice]) {
+        let records = devices.map(DeviceRegistryRecord.init)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let data = try JSONEncoder().encode(records)
+            try data.write(to: fileURL, options: [.atomic])
+        } catch {
+            Logger(subsystem: "com.shawnrain.CandyMonitor", category: "DeviceRegistry")
+                .error("device_registry_save_failed \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    static func load() -> [DeviceRegistryRecord] {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return [] }
+        do {
+            let data = try Data(contentsOf: fileURL)
+            return try JSONDecoder().decode([DeviceRegistryRecord].self, from: data)
+        } catch {
+            Logger(subsystem: "com.shawnrain.CandyMonitor", category: "DeviceRegistry")
+                .error("device_registry_load_failed \(error.localizedDescription, privacy: .public)")
+            return []
+        }
+    }
+
+    private static var directory: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
+        return base.appendingPathComponent("CandyMonitor", isDirectory: true)
+    }
+
+    private static var fileURL: URL {
+        directory.appendingPathComponent("devices.json")
+    }
+}
+
+private struct DeviceRegistryRecord: Codable {
+    let id: UUID
+    let name: String
+    let keychainAccount: String
+    let psn: String?
+    let model: String?
+    let productFamily: String?
+    let maxPowerBudget: Int
+    let createdAt: Date
+    let lastSeenAt: Date?
+
+    init(_ device: MirrorDevice) {
+        self.id = device.id
+        self.name = device.name
+        self.keychainAccount = device.keychainAccount
+        self.psn = device.psn
+        self.model = device.model
+        self.productFamily = device.productFamily
+        self.maxPowerBudget = device.maxPowerBudget
+        self.createdAt = device.createdAt
+        self.lastSeenAt = device.lastSeenAt
     }
 }
 

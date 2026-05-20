@@ -29,8 +29,15 @@ struct ContentView: View {
         .task {
             store.configure(modelContext: modelContext)
         }
+        .onAppear {
+            store.configure(modelContext: modelContext)
+            store.reloadPersistedState()
+        }
         .onChange(of: scenePhase) { _, phase in
             store.isRealtimeRefreshEnabled = phase == .active
+            if phase == .active {
+                store.reloadPersistedState()
+            }
         }
         .sheet(isPresented: Binding(
             get: { store.isShowingAddDevice },

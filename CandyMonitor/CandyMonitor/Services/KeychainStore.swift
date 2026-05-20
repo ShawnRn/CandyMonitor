@@ -12,17 +12,29 @@ enum KeychainStore {
     }
 
     static func loadMCPURL(account: String) throws -> String? {
-        let url = fileURL(for: account)
-        guard FileManager.default.fileExists(atPath: url.path) else {
-            return nil
+        for url in candidateFileURLs(for: account) {
+            guard FileManager.default.fileExists(atPath: url.path) else { continue }
+            let sealed = try Data(contentsOf: url)
+            let opened = try open(sealed)
+            guard let urlString = String(data: opened, encoding: .utf8) else {
+                throw CredentialStoreError.invalidData
+            }
+            if url != fileURL(for: account) {
+                try? saveMCPURL(urlString, account: account)
+            }
+            return urlString
         }
-        let sealed = try Data(contentsOf: url)
-        let opened = try open(sealed)
-        return String(data: opened, encoding: .utf8)
+        return nil
+    }
+
+    static func hasMCPURL(account: String) -> Bool {
+        candidateFileURLs(for: account).contains { FileManager.default.fileExists(atPath: $0.path) }
     }
 
     static func deleteMCPURL(account: String) {
-        try? FileManager.default.removeItem(at: fileURL(for: account))
+        for url in candidateFileURLs(for: account) {
+            try? FileManager.default.removeItem(at: url)
+        }
     }
 
     private static var storeDirectory: URL {
@@ -33,9 +45,31 @@ enum KeychainStore {
     }
 
     private static func fileURL(for account: String) -> URL {
+        fileURL(for: account, in: storeDirectory)
+    }
+
+    private static func fileURL(for account: String, in directory: URL) -> URL {
         let digest = SHA256.hash(data: Data((account + decodedSalt).utf8))
         let name = digest.map { String(format: "%02x", $0) }.joined()
-        return storeDirectory.appendingPathComponent("\(name).cmvault")
+        return directory.appendingPathComponent("\(name).cmvault")
+    }
+
+    private static func candidateFileURLs(for account: String) -> [URL] {
+        ([storeDirectory] + legacyStoreDirectories)
+            .map { fileURL(for: account, in: $0) }
+            .reduce(into: []) { urls, url in
+                if urls.contains(url) == false {
+                    urls.append(url)
+                }
+            }
+    }
+
+    private static var legacyStoreDirectories: [URL] {
+        let homeSupport = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support", isDirectory: true)
+            .appendingPathComponent(directoryName, isDirectory: true)
+            .appendingPathComponent(storeName, isDirectory: true)
+        return [homeSupport]
     }
 
     private static func seal(_ data: Data) throws -> Data {

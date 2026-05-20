@@ -36,14 +36,14 @@ enum CSVExporter {
         for sample in samples.sorted(by: { $0.timestamp < $1.timestamp }) {
             lines.append(csvRow([
                 iso8601.string(from: sample.timestamp),
-                sample.deviceName,
+                sample.deviceName ?? session.deviceName,
                 sample.portName,
                 LocalizedTelemetry.protocolLabel(sample.protocolName),
                 "\(sample.voltageMV)",
                 "\(sample.currentMA)",
                 number(sample.powerW),
-                sample.temperature,
-                sample.connected ? "true" : "false",
+                sample.temperature ?? "",
+                sample.connected == true ? "true" : "false",
                 sample.batteryPercent.map(number) ?? "",
                 sample.event ?? ""
             ]))

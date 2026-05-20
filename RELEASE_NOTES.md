@@ -1,5 +1,9 @@
 ## CandyMonitor 1.0
 
+- Hotfix build 5：修复旧库迁移失败导致设备列表变空、手动添加无反应的问题。
+- 新增采样字段改为向后兼容的可迁移结构，旧版 `PortSample` 记录不再卡住 SwiftData store 加载。
+- 启动、窗口出现和回到前台都会重新加载本地设备；同时保存一份不含 MCP 地址的设备元数据索引，用于数据库异常时自动补回设备行。
+- 本地加密 MCP vault 支持从旧 Application Support 位置迁入 sandbox 容器，减少安装方式切换后的重新配置概率。
 - Hotfix build 4：继续收敛实时轮询中 SwiftData fault 触发的崩溃，并减少空闲端口每秒写库。
 - 实时保存改为先用普通 Swift 值更新会话统计，再插入采样对象，避免刚插入或已 fault 的 SwiftData 对象在同一轮保存里互相读写。
 - 端口详情中移除没有动作的“设备详情 / 专业信息 / 协议管理”假入口。
