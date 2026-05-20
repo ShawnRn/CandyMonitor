@@ -17,6 +17,13 @@ private struct DeviceSnapshot: Sendable {
     }
 }
 
+private struct SampleStats {
+    let powerW: Double
+    let voltageMV: Int
+    let protocolName: String
+    let batteryPercent: Double?
+}
+
 @Observable
 @MainActor
 final class MonitorStore {
@@ -631,6 +638,16 @@ final class MonitorStore {
                 end(session, at: now, reason: "battery_full")
             }
 
+            let stats = SampleStats(
+                powerW: detail.powerW,
+                voltageMV: detail.voutMV,
+                protocolName: detail.fcProtocol,
+                batteryPercent: port.batteryPercent
+            )
+            if let session {
+                updateStats(session: session, with: stats)
+            }
+
             let sample = PortSample(
                 sessionID: session?.id,
                 deviceID: deviceID,
@@ -650,11 +667,6 @@ final class MonitorStore {
             )
             modelContext.insert(sample)
             didMutateStore = true
-
-            if let session {
-                updateStats(session: session, with: sample)
-                maybePromptLowPower(session: session)
-            }
         }
 
         for (key, sessionID) in Array(activeSessions) where observedKeys.contains(key) && attachedKeys.contains(key) == false {
@@ -693,7 +705,7 @@ final class MonitorStore {
         return try? modelContext.fetch(descriptor).first
     }
 
-    private func updateStats(session: ChargingSession, with sample: PortSample) {
+    private func updateStats(session: ChargingSession, with sample: SampleStats) {
         session.sampleCount += 1
         session.peakPowerW = max(session.peakPowerW, sample.powerW)
         if session.sampleCount == 1 {
@@ -715,32 +727,6 @@ final class MonitorStore {
             session.hasBatteryData = true
             session.finalBatteryPercent = battery
         }
-    }
-
-    private func maybePromptLowPower(session: ChargingSession) {
-        guard session.endedAt == nil,
-              session.hasBatteryData == false,
-              session.startedAt.timeIntervalSinceNow < -600,
-              lowPowerSessionPrompt == nil else {
-            return
-        }
-
-        guard let modelContext else { return }
-        let id = session.id
-        var descriptor = FetchDescriptor<PortSample>(
-            predicate: #Predicate { sample in
-                sample.sessionID == id
-            },
-            sortBy: [SortDescriptor(\.timestamp, order: .reverse)]
-        )
-        descriptor.fetchLimit = 8
-
-        guard let samples = try? modelContext.fetch(descriptor),
-              samples.count >= 8,
-              samples.allSatisfy({ $0.powerW < 2.0 }) else {
-            return
-        }
-        lowPowerSessionPrompt = session
     }
 
     private func client(for device: DeviceSnapshot) async throws -> MCPClient {

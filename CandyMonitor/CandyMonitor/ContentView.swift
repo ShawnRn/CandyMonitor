@@ -743,7 +743,7 @@ private struct MirrorPortTile: View {
                     .lineLimit(1)
                 MirrorConnectorGlyph(connectorType: port.port.connectorType)
                     .frame(width: 44, height: 16)
-                Text(port.chargeStateLabel == "未接入" ? "待机中" : port.chargeStateLabel)
+                Text(port.connected ? String(format: "%.1fW", port.powerW) : "待机中")
                     .font(.system(size: 14, weight: .semibold, design: .rounded))
                     .foregroundStyle(port.connected ? CandyTheme.mint : CandyTheme.syrup.opacity(0.76))
                     .lineLimit(1)
@@ -1443,7 +1443,7 @@ private struct PortDetailSheet: View {
 
                     PortMapView(selectedPort: port.port.index)
 
-                    sectionHeader("\(portTitle) \(port.connected ? "在充设备" : "未接入设备")", trailing: "设备详情")
+                    sectionHeader("\(portTitle) \(port.connected ? "在充设备" : "未接入设备")")
 
                     detailCard {
                         VStack(alignment: .leading, spacing: 8) {
@@ -1469,7 +1469,7 @@ private struct PortDetailSheet: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
 
-                    sectionHeader("\(portTitle) 充电口", trailing: "专业信息")
+                    sectionHeader("\(portTitle) 充电口")
 
                     detailCard {
                         HStack {
@@ -1507,7 +1507,7 @@ private struct PortDetailSheet: View {
                         }
                     }
 
-                    sectionHeader("\(portTitle) 兼容协议", trailing: "协议管理")
+                    sectionHeader("\(portTitle) 兼容协议")
 
                     detailCard {
                         FlowChips(items: protocolChips)
@@ -1614,18 +1614,17 @@ private struct PortDetailSheet: View {
         }
     }
 
-    private func sectionHeader(_ title: String, trailing: String) -> some View {
+    private func sectionHeader(_ title: String, trailing: String? = nil) -> some View {
         HStack {
             Text(title)
                 .font(.title2.weight(.medium))
                 .foregroundStyle(.secondary)
             Spacer()
-            Text(trailing)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-            Image(systemName: "chevron.right")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.tertiary)
+            if let trailing {
+                Text(trailing)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 }
@@ -1885,7 +1884,7 @@ private struct SessionDetailView: View {
                         HStack(spacing: 12) {
                             MetricCard(title: "峰值功率", value: String(format: "%.1f W", session.peakPowerW), icon: "bolt.fill")
                             MetricCard(title: "平均功率", value: String(format: "%.1f W", session.averagePowerW), icon: "waveform.path")
-                            MetricCard(title: "样本", value: "\(session.sampleCount)", icon: "number")
+                            MetricCard(title: "实时功率", value: String(format: "%.1f W", latestPowerW), icon: "gauge.medium")
                             MetricCard(title: "耗时", value: durationText(session), icon: "clock")
                         }
 
@@ -1923,6 +1922,10 @@ private struct SessionDetailView: View {
             return "\(session.startedAt.formatted(date: .abbreviated, time: .shortened)) - \(endedAt.formatted(date: .omitted, time: .shortened))"
         }
         return "正在记录"
+    }
+
+    private var latestPowerW: Double {
+        store.selectedSessionSamples.last?.powerW ?? store.selectedSession?.averagePowerW ?? 0
     }
 
     private func durationText(_ session: ChargingSession) -> String {
