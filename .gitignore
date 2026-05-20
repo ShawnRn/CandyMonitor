@@ -1,0 +1,23 @@
+# Xcode
+DerivedData/
+.build/
+*.xcuserstate
+xcuserdata/
+
+# macOS
+.DS_Store
+
+# Local release output
+releases/
+*.dmg
+*.zip
+/*.app
+
+# Local agent/decompile workspaces
+.agent/
+.codex-wxapp-analysis/
+CandyMonitor/CandyMon.icon/
+
+# Secrets and local configs
+*.env
+!.env.example
