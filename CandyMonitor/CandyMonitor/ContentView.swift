@@ -400,7 +400,7 @@ private struct NativeMonitorView: View {
                 Chart(filteredSamples) { sample in
                     LineMark(
                         x: .value("Time", sample.timestamp),
-                        y: .value(metric.title, metric.value(sample))
+                        y: .value(metric.title, metric.displayValue(sample))
                     )
                     .foregroundStyle(by: .value("Port", sample.portName))
                     .lineStyle(StrokeStyle(lineWidth: 2.5, lineCap: .round, lineJoin: .round))
@@ -412,13 +412,14 @@ private struct NativeMonitorView: View {
                             .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 4]))
                         PointMark(
                             x: .value("Time", sample.timestamp),
-                            y: .value(metric.title, metric.value(sample))
+                            y: .value(metric.title, metric.displayValue(sample))
                         )
                         .foregroundStyle(CandyTheme.syrup)
                         .symbolSize(90)
                     }
                 }
                 .chartYAxisLabel(metric.axisLabel)
+                .chartYScale(domain: metric.displayDomain(for: filteredSamples))
                 .chartOverlay { proxy in
                     GeometryReader { geometry in
                         Rectangle()
@@ -1032,7 +1033,7 @@ private struct MonitorView: View {
                 Chart(filteredSamples) { sample in
                     LineMark(
                         x: .value("Time", sample.timestamp),
-                        y: .value(metric.title, metric.value(sample))
+                        y: .value(metric.title, metric.displayValue(sample))
                     )
                     .foregroundStyle(by: .value("Port", sample.portName))
                     .lineStyle(StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
@@ -1044,13 +1045,14 @@ private struct MonitorView: View {
                             .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 4]))
                         PointMark(
                             x: .value("Time", sample.timestamp),
-                            y: .value(metric.title, metric.value(sample))
+                            y: .value(metric.title, metric.displayValue(sample))
                         )
                         .foregroundStyle(CandyTheme.berry)
                         .symbolSize(90)
                     }
                 }
                 .chartYAxisLabel(metric.axisLabel)
+                .chartYScale(domain: metric.displayDomain(for: filteredSamples))
                 .chartOverlay { proxy in
                     GeometryReader { geometry in
                         Rectangle()
@@ -1202,11 +1204,14 @@ private enum ChartMetric: String, CaseIterable, Identifiable {
         }
     }
 
-    func value(_ sample: ChartSamplePoint) -> Double {
+    func displayValue(_ sample: ChartSamplePoint) -> Double {
         switch self {
-        case .power: sample.powerW
-        case .voltage: sample.voltageV
-        case .current: sample.currentA
+        case .power:
+            sample.powerW < Self.idlePowerDeadband ? 0 : sample.powerW
+        case .voltage:
+            sample.powerW < Self.idlePowerDeadband && sample.currentA < Self.idleCurrentDeadband ? 0 : sample.voltageV
+        case .current:
+            sample.currentA < Self.idleCurrentDeadband ? 0 : sample.currentA
         case .temperature: sample.temperatureScore
         }
     }
@@ -1214,15 +1219,32 @@ private enum ChartMetric: String, CaseIterable, Identifiable {
     func formattedValue(_ sample: ChartSamplePoint) -> String {
         switch self {
         case .power:
-            return String(format: "%.2f W", sample.powerW)
+            return String(format: "%.1f W", displayValue(sample))
         case .voltage:
-            return String(format: "%.2f V", sample.voltageV)
+            return String(format: "%.2f V", displayValue(sample))
         case .current:
-            return String(format: "%.2f A", sample.currentA)
+            return String(format: "%.2f A", displayValue(sample))
         case .temperature:
             return String(format: "%.0f", sample.temperatureScore)
         }
     }
+
+    func displayDomain(for samples: [ChartSamplePoint]) -> ClosedRange<Double> {
+        let maxValue = samples.map(displayValue).max() ?? 0
+        switch self {
+        case .power:
+            return 0...(max(5, ceil(maxValue * 1.15)))
+        case .current:
+            return 0...(max(0.5, maxValue * 1.15))
+        case .voltage:
+            return 0...(max(5, ceil(maxValue * 1.1)))
+        case .temperature:
+            return 0...(max(5, ceil(maxValue * 1.1)))
+        }
+    }
+
+    private static let idlePowerDeadband = 0.5
+    private static let idleCurrentDeadband = 0.05
 }
 
 private struct FilterChip: View {

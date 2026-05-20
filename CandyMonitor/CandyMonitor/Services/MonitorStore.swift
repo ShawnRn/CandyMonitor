@@ -4,6 +4,18 @@ import Observation
 import SwiftData
 import UniformTypeIdentifiers
 
+private struct DeviceSnapshot: Sendable {
+    let id: UUID
+    let name: String
+    let keychainAccount: String
+
+    init(_ device: MirrorDevice) {
+        self.id = device.id
+        self.name = device.name
+        self.keychainAccount = device.keychainAccount
+    }
+}
+
 @Observable
 @MainActor
 final class MonitorStore {
@@ -38,6 +50,10 @@ final class MonitorStore {
     var selectedDevice: MirrorDevice? {
         guard let selectedDeviceID else { return nil }
         return devices.first { $0.id == selectedDeviceID }
+    }
+
+    private var selectedDeviceSnapshot: DeviceSnapshot? {
+        selectedDevice.map(DeviceSnapshot.init)
     }
 
     var hasDevices: Bool {
@@ -295,7 +311,7 @@ final class MonitorStore {
     }
 
     func refreshSelectedDeviceNow() async {
-        guard let device = selectedDevice else { return }
+        guard let device = selectedDeviceSnapshot else { return }
         isRefreshingNow = true
         defer { isRefreshingNow = false }
 
@@ -360,21 +376,22 @@ final class MonitorStore {
     }
 
     private func runControl(action: String, detail: String, operation: @escaping (MCPClient) async throws -> Void) async {
-        guard let device = selectedDevice else { return }
+        guard let selectedDevice else { return }
+        let device = DeviceSnapshot(selectedDevice)
         do {
             let client = try await client(for: device)
             try await operation(client)
-            logControl(device: device, action: action, detail: detail, verified: true)
+            logControl(deviceID: device.id, deviceName: device.name, action: action, detail: detail, verified: true)
             try await refreshOnce(device: device, client: client)
         } catch {
             lastError = error.localizedDescription
-            logControl(device: device, action: action, detail: "\(detail) - \(error.localizedDescription)", verified: false)
+            logControl(deviceID: device.id, deviceName: device.name, action: action, detail: "\(detail) - \(error.localizedDescription)", verified: false)
         }
     }
 
     private func restartPollingIfNeeded() {
         stopPolling()
-        guard let selectedDevice else {
+        guard let selectedDevice = selectedDeviceSnapshot else {
             connectionState = .idle
             return
         }
@@ -389,7 +406,7 @@ final class MonitorStore {
         pollingTask = nil
     }
 
-    private func pollingLoop(device: MirrorDevice) async {
+    private func pollingLoop(device: DeviceSnapshot) async {
         connectionState = .connecting
 
         do {
@@ -407,7 +424,7 @@ final class MonitorStore {
         }
     }
 
-    private func refreshOnce(device: MirrorDevice, client: MCPClient) async throws {
+    private func refreshOnce(device: DeviceSnapshot, client: MCPClient) async throws {
         let facts = try await retry {
             try await client.machineFacts()
         }
@@ -426,12 +443,17 @@ final class MonitorStore {
         let temperature = try await temperatureTask
         let pd = try? await client.pdStatus()
 
-        device.psn = device.psn
-        device.maxPowerBudget = facts.maxPowerBudget
-        device.productFamily = facts.productFamily
-        device.lastSeenAt = Date()
+        guard selectedDeviceID == device.id else { return }
+
+        let now = Date()
+        let didUpdateDevice = updateDeviceMetadata(
+            id: device.id,
+            productFamily: facts.productFamily,
+            maxPowerBudget: facts.maxPowerBudget,
+            seenAt: now
+        )
         temperatureModeLabel = temperature.modeName ?? "\(temperature.mode)"
-        lastRefreshedAt = Date()
+        lastRefreshedAt = now
 
         let pdByPort = Dictionary(uniqueKeysWithValues: (pd?.ports ?? []).map { ($0.port, $0) })
         let detailsByPort = Dictionary(uniqueKeysWithValues: details.ports.map { ($0.port, $0) })
@@ -445,20 +467,59 @@ final class MonitorStore {
             )
         }
 
-        recordSamples(device: device, ports: livePorts)
+        let didRecordSamples = recordSamples(deviceID: device.id, deviceName: device.name, ports: livePorts, at: now)
         connectionState = .connected
         lastError = nil
-        try? modelContext?.save()
+        if didUpdateDevice || didRecordSamples {
+            try? modelContext?.save()
+            loadSessions()
+        }
     }
 
-    private func recordSamples(device: MirrorDevice, ports: [PortViewState]) {
-        guard let modelContext else { return }
-        let now = Date()
+    private func updateDeviceMetadata(
+        id: UUID,
+        productFamily: String?,
+        maxPowerBudget: Int,
+        seenAt: Date
+    ) -> Bool {
+        guard let device = devices.first(where: { $0.id == id }) else { return false }
+        var didChange = false
+
+        if let productFamily, device.productFamily != productFamily {
+            device.productFamily = productFamily
+            didChange = true
+        }
+        if device.maxPowerBudget != maxPowerBudget {
+            device.maxPowerBudget = maxPowerBudget
+            didChange = true
+        }
+        if device.lastSeenAt.map({ seenAt.timeIntervalSince($0) >= 30 }) ?? true {
+            device.lastSeenAt = seenAt
+            didChange = true
+        }
+
+        return didChange
+    }
+
+    private func recordSamples(deviceID: UUID, deviceName: String, ports: [PortViewState], at now: Date) -> Bool {
+        guard let modelContext else { return false }
+        var didMutateStore = false
 
         for port in ports {
             guard let detail = port.detail else { continue }
-            let key = sessionKey(deviceID: device.id, port: port.port.index)
-            let shouldRecord = detail.connected || detail.powerW >= 0.5 || activeSessions[key] != nil
+
+            recentSamples.append(ChartSamplePoint(
+                timestamp: now,
+                portIndex: port.port.index,
+                portName: port.port.name,
+                powerW: detail.powerW,
+                voltageV: Double(detail.voutMV) / 1000,
+                currentA: Double(detail.ioutMA) / 1000,
+                temperatureScore: temperatureScore(detail.dieTemperature)
+            ))
+
+            let key = sessionKey(deviceID: deviceID, port: port.port.index)
+            let shouldRecord = detail.powerW >= 0.5 || activeSessions[key] != nil
             guard shouldRecord else { continue }
 
             var event: String?
@@ -466,8 +527,8 @@ final class MonitorStore {
 
             if session == nil, detail.connected, detail.powerW >= 0.5 {
                 let newSession = ChargingSession(
-                    deviceID: device.id,
-                    deviceName: device.name,
+                    deviceID: deviceID,
+                    deviceName: deviceName,
                     portIndex: port.port.index,
                     portName: port.port.name,
                     connectedDeviceName: detail.deviceNameZH ?? detail.deviceNameEN,
@@ -478,6 +539,7 @@ final class MonitorStore {
                 session = newSession
                 event = "session_started"
                 knownProtocols[newSession.id] = []
+                didMutateStore = true
             }
 
             if detail.connected == false, let session {
@@ -493,8 +555,8 @@ final class MonitorStore {
 
             let sample = PortSample(
                 sessionID: session?.id,
-                deviceID: device.id,
-                deviceName: device.name,
+                deviceID: deviceID,
+                deviceName: deviceName,
                 timestamp: now,
                 portIndex: port.port.index,
                 portName: port.port.name,
@@ -509,26 +571,17 @@ final class MonitorStore {
                 event: event
             )
             modelContext.insert(sample)
+            didMutateStore = true
 
             if let session {
                 updateStats(session: session, with: sample)
                 maybePromptLowPower(session: session)
             }
-
-            recentSamples.append(ChartSamplePoint(
-                timestamp: now,
-                portIndex: port.port.index,
-                portName: port.port.name,
-                powerW: detail.powerW,
-                voltageV: Double(detail.voutMV) / 1000,
-                currentA: Double(detail.ioutMA) / 1000,
-                temperatureScore: temperatureScore(detail.dieTemperature)
-            ))
         }
 
         let cutoff = Date().addingTimeInterval(-60 * 20)
         recentSamples.removeAll { $0.timestamp < cutoff }
-        loadSessions()
+        return didMutateStore
     }
 
     private func end(_ session: ChargingSession, at date: Date, reason: String) {
@@ -591,7 +644,7 @@ final class MonitorStore {
         lowPowerSessionPrompt = session
     }
 
-    private func client(for device: MirrorDevice) async throws -> MCPClient {
+    private func client(for device: DeviceSnapshot) async throws -> MCPClient {
         if let client = clients[device.id] {
             try await client.connect()
             return client
@@ -606,11 +659,11 @@ final class MonitorStore {
         return client
     }
 
-    private func logControl(device: MirrorDevice, action: String, detail: String, verified: Bool) {
+    private func logControl(deviceID: UUID, deviceName: String, action: String, detail: String, verified: Bool) {
         guard let modelContext else { return }
         modelContext.insert(ControlEvent(
-            deviceID: device.id,
-            deviceName: device.name,
+            deviceID: deviceID,
+            deviceName: deviceName,
             action: action,
             detail: detail,
             verified: verified
