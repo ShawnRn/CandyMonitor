@@ -63,10 +63,9 @@ for TARGET_ARCH in arm64 x86_64; do
   ARCH_APP_BUNDLE="$APP_BUILD_DIR/${PROJECT_NAME}_${TARGET_ARCH}.app"
   ARCH_ARCHIVE_PATH="$ARCHIVE_DIR/${PROJECT_NAME}_${TARGET_ARCH}.xcarchive"
   DMG_FINAL_PATH="$RELEASE_DIR/${PROJECT_NAME}_${MARKETING_VERSION}_${TARGET_ARCH}.dmg"
-  TEMP_DMG_ROOT="$BUILD_DIR/dmg-root-${TARGET_ARCH}"
-  TEMP_DMG_OUTPUT="$DMG_WORK_DIR/output-${TARGET_ARCH}"
+  TEMP_DMG_ROOT="${TMPDIR:-/tmp}/CandyMonitor-dmg-root-${TARGET_ARCH}-$$"
 
-  rm -rf "$ARCH_APP_BUNDLE" "$ARCH_ARCHIVE_PATH" "$TEMP_DMG_ROOT" "$TEMP_DMG_OUTPUT" "$DMG_FINAL_PATH"
+  rm -rf "$ARCH_APP_BUNDLE" "$ARCH_ARCHIVE_PATH" "$TEMP_DMG_ROOT" "$DMG_FINAL_PATH"
 
   if [[ "$XCODE_CONF" == "Debug" ]]; then
     xcodebuild build \
@@ -109,7 +108,7 @@ for TARGET_ARCH in arm64 x86_64; do
   codesign --force --deep --sign "-" --entitlements "$ENTITLEMENTS_FILE" "$ARCH_APP_BUNDLE"
   verify_sandbox_entitlement "$ARCH_APP_BUNDLE"
 
-  mkdir -p "$TEMP_DMG_ROOT" "$TEMP_DMG_OUTPUT"
+  mkdir -p "$TEMP_DMG_ROOT"
   ditto --noextattr --noqtn "$ARCH_APP_BUNDLE" "$TEMP_DMG_ROOT/$APP_NAME"
   verify_sandbox_entitlement "$TEMP_DMG_ROOT/$APP_NAME"
 
@@ -122,7 +121,7 @@ for TARGET_ARCH in arm64 x86_64; do
     "$DMG_FINAL_PATH"
   codesign --force --sign "-" "$DMG_FINAL_PATH"
 
-  rm -rf "$TEMP_DMG_ROOT" "$TEMP_DMG_OUTPUT"
+  rm -rf "$TEMP_DMG_ROOT"
   echo "==> Done: $DMG_FINAL_PATH"
 done
 
