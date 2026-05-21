@@ -428,8 +428,11 @@ struct PDPortStatus: Codable, Hashable, Sendable {
     let modelName: String?
     let serialNumber: String?
     let batteryCapacityMWh: Double?
+    let batteryLastFullChargeCapacityMWh: Double?
+    let batteryPresentCapacityMWh: Double?
     let batteryHealthPercent: Double?
     let estimatedFullMinutes: Double?
+    let remainingTimeText: String?
     let cycleCount: Int?
 
     init(from decoder: Decoder) throws {
@@ -446,7 +449,8 @@ struct PDPortStatus: Codable, Hashable, Sendable {
             "soc",
             "battery_soc",
             "state_of_charge",
-            "relative_state_of_charge"
+            "relative_state_of_charge",
+            "capacityPercent"
         ]))
         manufacturer = Self.decodeFirstString(in: containers, keys: [
             "manufacturer", "vendor", "brand", "device_manufacturer", "device_vendor", "oem"
@@ -459,15 +463,28 @@ struct PDPortStatus: Codable, Hashable, Sendable {
         ])
         batteryCapacityMWh = Self.decodeFirstDouble(in: containers, keys: [
             "battery_capacity_mwh", "batteryCapacityMWh", "capacity_mwh", "design_capacity_mwh",
-            "full_charge_capacity_mwh", "battery_full_charge_capacity_mwh", "nominal_capacity_mwh"
+            "batteryDesignCapacity", "designCapacity", "battery_design_capacity",
+            "nominal_capacity_mwh"
+        ])
+        batteryLastFullChargeCapacityMWh = Self.decodeFirstDouble(in: containers, keys: [
+            "batteryLastFullChargeCapacity", "lastFullChargeCapacity", "current_max_capacity_mwh",
+            "full_charge_capacity_mwh", "battery_full_charge_capacity_mwh"
+        ])
+        batteryPresentCapacityMWh = Self.decodeFirstDouble(in: containers, keys: [
+            "batteryPresentCapacity", "presentCapacity", "current_capacity_mwh",
+            "battery_present_capacity_mwh"
         ])
         batteryHealthPercent = Self.normalizedPercent(Self.decodeFirstDouble(in: containers, keys: [
             "battery_health", "battery_health_percent", "health", "health_percent", "soh",
+            "batteryHealth",
             "state_of_health"
         ]))
         estimatedFullMinutes = Self.decodeFirstDouble(in: containers, keys: [
             "estimated_full_minutes", "estimate_full_minutes", "time_to_full_minutes",
             "minutes_to_full", "time_to_full_min", "remaining_charge_minutes"
+        ])
+        remainingTimeText = Self.decodeFirstString(in: containers, keys: [
+            "remainingTimeStr", "remaining_time_str", "remainingTime", "timeToFullText"
         ])
         cycleCount = Self.decodeFirstInt(in: containers, keys: [
             "cycle_count", "battery_cycle_count", "cycles"
@@ -482,8 +499,11 @@ struct PDPortStatus: Codable, Hashable, Sendable {
         try container.encodeIfPresent(modelName, forKey: .init("model"))
         try container.encodeIfPresent(serialNumber, forKey: .init("serial_number"))
         try container.encodeIfPresent(batteryCapacityMWh, forKey: .init("battery_capacity_mwh"))
+        try container.encodeIfPresent(batteryLastFullChargeCapacityMWh, forKey: .init("battery_last_full_charge_capacity_mwh"))
+        try container.encodeIfPresent(batteryPresentCapacityMWh, forKey: .init("battery_present_capacity_mwh"))
         try container.encodeIfPresent(batteryHealthPercent, forKey: .init("battery_health_percent"))
         try container.encodeIfPresent(estimatedFullMinutes, forKey: .init("estimated_full_minutes"))
+        try container.encodeIfPresent(remainingTimeText, forKey: .init("remaining_time_text"))
         try container.encodeIfPresent(cycleCount, forKey: .init("cycle_count"))
     }
 
@@ -617,10 +637,13 @@ enum LocalizedTelemetry {
         if normalized.isEmpty { return "未知协议" }
         let lowercased = normalized.lowercased()
 
+        if let numericProtocol = Int(normalized), let label = miniProgramFastChargeProtocolLabel(for: numericProtocol) {
+            return label
+        }
+
         if lowercased == "unknown(21)" ||
             lowercased == "unknown 21" ||
             lowercased == "protocol 21" ||
-            lowercased == "21" ||
             lowercased.contains("xiaomi") ||
             lowercased.contains("hypercharge") ||
             lowercased.contains("mi turbo") ||
@@ -631,21 +654,83 @@ enum LocalizedTelemetry {
         switch lowercased {
         case "unknown":
             return "未知协议"
-        case "not charging", "not_charging", "idle":
-            return "未充电"
-        case "pd programmable power supply", "programmable power supply", "pps":
-            return "PD 可编程电源"
-        case "pd fixed supply":
-            return "PD 固定电压"
-        case "pd fixed high voltage":
-            return "PD 固定高压"
-        case "qc", "quick charge":
-            return "QC 快充"
+        case "not charging", "not_charging", "idle", "fc_not_charging":
+            return "NOT_CHARGING"
+        case "none", "fc_none":
+            return "NONE"
+        case "fc_qc2":
+            return "QC2"
+        case "fc_qc3":
+            return "QC3"
+        case "fc_qc3p", "fc_qc3_plus":
+            return "QC3P"
+        case "fc_sfcp":
+            return "SFCP"
+        case "fc_afc":
+            return "AFC"
+        case "fc_fcp":
+            return "FCP"
+        case "fc_scp":
+            return "SCP"
+        case "fc_vooc1p0":
+            return "VOOC1P0"
+        case "fc_vooc4p0":
+            return "VOOC4P0"
+        case "fc_svooc2p0":
+            return "SVOOC2P0"
+        case "fc_tfcp":
+            return "TFCP"
+        case "fc_ufcs":
+            return "UFCS"
+        case "fc_pe1":
+            return "PE1"
+        case "fc_pe2":
+            return "PE2"
+        case "fc_pd_fix5v", "pd fixed 5v", "pd 固定电压", "pd 固定电压档":
+            return "PD_FIX5V"
+        case "fc_pd_fixhv", "pd fixed high voltage", "pd fixed hv", "pd 固定高压":
+            return "PD_FIXHV"
+        case "fc_pd_spr_avs":
+            return "PD_SPR_AVS"
+        case "fc_pd_pps", "pd programmable power supply", "programmable power supply", "pps":
+            return "PD_PPS"
+        case "fc_pd_epr_hv":
+            return "PD_EPR_HV"
+        case "fc_pd_avs":
+            return "PD_AVS"
+        case "fc_pd_mi_pps", "pd_mi_pps":
+            return "小米澎湃秒充"
         default:
-            return normalized
-                .replacingOccurrences(of: "Programmable Power Supply", with: "可编程电源")
-                .replacingOccurrences(of: "Fixed Supply", with: "固定电压")
-                .replacingOccurrences(of: "Not Charging", with: "未充电")
+            return normalized.hasPrefix("FC_") ? String(normalized.dropFirst(3)) : normalized
+        }
+    }
+
+    private static func miniProgramFastChargeProtocolLabel(for value: Int) -> String? {
+        switch value {
+        case 0: return "NONE"
+        case 1: return "QC2"
+        case 2: return "QC3"
+        case 3: return "QC3P"
+        case 4: return "SFCP"
+        case 5: return "AFC"
+        case 6: return "FCP"
+        case 7: return "SCP"
+        case 8: return "VOOC1P0"
+        case 9: return "VOOC4P0"
+        case 10: return "SVOOC2P0"
+        case 11: return "TFCP"
+        case 12: return "UFCS"
+        case 13: return "PE1"
+        case 14: return "PE2"
+        case 15: return "PD_FIX5V"
+        case 16: return "PD_FIXHV"
+        case 17: return "PD_SPR_AVS"
+        case 18: return "PD_PPS"
+        case 19: return "PD_EPR_HV"
+        case 20: return "PD_AVS"
+        case 21: return "小米澎湃秒充"
+        case 255: return "NOT_CHARGING"
+        default: return nil
         }
     }
 

@@ -48,7 +48,7 @@ releases/CandyMonitor_<version>_x86_64.dmg
 3. Enter a device name and MCP SSE URL.
 4. CandyMonitor validates the endpoint before saving it to the local encrypted app store.
 
-MCP URLs are stored under `~/Library/Application Support/CandyMonitor/mcp-vault/` as AES-GCM encrypted, lightly obfuscated files. They are not written to SwiftData or the macOS keychain.
+CandyMonitor is sandboxed. MCP URLs are stored under the app container's `Library/Application Support/CandyMonitor/mcp-vault/` directory as AES-GCM encrypted, lightly obfuscated files. They are not written to SwiftData or the macOS keychain.
 
 ## Release Workflow
 
@@ -59,7 +59,12 @@ This project follows the same high-level flow as MotrixMac:
    ```bash
    ./scripts/build.sh release
    ```
-3. Create a GitHub Release and upload both DMGs:
+3. Verify the packaged app still has the sandbox entitlement before uploading. A release signed without `com.apple.security.app-sandbox=true` will read a different data container and appear to lose all local devices and history:
+   ```bash
+   codesign -d --entitlements :- .build/apps/CandyMonitor_arm64.app 2>/dev/null | grep -A1 com.apple.security.app-sandbox
+   codesign --verify --deep --strict --verbose=2 .build/apps/CandyMonitor_arm64.app
+   ```
+4. Create a GitHub Release and upload both DMGs:
    ```bash
    VERSION=1.0
    gh release create "v$VERSION" \

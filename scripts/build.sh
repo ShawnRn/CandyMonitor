@@ -9,6 +9,7 @@ PROJECT_FILE="$PROJECT_DIR/CandyMonitor.xcodeproj"
 SCHEME="CandyMonitor"
 PROJECT_NAME="CandyMonitor"
 APP_NAME="CandyMonitor.app"
+ENTITLEMENTS_FILE="$PROJECT_DIR/CandyMonitor/CandyMonitor.entitlements"
 RELEASE_DIR="$ROOT/releases"
 BUILD_DIR="$ROOT/.build"
 ARCHIVE_DIR="$BUILD_DIR/archive"
@@ -24,6 +25,21 @@ fi
 command -v create-dmg >/dev/null 2>&1 || {
   echo "error: create-dmg is required. Install with: brew install create-dmg"
   exit 1
+}
+
+verify_sandbox_entitlement() {
+  local app_bundle="$1"
+  local entitlements_xml
+
+  codesign --verify --deep --strict --verbose=2 "$app_bundle"
+  entitlements_xml=$(codesign -d --entitlements :- "$app_bundle" 2>/dev/null || true)
+
+  if ! grep -q "<key>com.apple.security.app-sandbox</key>" <<<"$entitlements_xml" ||
+     ! grep -A1 "<key>com.apple.security.app-sandbox</key>" <<<"$entitlements_xml" | grep -q "<true/>"; then
+    echo "error: $app_bundle is missing com.apple.security.app-sandbox=true"
+    echo "error: refusing to package an app that would read a different data container"
+    exit 1
+  fi
 }
 
 echo "==> Reading version from Xcode settings"
@@ -94,7 +110,8 @@ for TARGET_ARCH in arm64 x86_64; do
   fi
 
   echo "==> Signing app bundle for $TARGET_ARCH"
-  codesign --force --deep --sign "-" "$ARCH_APP_BUNDLE"
+  codesign --force --deep --sign "-" --entitlements "$ENTITLEMENTS_FILE" "$ARCH_APP_BUNDLE"
+  verify_sandbox_entitlement "$ARCH_APP_BUNDLE"
 
   mkdir -p "$TEMP_DMG_ROOT" "$TEMP_DMG_OUTPUT"
   cp -R "$ARCH_APP_BUNDLE" "$TEMP_DMG_ROOT/$APP_NAME"

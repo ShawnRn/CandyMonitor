@@ -1581,10 +1581,11 @@ private struct PortDetailSheet: View {
                         LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 3), spacing: 18) {
                             PortDetailMetric(title: "品牌", value: deviceBrand)
                             PortDetailMetric(title: "型号", value: deviceModel)
-                            PortDetailMetric(title: "电池容量(mWh)", value: batteryCapacityText)
+                            PortDetailMetric(title: "电池设计容量", value: batteryCapacityText)
+                            PortDetailMetric(title: "当前最大容量", value: batteryLastFullCapacityText)
                             PortDetailMetric(title: "健康度", value: batteryHealthText)
                             PortDetailMetric(title: "当前电量", value: batteryPercentText)
-                            PortDetailMetric(title: "预计充满", value: estimatedFullText)
+                            PortDetailMetric(title: "预计充满时间", value: estimatedFullText)
                         }
                     }
 
@@ -1708,9 +1709,12 @@ private struct PortDetailSheet: View {
         port.pdStatus?.manufacturer != nil ||
             port.pdStatus?.modelName != nil ||
             port.pdStatus?.batteryCapacityMWh != nil ||
+            port.pdStatus?.batteryLastFullChargeCapacityMWh != nil ||
+            port.pdStatus?.batteryPresentCapacityMWh != nil ||
             port.pdStatus?.batteryHealthPercent != nil ||
             port.pdStatus?.batteryPercent != nil ||
             port.pdStatus?.estimatedFullMinutes != nil ||
+            port.pdStatus?.remainingTimeText != nil ||
             portStats.isEmpty == false
     }
 
@@ -1740,24 +1744,33 @@ private struct PortDetailSheet: View {
 
     private var batteryCapacityText: String {
         formattedMWh(port.pdStatus?.batteryCapacityMWh) ??
-            statValue(["battery_capacity_mwh", "capacity_mwh", "design_capacity_mwh", "full_charge_capacity_mwh"]) ??
+            statValue(["batteryDesignCapacity", "battery_capacity_mwh", "capacity_mwh", "design_capacity_mwh"]) ??
+            "-"
+    }
+
+    private var batteryLastFullCapacityText: String {
+        formattedMWh(port.pdStatus?.batteryLastFullChargeCapacityMWh) ??
+            statValue(["batteryLastFullChargeCapacity", "lastFullChargeCapacity", "full_charge_capacity_mwh", "current_max_capacity_mwh"]) ??
             "-"
     }
 
     private var batteryHealthText: String {
-        formattedPercent(port.pdStatus?.batteryHealthPercent) ??
+        formattedBatteryHealth(port.pdStatus?.batteryHealthPercent) ??
             statValue(["battery_health_percent", "battery_health", "health_percent", "health", "soh"]) ??
             "-"
     }
 
     private var batteryPercentText: String {
-        formattedPercent(port.batteryPercent) ??
-            statValue(["battery_percent", "battery_level", "battery_soc", "soc", "state_of_charge"]) ??
+        formattedPresentCapacity() ??
+            formattedPercent(port.batteryPercent) ??
+            statValue(["capacityPercent", "battery_percent", "battery_level", "battery_soc", "soc", "state_of_charge"]) ??
             "-"
     }
 
     private var estimatedFullText: String {
-        formattedMinutes(port.pdStatus?.estimatedFullMinutes) ??
+        port.pdStatus?.remainingTimeText ??
+            statValue(["remainingTimeStr", "remaining_time_str", "timeToFullText"]) ??
+            formattedMinutes(port.pdStatus?.estimatedFullMinutes) ??
             statValue(["estimated_full_minutes", "time_to_full_minutes", "minutes_to_full", "remaining_charge_minutes"]) ??
             "-"
     }
@@ -1800,7 +1813,10 @@ private struct PortDetailSheet: View {
             items.append("健康度 \(Int(health.rounded()))%")
         }
         if let capacity = port.pdStatus?.batteryCapacityMWh {
-            items.append("容量 \(Int(capacity.rounded())) mWh")
+            items.append("设计容量 \(Int(capacity.rounded())) mWh")
+        }
+        if let capacity = port.pdStatus?.batteryLastFullChargeCapacityMWh {
+            items.append("当前最大 \(Int(capacity.rounded())) mWh")
         }
         if let cycleCount = port.pdStatus?.cycleCount {
             items.append("循环 \(cycleCount) 次")
@@ -1834,7 +1850,27 @@ private struct PortDetailSheet: View {
 
     private func formattedMWh(_ value: Double?) -> String? {
         guard let value else { return nil }
-        return "\(Int(value.rounded()))"
+        return "\(Int(value.rounded())) mWh"
+    }
+
+    private func formattedPresentCapacity() -> String? {
+        guard let present = port.pdStatus?.batteryPresentCapacityMWh else { return nil }
+        let capacity = "\(Int(present.rounded())) mWh"
+        if let percent = port.pdStatus?.batteryPercent {
+            return "\(capacity) (\(Int(percent.rounded()))%)"
+        }
+        return capacity
+    }
+
+    private func formattedBatteryHealth(_ value: Double?) -> String? {
+        guard let value else { return nil }
+        if value.rounded() == 100 {
+            return "正常"
+        }
+        if value < 75 {
+            return "-"
+        }
+        return "\(Int(value.rounded()))%"
     }
 
     private func formattedMinutes(_ value: Double?) -> String? {

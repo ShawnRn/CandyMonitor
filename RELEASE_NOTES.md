@@ -1,3 +1,11 @@
+## CandyMonitor 1.0.2
+
+- 修复 release 二次签名丢失 App Sandbox entitlement 导致更新后读取非沙盒空库的问题；本地设备、充电记录和采样数据会继续从原 sandbox container 读取。
+- `scripts/build.sh` 现在使用 `CandyMonitor/CandyMonitor/CandyMonitor.entitlements` 重新签名，并在打包前强制验证 `com.apple.security.app-sandbox=true`，缺失时直接终止发布。
+- 端口详情的标准 PD 电池字段对齐小程序命名，补充读取 `电池设计容量`、`当前最大容量`、`当前电量`、`健康度` 和 `预计充满时间` 等字段。
+- 快充协议名称改为小程序同款枚举显示，例如 `PD_FIXHV`、`PD_PPS`、`NOT_CHARGING`；小米私有协议仍显示为 `小米澎湃秒充`。
+- AGENTS、README 和本地 `.agent` 发布文档补充持久化数据域与 entitlement 发布检查，防止后续 release 再把数据目录切错。
+
 ## CandyMonitor 1.0.1
 
 - 充电记录只在端口实际输出功率后创建，避免单口接入时多个空闲端口一起显示“正在记录”。
