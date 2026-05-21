@@ -288,7 +288,8 @@ private struct NativeMonitorView: View {
     let store: MonitorStore
     @State private var metric: ChartMetric = .power
     @State private var selectedPortIDs: Set<Int> = []
-    @State private var hoveredLiveSample: ChartSamplePoint?
+    @State private var portFilterAnchor: Int?
+    @State private var hoveredLiveSamples: [ChartSamplePoint] = []
     @State private var detailPort: PortViewState?
 
     private var effectivePortIDs: Set<Int> {
@@ -302,7 +303,15 @@ private struct NativeMonitorView: View {
     }
 
     private var lineSamples: [ChartLinePoint] {
-        segmentedChartPoints(from: filteredSamples)
+        segmentedChartPoints(from: plottedSamples)
+    }
+
+    private var plottedSamples: [ChartSamplePoint] {
+        downsampleChartSamples(filteredSamples, metric: metric)
+    }
+
+    private var hoveredSampleIDs: Set<UUID> {
+        Set(hoveredLiveSamples.map(\.id))
     }
 
     var body: some View {
@@ -380,7 +389,7 @@ private struct NativeMonitorView: View {
             totalPowerW: store.totalPowerW,
             selectedPortIDs: selectedPortIDs,
             selectPort: { detailPort = $0 },
-            togglePort: togglePort
+            togglePort: selectPortFilter
         )
     }
 
@@ -410,26 +419,31 @@ private struct NativeMonitorView: View {
             portFilterBar
 
             ZStack(alignment: .topLeading) {
-                Chart(lineSamples) { point in
-                    LineMark(
-                        x: .value("Time", point.sample.timestamp),
-                        y: .value(metric.title, metric.displayValue(point.sample)),
-                        series: .value("Segment", point.seriesID)
-                    )
-                    .foregroundStyle(by: .value("Port", point.sample.portName))
-                    .lineStyle(StrokeStyle(lineWidth: 2.5, lineCap: .round, lineJoin: .round))
-                    .interpolationMethod(.linear)
+                Chart {
+                    ForEach(lineSamples) { point in
+                        LineMark(
+                            x: .value("Time", point.sample.timestamp),
+                            y: .value(metric.title, metric.displayValue(point.sample)),
+                            series: .value("Segment", point.seriesID)
+                        )
+                        .foregroundStyle(by: .value("Port", point.sample.portName))
+                        .lineStyle(StrokeStyle(lineWidth: 2.5, lineCap: .round, lineJoin: .round))
+                        .interpolationMethod(.linear)
 
-                    if hoveredLiveSample?.id == point.sample.id {
-                        RuleMark(x: .value("Time", point.sample.timestamp))
+                        if hoveredSampleIDs.contains(point.sample.id) {
+                            PointMark(
+                                x: .value("Time", point.sample.timestamp),
+                                y: .value(metric.title, metric.displayValue(point.sample))
+                            )
+                            .foregroundStyle(CandyTheme.syrup)
+                            .symbolSize(90)
+                        }
+                    }
+
+                    if let hoveredTimestamp = hoveredLiveSamples.first?.timestamp {
+                        RuleMark(x: .value("Time", hoveredTimestamp))
                             .foregroundStyle(CandyTheme.syrup.opacity(0.42))
                             .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 4]))
-                        PointMark(
-                            x: .value("Time", point.sample.timestamp),
-                            y: .value(metric.title, metric.displayValue(point.sample))
-                        )
-                        .foregroundStyle(CandyTheme.syrup)
-                        .symbolSize(90)
                     }
                 }
                 .chartYAxisLabel(metric.axisLabel)
@@ -444,15 +458,15 @@ private struct NativeMonitorView: View {
                                 case .active(let location):
                                     updateHover(location: location, proxy: proxy, geometry: geometry)
                                 case .ended:
-                                    hoveredLiveSample = nil
+                                    hoveredLiveSamples = []
                                 }
                             }
                     }
                 }
                 .frame(height: 220)
 
-                if let hoveredLiveSample {
-                    ChartReadout(sample: hoveredLiveSample, metric: metric)
+                if hoveredLiveSamples.isEmpty == false {
+                    ChartReadout(samples: hoveredLiveSamples, metric: metric)
                         .padding(14)
                 }
             }
@@ -531,37 +545,53 @@ private struct NativeMonitorView: View {
                     title: port.port.displayName,
                     isSelected: selectedPortIDs.contains(port.port.index)
                 ) {
-                    togglePort(port.port.index)
+                    selectPortFilter(port.port.index)
                 }
             }
         }
     }
 
-    private func togglePort(_ port: Int) {
-        if selectedPortIDs.isEmpty {
-            selectedPortIDs = [port]
-        } else if selectedPortIDs.contains(port) {
-            selectedPortIDs.remove(port)
+    private func selectPortFilter(_ port: Int) {
+        let modifiers = NSEvent.modifierFlags
+        let availablePorts = store.livePorts.map(\.port.index)
+
+        if modifiers.contains(.shift),
+           let anchor = portFilterAnchor ?? selectedPortIDs.sorted().first,
+           let anchorIndex = availablePorts.firstIndex(of: anchor),
+           let currentIndex = availablePorts.firstIndex(of: port) {
+            let range = anchorIndex <= currentIndex ? anchorIndex...currentIndex : currentIndex...anchorIndex
+            let rangeSelection = Set(range.map { availablePorts[$0] })
+            if modifiers.contains(.command) {
+                selectedPortIDs.formUnion(rangeSelection)
+            } else {
+                selectedPortIDs = rangeSelection
+            }
+        } else if modifiers.contains(.command) {
+            if selectedPortIDs.contains(port) {
+                selectedPortIDs.remove(port)
+            } else {
+                selectedPortIDs.insert(port)
+            }
         } else {
-            selectedPortIDs.insert(port)
+            selectedPortIDs = [port]
         }
+
+        portFilterAnchor = port
     }
 
     private func updateHover(location: CGPoint, proxy: ChartProxy, geometry: GeometryProxy) {
         guard let plotAnchor = proxy.plotFrame else {
-            hoveredLiveSample = nil
+            hoveredLiveSamples = []
             return
         }
         let plotFrame = geometry[plotAnchor]
         guard plotFrame.contains(location),
               let date: Date = proxy.value(atX: location.x - plotFrame.origin.x) else {
-            hoveredLiveSample = nil
+            hoveredLiveSamples = []
             return
         }
 
-        hoveredLiveSample = filteredSamples.min {
-            abs($0.timestamp.timeIntervalSince(date)) < abs($1.timestamp.timeIntervalSince(date))
-        }
+        hoveredLiveSamples = nearestSamplesByPort(to: date, in: plottedSamples)
     }
 }
 
@@ -954,7 +984,8 @@ private struct MonitorView: View {
     let store: MonitorStore
     @State private var metric: ChartMetric = .power
     @State private var selectedPortIDs: Set<Int> = []
-    @State private var hoveredLiveSample: ChartSamplePoint?
+    @State private var portFilterAnchor: Int?
+    @State private var hoveredLiveSamples: [ChartSamplePoint] = []
     @State private var detailPort: PortViewState?
 
     private var effectivePortIDs: Set<Int> {
@@ -968,7 +999,15 @@ private struct MonitorView: View {
     }
 
     private var lineSamples: [ChartLinePoint] {
-        segmentedChartPoints(from: filteredSamples)
+        segmentedChartPoints(from: plottedSamples)
+    }
+
+    private var plottedSamples: [ChartSamplePoint] {
+        downsampleChartSamples(filteredSamples, metric: metric)
+    }
+
+    private var hoveredSampleIDs: Set<UUID> {
+        Set(hoveredLiveSamples.map(\.id))
     }
 
     var body: some View {
@@ -1032,7 +1071,7 @@ private struct MonitorView: View {
         VStack(alignment: .leading, spacing: 12) {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(alignment: .firstTextBaseline) {
-                    Text("20 分钟曲线")
+                    Text("半小时曲线")
                         .font(.headline)
                     Text("点接口卡片查看详情；下方芯片切换单路曲线。")
                         .font(.callout)
@@ -1050,26 +1089,31 @@ private struct MonitorView: View {
             }
 
             ZStack(alignment: .topLeading) {
-                Chart(lineSamples) { point in
-                    LineMark(
-                        x: .value("Time", point.sample.timestamp),
-                        y: .value(metric.title, metric.displayValue(point.sample)),
-                        series: .value("Segment", point.seriesID)
-                    )
-                    .foregroundStyle(by: .value("Port", point.sample.portName))
-                    .lineStyle(StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
-                    .interpolationMethod(.linear)
+                Chart {
+                    ForEach(lineSamples) { point in
+                        LineMark(
+                            x: .value("Time", point.sample.timestamp),
+                            y: .value(metric.title, metric.displayValue(point.sample)),
+                            series: .value("Segment", point.seriesID)
+                        )
+                        .foregroundStyle(by: .value("Port", point.sample.portName))
+                        .lineStyle(StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
+                        .interpolationMethod(.linear)
 
-                    if hoveredLiveSample?.id == point.sample.id {
-                        RuleMark(x: .value("Time", point.sample.timestamp))
+                        if hoveredSampleIDs.contains(point.sample.id) {
+                            PointMark(
+                                x: .value("Time", point.sample.timestamp),
+                                y: .value(metric.title, metric.displayValue(point.sample))
+                            )
+                            .foregroundStyle(CandyTheme.berry)
+                            .symbolSize(90)
+                        }
+                    }
+
+                    if let hoveredTimestamp = hoveredLiveSamples.first?.timestamp {
+                        RuleMark(x: .value("Time", hoveredTimestamp))
                             .foregroundStyle(CandyTheme.berry.opacity(0.45))
                             .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 4]))
-                        PointMark(
-                            x: .value("Time", point.sample.timestamp),
-                            y: .value(metric.title, metric.displayValue(point.sample))
-                        )
-                        .foregroundStyle(CandyTheme.berry)
-                        .symbolSize(90)
                     }
                 }
                 .chartYAxisLabel(metric.axisLabel)
@@ -1084,15 +1128,15 @@ private struct MonitorView: View {
                                 case .active(let location):
                                     updateHover(location: location, proxy: proxy, geometry: geometry)
                                 case .ended:
-                                    hoveredLiveSample = nil
+                                    hoveredLiveSamples = []
                                 }
                             }
                     }
                 }
                 .frame(height: 300)
 
-                if let hoveredLiveSample {
-                    ChartReadout(sample: hoveredLiveSample, metric: metric)
+                if hoveredLiveSamples.isEmpty == false {
+                    ChartReadout(samples: hoveredLiveSamples, metric: metric)
                         .padding(14)
                 }
             }
@@ -1165,37 +1209,53 @@ private struct MonitorView: View {
                     title: port.port.displayName,
                     isSelected: selectedPortIDs.contains(port.port.index)
                 ) {
-                    togglePort(port.port.index)
+                    selectPortFilter(port.port.index)
                 }
             }
         }
     }
 
-    private func togglePort(_ port: Int) {
-        if selectedPortIDs.isEmpty {
-            selectedPortIDs = [port]
-        } else if selectedPortIDs.contains(port) {
-            selectedPortIDs.remove(port)
+    private func selectPortFilter(_ port: Int) {
+        let modifiers = NSEvent.modifierFlags
+        let availablePorts = store.livePorts.map(\.port.index)
+
+        if modifiers.contains(.shift),
+           let anchor = portFilterAnchor ?? selectedPortIDs.sorted().first,
+           let anchorIndex = availablePorts.firstIndex(of: anchor),
+           let currentIndex = availablePorts.firstIndex(of: port) {
+            let range = anchorIndex <= currentIndex ? anchorIndex...currentIndex : currentIndex...anchorIndex
+            let rangeSelection = Set(range.map { availablePorts[$0] })
+            if modifiers.contains(.command) {
+                selectedPortIDs.formUnion(rangeSelection)
+            } else {
+                selectedPortIDs = rangeSelection
+            }
+        } else if modifiers.contains(.command) {
+            if selectedPortIDs.contains(port) {
+                selectedPortIDs.remove(port)
+            } else {
+                selectedPortIDs.insert(port)
+            }
         } else {
-            selectedPortIDs.insert(port)
+            selectedPortIDs = [port]
         }
+
+        portFilterAnchor = port
     }
 
     private func updateHover(location: CGPoint, proxy: ChartProxy, geometry: GeometryProxy) {
         guard let plotAnchor = proxy.plotFrame else {
-            hoveredLiveSample = nil
+            hoveredLiveSamples = []
             return
         }
         let plotFrame = geometry[plotAnchor]
         guard plotFrame.contains(location),
               let date: Date = proxy.value(atX: location.x - plotFrame.origin.x) else {
-            hoveredLiveSample = nil
+            hoveredLiveSamples = []
             return
         }
 
-        hoveredLiveSample = filteredSamples.min {
-            abs($0.timestamp.timeIntervalSince(date)) < abs($1.timestamp.timeIntervalSince(date))
-        }
+        hoveredLiveSamples = nearestSamplesByPort(to: date, in: plottedSamples)
     }
 }
 
@@ -1274,6 +1334,41 @@ private struct ChartLinePoint: Identifiable {
     let seriesID: String
 }
 
+private func downsampleChartSamples(
+    _ samples: [ChartSamplePoint],
+    metric: ChartMetric,
+    maxSamplesPerPort: Int = 240
+) -> [ChartSamplePoint] {
+    let grouped = Dictionary(grouping: samples) { $0.portIndex }
+
+    return grouped.keys.sorted().flatMap { portIndex in
+        let sortedSamples = (grouped[portIndex] ?? []).sorted { $0.timestamp < $1.timestamp }
+        guard sortedSamples.count > maxSamplesPerPort else { return sortedSamples }
+
+        let bucketSize = Int(ceil(Double(sortedSamples.count) / Double(maxSamplesPerPort)))
+        var reduced: [ChartSamplePoint] = []
+        reduced.reserveCapacity(maxSamplesPerPort * 2)
+
+        for bucketStart in stride(from: 0, to: sortedSamples.count, by: bucketSize) {
+            let bucketEnd = min(bucketStart + bucketSize, sortedSamples.count)
+            let bucket = Array(sortedSamples[bucketStart..<bucketEnd])
+            if let first = bucket.first {
+                reduced.append(first)
+            }
+            if let extreme = bucket.max(by: { metric.displayValue($0) < metric.displayValue($1) }),
+               extreme.id != reduced.last?.id {
+                reduced.append(extreme)
+            }
+            if let last = bucket.last,
+               last.id != reduced.last?.id {
+                reduced.append(last)
+            }
+        }
+
+        return reduced.sorted { $0.timestamp < $1.timestamp }
+    }
+}
+
 private func segmentedChartPoints(from samples: [ChartSamplePoint]) -> [ChartLinePoint] {
     let grouped = Dictionary(grouping: samples) { $0.portIndex }
     var points: [ChartLinePoint] = []
@@ -1300,6 +1395,22 @@ private func segmentedChartPoints(from samples: [ChartSamplePoint]) -> [ChartLin
     return points
 }
 
+private func nearestSamplesByPort(to date: Date, in samples: [ChartSamplePoint]) -> [ChartSamplePoint] {
+    let grouped = Dictionary(grouping: samples) { $0.portIndex }
+    let tolerance: TimeInterval = 10
+
+    return grouped.keys.sorted().compactMap { portIndex in
+        let nearest = grouped[portIndex]?.min {
+            abs($0.timestamp.timeIntervalSince(date)) < abs($1.timestamp.timeIntervalSince(date))
+        }
+        guard let nearest,
+              abs(nearest.timestamp.timeIntervalSince(date)) <= tolerance else {
+            return nil
+        }
+        return nearest
+    }
+}
+
 private struct FilterChip: View {
     let title: String
     let isSelected: Bool
@@ -1319,18 +1430,23 @@ private struct FilterChip: View {
 }
 
 private struct ChartReadout: View {
-    let sample: ChartSamplePoint
+    let samples: [ChartSamplePoint]
     let metric: ChartMetric
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
-            Text(sample.portName)
-                .font(.caption.weight(.semibold))
-            Text(sample.timestamp, format: .dateTime.hour().minute().second())
+            Text(samples.first?.timestamp ?? Date(), format: .dateTime.hour().minute().second())
                 .font(.caption2)
                 .foregroundStyle(.secondary)
-            Text("\(metric.title) \(metric.formattedValue(sample))")
-                .font(.headline.monospacedDigit())
+            ForEach(samples) { sample in
+                HStack(spacing: 10) {
+                    Text(sample.portName)
+                        .font(.caption.weight(.semibold))
+                        .frame(width: 30, alignment: .leading)
+                    Text(metric.formattedValue(sample))
+                        .font(.headline.monospacedDigit())
+                }
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
@@ -1463,12 +1579,12 @@ private struct PortDetailSheet: View {
                         }
 
                         LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 3), spacing: 18) {
-                            PortDetailMetric(title: "品牌", value: isXiaomiSurgeCharge ? "小米" : "-")
-                            PortDetailMetric(title: "型号", value: port.detail?.deviceNameZH ?? port.detail?.deviceNameEN ?? (isXiaomiSurgeCharge ? "澎湃秒充" : "-"))
-                            PortDetailMetric(title: "电池容量(mWh)", value: "-")
-                            PortDetailMetric(title: "健康度", value: "-")
-                            PortDetailMetric(title: "当前电量", value: port.batteryPercent.map { "\(Int($0))%" } ?? "-")
-                            PortDetailMetric(title: "预计充满", value: "-")
+                            PortDetailMetric(title: "品牌", value: deviceBrand)
+                            PortDetailMetric(title: "型号", value: deviceModel)
+                            PortDetailMetric(title: "电池容量(mWh)", value: batteryCapacityText)
+                            PortDetailMetric(title: "健康度", value: batteryHealthText)
+                            PortDetailMetric(title: "当前电量", value: batteryPercentText)
+                            PortDetailMetric(title: "预计充满", value: estimatedFullText)
                         }
                     }
 
@@ -1528,6 +1644,7 @@ private struct PortDetailSheet: View {
         .background(Color(nsColor: .windowBackgroundColor))
         .task {
             await store.refreshSelectedDeviceNow()
+            await store.refreshPortStats(port: port.port.index)
         }
         .confirmationDialog("确认控制操作", isPresented: Binding(
             get: { pendingPowerState != nil },
@@ -1558,6 +1675,9 @@ private struct PortDetailSheet: View {
     }
 
     private var deviceTitle: String {
+        if let model = port.pdStatus?.modelName, model.isEmpty == false {
+            return model
+        }
         if let name = port.detail?.deviceNameZH ?? port.detail?.deviceNameEN, name.isEmpty == false {
             return name
         }
@@ -1571,12 +1691,87 @@ private struct PortDetailSheet: View {
         if isXiaomiSurgeCharge {
             return "检测到小米私有快充协议；设备型号和电池信息不一定会通过标准 PD 返回。"
         }
+        if hasPDDeviceInfo {
+            return "已读取到标准 PD 设备与电池信息，电量和满电判断会优先使用这些数据。"
+        }
         if port.connected {
-            return port.batteryPercent == nil
-                ? "此设备没有正确实现标准协议，无法准确识别设备型号和电池电量等信息。"
-                : "已读取到 PD 电量数据，曲线会优先使用电量判断满电。"
+            return "设备已接入，但当前 MCP 响应没有返回更多 PD 设备信息。"
         }
         return "当前端口没有检测到负载，接入设备后会自动刷新这里的信息。"
+    }
+
+    private var portStats: [String: String] {
+        store.portStatsByPort[port.port.index] ?? [:]
+    }
+
+    private var hasPDDeviceInfo: Bool {
+        port.pdStatus?.manufacturer != nil ||
+            port.pdStatus?.modelName != nil ||
+            port.pdStatus?.batteryCapacityMWh != nil ||
+            port.pdStatus?.batteryHealthPercent != nil ||
+            port.pdStatus?.batteryPercent != nil ||
+            port.pdStatus?.estimatedFullMinutes != nil ||
+            portStats.isEmpty == false
+    }
+
+    private var deviceBrand: String {
+        if let manufacturer = port.pdStatus?.manufacturer, manufacturer.isEmpty == false {
+            return manufacturer
+        }
+        if let stat = statValue(["manufacturer", "vendor", "brand", "device_manufacturer", "device_vendor"]) {
+            return stat
+        }
+        if isAppleDevice {
+            return "Apple"
+        }
+        if isXiaomiSurgeCharge {
+            return "小米"
+        }
+        return "-"
+    }
+
+    private var deviceModel: String {
+        port.pdStatus?.modelName ??
+            statValue(["model", "model_name", "device_model", "product_name", "name"]) ??
+            port.detail?.deviceNameZH ??
+            port.detail?.deviceNameEN ??
+            (isXiaomiSurgeCharge ? "澎湃秒充" : "-")
+    }
+
+    private var batteryCapacityText: String {
+        formattedMWh(port.pdStatus?.batteryCapacityMWh) ??
+            statValue(["battery_capacity_mwh", "capacity_mwh", "design_capacity_mwh", "full_charge_capacity_mwh"]) ??
+            "-"
+    }
+
+    private var batteryHealthText: String {
+        formattedPercent(port.pdStatus?.batteryHealthPercent) ??
+            statValue(["battery_health_percent", "battery_health", "health_percent", "health", "soh"]) ??
+            "-"
+    }
+
+    private var batteryPercentText: String {
+        formattedPercent(port.batteryPercent) ??
+            statValue(["battery_percent", "battery_level", "battery_soc", "soc", "state_of_charge"]) ??
+            "-"
+    }
+
+    private var estimatedFullText: String {
+        formattedMinutes(port.pdStatus?.estimatedFullMinutes) ??
+            statValue(["estimated_full_minutes", "time_to_full_minutes", "minutes_to_full", "remaining_charge_minutes"]) ??
+            "-"
+    }
+
+    private var isAppleDevice: Bool {
+        let text = [port.pdStatus?.manufacturer, port.pdStatus?.modelName, port.detail?.deviceNameZH, port.detail?.deviceNameEN, portStats.values.joined(separator: " ")]
+            .compactMap { $0 }
+            .joined(separator: " ")
+            .lowercased()
+        return text.contains("apple") ||
+            text.contains("iphone") ||
+            text.contains("ipad") ||
+            text.contains("macbook") ||
+            text.contains("airpods")
     }
 
     private var isXiaomiSurgeCharge: Bool {
@@ -1601,10 +1796,54 @@ private struct PortDetailSheet: View {
         } else {
             items.append("无电量数据")
         }
+        if let health = port.pdStatus?.batteryHealthPercent {
+            items.append("健康度 \(Int(health.rounded()))%")
+        }
+        if let capacity = port.pdStatus?.batteryCapacityMWh {
+            items.append("容量 \(Int(capacity.rounded())) mWh")
+        }
+        if let cycleCount = port.pdStatus?.cycleCount {
+            items.append("循环 \(cycleCount) 次")
+        }
         if port.detail?.sessionChargeMWh ?? 0 > 0 {
             items.append(String(format: "本次 %.2f Wh", Double(port.detail?.sessionChargeMWh ?? 0) / 1000))
         }
         return items
+    }
+
+    private func statValue(_ candidateKeys: [String]) -> String? {
+        let normalizedCandidates = candidateKeys.map(normalizedStatKey)
+        for (key, value) in portStats {
+            let normalizedKey = normalizedStatKey(key)
+            if normalizedCandidates.contains(where: { normalizedKey == $0 || normalizedKey.hasSuffix($0) }) {
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { return trimmed }
+            }
+        }
+        return nil
+    }
+
+    private func normalizedStatKey(_ key: String) -> String {
+        key.lowercased().filter { $0.isLetter || $0.isNumber }
+    }
+
+    private func formattedPercent(_ value: Double?) -> String? {
+        guard let value else { return nil }
+        return "\(Int(value.rounded()))%"
+    }
+
+    private func formattedMWh(_ value: Double?) -> String? {
+        guard let value else { return nil }
+        return "\(Int(value.rounded()))"
+    }
+
+    private func formattedMinutes(_ value: Double?) -> String? {
+        guard let value else { return nil }
+        let minutes = max(Int(value.rounded()), 0)
+        if minutes >= 60 {
+            return "\(minutes / 60)h \(minutes % 60)m"
+        }
+        return "\(minutes)m"
     }
 
     @ViewBuilder
@@ -1723,6 +1962,7 @@ private struct FlowChips: View {
 private struct SessionsView: View {
     let store: MonitorStore
     @State private var selectedSessionIDs = Set<UUID>()
+    @State private var selectionAnchorSessionID: UUID?
     @State private var isConfirmingBulkDelete = false
 
     var body: some View {
@@ -1743,9 +1983,9 @@ private struct SessionsView: View {
                     VStack(spacing: 0) {
                         HeaderBar(title: "充电记录", subtitle: "\(store.sessions.count) 条会话") {
                             HStack(spacing: 8) {
-                                if selectedSessionIDs.isEmpty == false {
+                                if selectedSessionIDs.count > 1 {
                                     Button("取消选择") {
-                                        selectedSessionIDs.removeAll()
+                                        selectSingle(store.selectedSession ?? store.sessions.first)
                                     }
                                     .buttonStyle(SoftButtonStyle())
 
@@ -1761,27 +2001,15 @@ private struct SessionsView: View {
                         ScrollView {
                             LazyVStack(spacing: 8) {
                                 ForEach(store.sessions, id: \.id) { session in
-                                    HStack(spacing: 8) {
-                                        Button {
-                                            toggleSelection(for: session)
-                                        } label: {
-                                            Image(systemName: selectedSessionIDs.contains(session.id) ? "checkmark.circle.fill" : "circle")
-                                                .font(.system(size: 17, weight: .semibold))
-                                                .foregroundStyle(selectedSessionIDs.contains(session.id) ? CandyTheme.syrup : .secondary)
-                                                .frame(width: 22, height: 22)
-                                        }
-                                        .buttonStyle(.plain)
-
-                                        Button {
-                                            store.selectSession(session)
-                                        } label: {
-                                            SessionRow(
-                                                session: session,
-                                                isSelected: store.selectedSession?.id == session.id
-                                            )
-                                        }
-                                        .buttonStyle(.plain)
+                                    Button {
+                                        selectSession(session)
+                                    } label: {
+                                        SessionRow(
+                                            session: session,
+                                            isSelected: selectedSessionIDs.contains(session.id)
+                                        )
                                     }
+                                    .buttonStyle(.plain)
                                 }
                             }
                             .padding(.horizontal, 10)
@@ -1799,8 +2027,16 @@ private struct SessionsView: View {
                 }
             }
         }
+        .onAppear {
+            if selectedSessionIDs.isEmpty {
+                selectSingle(store.selectedSession ?? store.sessions.first)
+            }
+        }
         .onChange(of: store.sessions.map(\.id)) { _, ids in
             selectedSessionIDs = selectedSessionIDs.intersection(Set(ids))
+            if selectedSessionIDs.isEmpty {
+                selectSingle(store.selectedSession ?? store.sessions.first)
+            }
         }
         .alert("删除选中的充电记录？", isPresented: $isConfirmingBulkDelete) {
             Button("删除", role: .destructive) {
@@ -1813,12 +2049,45 @@ private struct SessionsView: View {
         }
     }
 
-    private func toggleSelection(for session: ChargingSession) {
-        if selectedSessionIDs.contains(session.id) {
-            selectedSessionIDs.remove(session.id)
+    private func selectSingle(_ session: ChargingSession?) {
+        guard let session else { return }
+        selectedSessionIDs = [session.id]
+        selectionAnchorSessionID = session.id
+        store.selectSession(session)
+    }
+
+    private func selectSession(_ session: ChargingSession) {
+        let modifiers = NSEvent.modifierFlags
+
+        if modifiers.contains(.shift),
+           let anchor = selectionAnchorSessionID ?? selectedSessionIDs.sorted(by: sessionOrder).first,
+           let anchorIndex = store.sessions.firstIndex(where: { $0.id == anchor }),
+           let currentIndex = store.sessions.firstIndex(where: { $0.id == session.id }) {
+            let range = anchorIndex <= currentIndex ? anchorIndex...currentIndex : currentIndex...anchorIndex
+            let rangeSelection = Set(range.map { store.sessions[$0].id })
+            if modifiers.contains(.command) {
+                selectedSessionIDs.formUnion(rangeSelection)
+            } else {
+                selectedSessionIDs = rangeSelection
+            }
+        } else if modifiers.contains(.command) {
+            if selectedSessionIDs.contains(session.id) {
+                selectedSessionIDs.remove(session.id)
+            } else {
+                selectedSessionIDs.insert(session.id)
+            }
         } else {
-            selectedSessionIDs.insert(session.id)
+            selectedSessionIDs = [session.id]
         }
+
+        selectionAnchorSessionID = session.id
+        store.selectSession(session)
+    }
+
+    private func sessionOrder(_ lhs: UUID, _ rhs: UUID) -> Bool {
+        let left = store.sessions.firstIndex { $0.id == lhs } ?? Int.max
+        let right = store.sessions.firstIndex { $0.id == rhs } ?? Int.max
+        return left < right
     }
 }
 
@@ -1991,9 +2260,13 @@ private struct SessionPowerChart: View {
     let samples: [PortSample]
     @State private var hoveredSample: PortSample?
 
+    private var displaySamples: [PortSample] {
+        downsamplePortSamples(samples)
+    }
+
     var body: some View {
         ZStack(alignment: .topLeading) {
-            Chart(samples) { sample in
+            Chart(displaySamples) { sample in
                 LineMark(
                     x: .value("时间", sample.timestamp),
                     y: .value("功率", sample.powerW)
@@ -2053,10 +2326,37 @@ private struct SessionPowerChart: View {
             return
         }
 
-        hoveredSample = samples.min {
+        hoveredSample = displaySamples.min {
             abs($0.timestamp.timeIntervalSince(date)) < abs($1.timestamp.timeIntervalSince(date))
         }
     }
+}
+
+private func downsamplePortSamples(_ samples: [PortSample], maxSamples: Int = 600) -> [PortSample] {
+    let sortedSamples = samples.sorted { $0.timestamp < $1.timestamp }
+    guard sortedSamples.count > maxSamples else { return sortedSamples }
+
+    let bucketSize = Int(ceil(Double(sortedSamples.count) / Double(maxSamples)))
+    var reduced: [PortSample] = []
+    reduced.reserveCapacity(maxSamples * 2)
+
+    for bucketStart in stride(from: 0, to: sortedSamples.count, by: bucketSize) {
+        let bucketEnd = min(bucketStart + bucketSize, sortedSamples.count)
+        let bucket = Array(sortedSamples[bucketStart..<bucketEnd])
+        if let first = bucket.first {
+            reduced.append(first)
+        }
+        if let peak = bucket.max(by: { $0.powerW < $1.powerW }),
+           peak.id != reduced.last?.id {
+            reduced.append(peak)
+        }
+        if let last = bucket.last,
+           last.id != reduced.last?.id {
+            reduced.append(last)
+        }
+    }
+
+    return reduced.sorted { $0.timestamp < $1.timestamp }
 }
 
 private struct SessionReadout: View {

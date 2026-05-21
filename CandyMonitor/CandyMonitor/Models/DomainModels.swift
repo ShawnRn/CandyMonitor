@@ -424,45 +424,142 @@ struct PDStatusEnvelope: Codable, Sendable {
 struct PDPortStatus: Codable, Hashable, Sendable {
     let port: Int
     let batteryPercent: Double?
+    let manufacturer: String?
+    let modelName: String?
+    let serialNumber: String?
+    let batteryCapacityMWh: Double?
+    let batteryHealthPercent: Double?
+    let estimatedFullMinutes: Double?
+    let cycleCount: Int?
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: DynamicCodingKey.self)
+        let nestedContainers = ["battery", "device", "product", "pd"]
+            .compactMap { try? container.nestedContainer(keyedBy: DynamicCodingKey.self, forKey: .init($0)) }
+        let containers = [container] + nestedContainers
         port = (try? container.decode(Int.self, forKey: .init("port"))) ?? 0
-        let candidateKeys = [
+        batteryPercent = Self.normalizedPercent(Self.decodeFirstDouble(in: containers, keys: [
             "battery_percent",
             "batteryPercent",
             "battery_level",
             "batteryLevel",
             "soc",
-            "battery_soc"
-        ]
-        var percent: Double?
-        for key in candidateKeys where percent == nil {
-            if let value = try? container.decode(Double.self, forKey: .init(key)) {
-                percent = value
-            } else if let value = try? container.decode(Int.self, forKey: .init(key)) {
-                percent = Double(value)
-            }
-        }
-        batteryPercent = percent
+            "battery_soc",
+            "state_of_charge",
+            "relative_state_of_charge"
+        ]))
+        manufacturer = Self.decodeFirstString(in: containers, keys: [
+            "manufacturer", "vendor", "brand", "device_manufacturer", "device_vendor", "oem"
+        ])
+        modelName = Self.decodeFirstString(in: containers, keys: [
+            "model", "model_name", "device_model", "product_name", "name", "product"
+        ])
+        serialNumber = Self.decodeFirstString(in: containers, keys: [
+            "serial", "serial_number", "device_serial", "sn"
+        ])
+        batteryCapacityMWh = Self.decodeFirstDouble(in: containers, keys: [
+            "battery_capacity_mwh", "batteryCapacityMWh", "capacity_mwh", "design_capacity_mwh",
+            "full_charge_capacity_mwh", "battery_full_charge_capacity_mwh", "nominal_capacity_mwh"
+        ])
+        batteryHealthPercent = Self.normalizedPercent(Self.decodeFirstDouble(in: containers, keys: [
+            "battery_health", "battery_health_percent", "health", "health_percent", "soh",
+            "state_of_health"
+        ]))
+        estimatedFullMinutes = Self.decodeFirstDouble(in: containers, keys: [
+            "estimated_full_minutes", "estimate_full_minutes", "time_to_full_minutes",
+            "minutes_to_full", "time_to_full_min", "remaining_charge_minutes"
+        ])
+        cycleCount = Self.decodeFirstInt(in: containers, keys: [
+            "cycle_count", "battery_cycle_count", "cycles"
+        ])
     }
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: DynamicCodingKey.self)
         try container.encode(port, forKey: .init("port"))
         try container.encodeIfPresent(batteryPercent, forKey: .init("battery_percent"))
+        try container.encodeIfPresent(manufacturer, forKey: .init("manufacturer"))
+        try container.encodeIfPresent(modelName, forKey: .init("model"))
+        try container.encodeIfPresent(serialNumber, forKey: .init("serial_number"))
+        try container.encodeIfPresent(batteryCapacityMWh, forKey: .init("battery_capacity_mwh"))
+        try container.encodeIfPresent(batteryHealthPercent, forKey: .init("battery_health_percent"))
+        try container.encodeIfPresent(estimatedFullMinutes, forKey: .init("estimated_full_minutes"))
+        try container.encodeIfPresent(cycleCount, forKey: .init("cycle_count"))
+    }
+
+    private static func decodeFirstString(
+        in containers: [KeyedDecodingContainer<DynamicCodingKey>],
+        keys: [String]
+    ) -> String? {
+        for container in containers {
+            for key in keys {
+                if let value = try? container.decode(String.self, forKey: .init(key)) {
+                    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty { return trimmed }
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func decodeFirstDouble(
+        in containers: [KeyedDecodingContainer<DynamicCodingKey>],
+        keys: [String]
+    ) -> Double? {
+        for container in containers {
+            for key in keys {
+                if let value = try? container.decode(Double.self, forKey: .init(key)) {
+                    return value
+                }
+                if let value = try? container.decode(Int.self, forKey: .init(key)) {
+                    return Double(value)
+                }
+                if let value = try? container.decode(String.self, forKey: .init(key)),
+                   let number = Double(value.trimmingCharacters(in: CharacterSet(charactersIn: "% "))) {
+                    return number
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func decodeFirstInt(
+        in containers: [KeyedDecodingContainer<DynamicCodingKey>],
+        keys: [String]
+    ) -> Int? {
+        for container in containers {
+            for key in keys {
+                if let value = try? container.decode(Int.self, forKey: .init(key)) {
+                    return value
+                }
+                if let value = try? container.decode(Double.self, forKey: .init(key)) {
+                    return Int(value)
+                }
+                if let value = try? container.decode(String.self, forKey: .init(key)),
+                   let number = Int(value.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                    return number
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func normalizedPercent(_ value: Double?) -> Double? {
+        guard let value else { return nil }
+        return value <= 1 ? value * 100 : value
     }
 }
 
 struct PortViewState: Identifiable, Hashable {
     let port: MachinePort
     var detail: PortDetail?
-    var batteryPercent: Double?
+    var pdStatus: PDPortStatus?
     var charging: Bool
 
     var id: Int { port.index }
 
     var powerW: Double { detail?.powerW ?? 0 }
+    var batteryPercent: Double? { pdStatus?.batteryPercent }
     var voltageText: String { "\(detail?.voutMV ?? 0) mV" }
     var currentText: String { "\(detail?.ioutMA ?? 0) mA" }
     var protocolName: String { detail?.fcProtocol ?? "Unknown" }

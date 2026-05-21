@@ -24,6 +24,11 @@ private struct SampleStats {
     let batteryPercent: Double?
 }
 
+private struct RecordingResult {
+    var didMutateStore = false
+    var didChangeSessions = false
+}
+
 @Observable
 @MainActor
 final class MonitorStore {
@@ -37,6 +42,7 @@ final class MonitorStore {
     var sessions: [ChargingSession] = []
     var selectedSession: ChargingSession?
     var selectedSessionSamples: [PortSample] = []
+    var portStatsByPort: [Int: [String: String]] = [:]
     var lowPowerSessionPrompt: ChargingSession?
     var temperatureModeLabel = "-"
     var lastRefreshedAt: Date?
@@ -53,8 +59,15 @@ final class MonitorStore {
     @ObservationIgnored private var pollingTask: Task<Void, Never>?
     @ObservationIgnored private var activeSessions: [String: UUID] = [:]
     @ObservationIgnored private var knownProtocols: [UUID: Set<String>] = [:]
+    @ObservationIgnored private var cachedFacts: [UUID: MachineFacts] = [:]
+    @ObservationIgnored private var factsRefreshedAt: [UUID: Date] = [:]
+    @ObservationIgnored private var lastStoreSaveAt = Date.distantPast
     @ObservationIgnored private let selectedDeviceDefaultsKey = "CandyMonitor.SelectedDeviceID"
     @ObservationIgnored private let logger = Logger(subsystem: "com.shawnrain.CandyMonitor", category: "MonitorStore")
+    @ObservationIgnored private let recentSampleWindow: TimeInterval = 60 * 30
+    @ObservationIgnored private let recordingPowerThresholdW = 0.5
+    @ObservationIgnored private let factsRefreshInterval: TimeInterval = 60
+    @ObservationIgnored private let sampleSaveInterval: TimeInterval = 5
 
     var selectedDevice: MirrorDevice? {
         guard let selectedDeviceID else { return nil }
@@ -179,7 +192,7 @@ final class MonitorStore {
         UserDefaults.standard.set(device.id.uuidString, forKey: selectedDeviceDefaultsKey)
         selectedSection = .monitor
         livePorts = validation.facts.ports.map {
-            PortViewState(port: $0, detail: nil, batteryPercent: nil, charging: false)
+            PortViewState(port: $0, detail: nil, pdStatus: nil, charging: false)
         }
         connectionState = .connected
         restartPollingIfNeeded()
@@ -308,7 +321,7 @@ final class MonitorStore {
             return
         }
         let deviceID = device.id
-        let cutoff = Date().addingTimeInterval(-60 * 20)
+        let cutoff = Date().addingTimeInterval(-recentSampleWindow)
         let descriptor = FetchDescriptor<PortSample>(
             predicate: #Predicate { sample in
                 sample.deviceID == deviceID && sample.timestamp >= cutoff
@@ -445,6 +458,17 @@ final class MonitorStore {
         }
     }
 
+    func refreshPortStats(port: Int) async {
+        guard let device = selectedDeviceSnapshot else { return }
+        do {
+            let client = try await client(for: device)
+            let stats = try await client.portStats(port: port)
+            portStatsByPort[port] = flattenStats(stats)
+        } catch {
+            logger.error("port_stats_failed port=\(port, privacy: .public) \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
     private func samples(for session: ChargingSession) -> [PortSample] {
         guard let modelContext else { return [] }
         let id = session.id
@@ -546,9 +570,8 @@ final class MonitorStore {
     }
 
     private func refreshOnce(device: DeviceSnapshot, client: MCPClient) async throws {
-        let facts = try await retry {
-            try await client.machineFacts()
-        }
+        let now = Date()
+        let facts = try await machineFacts(for: device, client: client, at: now)
         async let detailsTask = retry {
             try await client.portDetails()
         }
@@ -566,7 +589,6 @@ final class MonitorStore {
 
         guard selectedDeviceID == device.id else { return }
 
-        let now = Date()
         let didUpdateDevice = updateDeviceMetadata(
             id: device.id,
             productFamily: facts.productFamily,
@@ -583,18 +605,38 @@ final class MonitorStore {
             return PortViewState(
                 port: port,
                 detail: detail,
-                batteryPercent: pdByPort[port.index]?.batteryPercent,
+                pdStatus: pdByPort[port.index],
                 charging: charging.statusBitmask & (1 << (port.index - 1)) != 0
             )
         }
 
-        let didRecordSamples = recordSamples(deviceID: device.id, deviceName: device.name, ports: livePorts, at: now)
+        let recordingResult = recordSamples(deviceID: device.id, deviceName: device.name, ports: livePorts, at: now)
         connectionState = .connected
         lastError = nil
-        if didUpdateDevice || didRecordSamples {
-            try? modelContext?.save()
-            loadSessions()
+        if didUpdateDevice || recordingResult.didMutateStore {
+            saveStoreIfNeeded(force: didUpdateDevice || recordingResult.didChangeSessions, at: now)
         }
+    }
+
+    private func machineFacts(for device: DeviceSnapshot, client: MCPClient, at now: Date) async throws -> MachineFacts {
+        if let facts = cachedFacts[device.id],
+           let refreshedAt = factsRefreshedAt[device.id],
+           now.timeIntervalSince(refreshedAt) < factsRefreshInterval {
+            return facts
+        }
+
+        let facts = try await retry {
+            try await client.machineFacts()
+        }
+        cachedFacts[device.id] = facts
+        factsRefreshedAt[device.id] = now
+        return facts
+    }
+
+    private func saveStoreIfNeeded(force: Bool = false, at now: Date = Date()) {
+        guard force || now.timeIntervalSince(lastStoreSaveAt) >= sampleSaveInterval else { return }
+        try? modelContext?.save()
+        lastStoreSaveAt = now
     }
 
     private func updateDeviceMetadata(
@@ -622,9 +664,9 @@ final class MonitorStore {
         return didChange
     }
 
-    private func recordSamples(deviceID: UUID, deviceName: String, ports: [PortViewState], at now: Date) -> Bool {
-        guard let modelContext else { return false }
-        var didMutateStore = false
+    private func recordSamples(deviceID: UUID, deviceName: String, ports: [PortViewState], at now: Date) -> RecordingResult {
+        guard let modelContext else { return RecordingResult() }
+        var result = RecordingResult()
         var observedKeys = Set<String>()
         var attachedKeys = Set<String>()
 
@@ -649,8 +691,9 @@ final class MonitorStore {
             ))
 
             let isAttached = port.connected
-            let shouldRecord = isAttached || activeSessions[key] != nil
-            guard shouldRecord else { continue }
+            let hasOutputPower = detail.powerW >= recordingPowerThresholdW
+            let shouldPersistSample = activeSessions[key] != nil || hasOutputPower
+            guard shouldPersistSample else { continue }
 
             var event: String?
             let activeSessionID = activeSessions[key]
@@ -659,7 +702,7 @@ final class MonitorStore {
                 activeSessions.removeValue(forKey: key)
             }
 
-            if session == nil, isAttached {
+            if session == nil, hasOutputPower {
                 let newSession = ChargingSession(
                     deviceID: deviceID,
                     deviceName: deviceName,
@@ -673,20 +716,27 @@ final class MonitorStore {
                 session = newSession
                 event = "session_started"
                 knownProtocols[newSession.id] = []
-                didMutateStore = true
+                sessions.insert(newSession, at: 0)
+                if selectedSession == nil {
+                    selectedSession = newSession
+                }
+                result.didMutateStore = true
+                result.didChangeSessions = true
                 logger.info("session_started port=\(port.port.index, privacy: .public) power=\(detail.powerW, privacy: .public)")
             }
 
             if isAttached == false, let session {
                 event = "device_disconnected"
                 end(session, at: now, reason: "device_disconnected")
-                didMutateStore = true
+                result.didMutateStore = true
+                result.didChangeSessions = true
             }
 
             if let session, let battery = port.batteryPercent, battery >= 99 {
                 event = "battery_full"
                 session.finalBatteryPercent = battery
                 end(session, at: now, reason: "battery_full")
+                result.didChangeSessions = true
             }
 
             let stats = SampleStats(
@@ -717,7 +767,10 @@ final class MonitorStore {
                 event: event
             )
             modelContext.insert(sample)
-            didMutateStore = true
+            if sample.sessionID == selectedSession?.id {
+                selectedSessionSamples.append(sample)
+            }
+            result.didMutateStore = true
         }
 
         for (key, sessionID) in Array(activeSessions) where observedKeys.contains(key) && attachedKeys.contains(key) == false {
@@ -726,12 +779,13 @@ final class MonitorStore {
                 continue
             }
             end(session, at: now, reason: "device_disconnected")
-            didMutateStore = true
+            result.didMutateStore = true
+            result.didChangeSessions = true
         }
 
-        let cutoff = Date().addingTimeInterval(-60 * 20)
+        let cutoff = Date().addingTimeInterval(-recentSampleWindow)
         recentSamples.removeAll { $0.timestamp < cutoff }
-        return didMutateStore
+        return result
     }
 
     private func end(_ session: ChargingSession, at date: Date, reason: String) {
@@ -805,6 +859,31 @@ final class MonitorStore {
             verified: verified
         ))
         try? modelContext.save()
+    }
+
+    private func flattenStats(_ value: Any, prefix: String = "") -> [String: String] {
+        if let dictionary = value as? [String: Any] {
+            return dictionary.reduce(into: [:]) { result, entry in
+                let key = prefix.isEmpty ? entry.key : "\(prefix).\(entry.key)"
+                result.merge(flattenStats(entry.value, prefix: key)) { current, _ in current }
+            }
+        }
+        if let array = value as? [Any] {
+            return array.enumerated().reduce(into: [:]) { result, entry in
+                let key = "\(prefix)[\(entry.offset)]"
+                result.merge(flattenStats(entry.element, prefix: key)) { current, _ in current }
+            }
+        }
+        if let number = value as? NSNumber {
+            return [prefix: number.stringValue]
+        }
+        if let string = value as? String {
+            return [prefix: string]
+        }
+        if value is NSNull || prefix.isEmpty {
+            return [:]
+        }
+        return [prefix: "\(value)"]
     }
 
     private func deleteRows<T: PersistentModel>(_ type: T.Type, matching predicate: (T) -> Bool) {
