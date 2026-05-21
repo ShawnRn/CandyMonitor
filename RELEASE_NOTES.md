@@ -1,3 +1,10 @@
+## CandyMonitor 1.0.3
+
+- 接入小程序同源 IOT WebSocket PD status：监听 service `130` / `stream_port_pd_status`，用于补充 Apple/PD 设备的电池、容量、健康度和预计时间等字段。
+- 新增可选“小程序 IOT WS JWT”本地加密配置；有 WS JWT 时优先使用同源 WS 数据，没有或连接失败时继续回落到 MCP `get_port_pd_status`。
+- WS PD 字段按小程序语义归一化端口号与字段名，并和 MCP PD 数据合并，避免单一来源缺字段时详情页空白。
+- AGENTS、README 和本地 `.agent` 规则补充 WS/JWT 与持久化注意事项，明确 MCP SSE 短 token 不是 IOT WS JWT。
+
 ## CandyMonitor 1.0.2
 
 - 修复 release 二次签名丢失 App Sandbox entitlement 导致更新后读取非沙盒空库的问题；本地设备、充电记录和采样数据会继续从原 sandbox container 读取。

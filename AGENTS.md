@@ -40,6 +40,9 @@ The release script creates separate DMGs for `arm64` and `x86_64` under `release
 - If `enable` is absent, keep port switch controls hidden in the UI instead of offering speculative open/close actions.
 - Fast-charge protocol labels should match the mini-program's `FAST_CHARGE_PROTOCOL_MAP` display: strip the `FC_` prefix for standard enum names such as `PD_FIXHV` and `PD_PPS`, keep `NOT_CHARGING`/`NONE`, and only translate `FC_PD_MI_PPS`/value `21` to `小米澎湃秒充`.
 - PD battery/device fields should accept the mini-program WebSocket key names where available, including `batteryDesignCapacity`, `batteryLastFullChargeCapacity`, `batteryPresentCapacity`, `capacityPercent`, `batteryHealth`, and `remainingTimeStr`.
+- The mini-program same-origin PD status stream is `wss://iot-gateway.minapp.com/ws/cp-02/v2/stats/?t=<iot-jwt>` with service `130` / payload key `stream_port_pd_status`. The app connects to this stream through `CandyIOTPDStatusClient` when an IOT WS JWT is available, normalizes zero-based mini-program port ids to the app's one-based ports, then merges those fields over MCP `get_port_pd_status`.
+- The short token in an MCP SSE URL is not the IOT WS JWT. The mini-program normally obtains the WS JWT from its BaaS `iotgw-jwt` endpoint after login. CandyMonitor stores an optional IOT WS JWT in the encrypted local vault next to the MCP URL and may auto-save one only if a future MCP wrapper exposes a JWT helper tool. If no JWT is present or the WS is unavailable, keep using MCP `get_port_pd_status` as a fallback instead of dropping PD UI data.
+- Do not persist the IOT WS JWT in SwiftData, logs, release notes, screenshots, or GitHub issues. Do not delete the MCP/WS encrypted vault while debugging missing battery data unless the user explicitly asks to reset connection credentials.
 
 ## UI Conventions
 
@@ -61,6 +64,7 @@ Do not commit local decompile caches, `.agent`, `releases/`, or DerivedData outp
 ## Persistence And Entitlement Safety
 
 - CandyMonitor is a sandboxed macOS app. User data lives in the app container, especially `~/Library/Containers/com.shawnrain.CandyMonitor/Data/Library/Application Support/default.store` for SwiftData and `~/Library/Containers/com.shawnrain.CandyMonitor/Data/Library/Application Support/CandyMonitor/` for the device registry and encrypted MCP vault.
+- The encrypted vault also stores the optional mini-program IOT WS JWT for PD status. Preserving sandbox entitlements preserves both the MCP URL and this WS credential path.
 - Never re-sign a release app without `CandyMonitor/CandyMonitor/CandyMonitor.entitlements`. Dropping `com.apple.security.app-sandbox=true` makes the app read non-sandbox `~/Library/Application Support/default.store`, which looks like all devices and charging history disappeared even though the sandbox data still exists.
 - `scripts/build.sh` must keep its post-signing entitlement verification. Do not remove the `codesign --verify` and `com.apple.security.app-sandbox` checks.
 - Before publishing or locally installing a release build, verify the exact app bundle that will be shipped or copied:

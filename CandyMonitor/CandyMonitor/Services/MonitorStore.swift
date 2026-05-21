@@ -9,11 +9,13 @@ private struct DeviceSnapshot: Sendable {
     let id: UUID
     let name: String
     let keychainAccount: String
+    let psn: String?
 
     init(_ device: MirrorDevice) {
         self.id = device.id
         self.name = device.name
         self.keychainAccount = device.keychainAccount
+        self.psn = device.psn
     }
 }
 
@@ -56,6 +58,8 @@ final class MonitorStore {
 
     @ObservationIgnored private var modelContext: ModelContext?
     @ObservationIgnored private var clients: [UUID: MCPClient] = [:]
+    @ObservationIgnored private var pdStreamClients: [UUID: CandyIOTPDStatusClient] = [:]
+    @ObservationIgnored private var iotJWTFetchAttempted: Set<UUID> = []
     @ObservationIgnored private var pollingTask: Task<Void, Never>?
     @ObservationIgnored private var activeSessions: [String: UUID] = [:]
     @ObservationIgnored private var knownProtocols: [UUID: Set<String>] = [:]
@@ -159,7 +163,7 @@ final class MonitorStore {
         restartPollingIfNeeded()
     }
 
-    func addDevice(name: String, sseURLString: String) async throws {
+    func addDevice(name: String, sseURLString: String, iotJWTString: String = "") async throws {
         guard let url = URL(string: sseURLString), url.scheme?.hasPrefix("http") == true else {
             throw MonitorError.invalidURL
         }
@@ -169,6 +173,11 @@ final class MonitorStore {
         let validation = try await client.validate()
         let account = UUID().uuidString
         try KeychainStore.saveMCPURL(sseURLString, account: account)
+        let providedJWT = sanitizedIOTGatewayJWT(iotJWTString)
+        let fetchedJWT = providedJWT == nil ? (try? await client.iotGatewayJWT(psn: validation.info.psn)) : nil
+        if let jwt = providedJWT ?? fetchedJWT {
+            try KeychainStore.saveIOTGatewayJWT(jwt, account: account)
+        }
 
         let device = MirrorDevice(
             name: name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "小电拼 Mirror" : name,
@@ -198,7 +207,7 @@ final class MonitorStore {
         restartPollingIfNeeded()
     }
 
-    func updateDevice(_ device: MirrorDevice, name: String, sseURLString: String) async throws {
+    func updateDevice(_ device: MirrorDevice, name: String, sseURLString: String, iotJWTString: String) async throws {
         guard let url = URL(string: sseURLString), url.scheme?.hasPrefix("http") == true else {
             throw MonitorError.invalidURL
         }
@@ -206,6 +215,15 @@ final class MonitorStore {
         let client = MCPClient(sseURL: url)
         let validation = try await client.validate()
         try KeychainStore.saveMCPURL(sseURLString, account: device.keychainAccount)
+        if let jwt = sanitizedIOTGatewayJWT(iotJWTString) {
+            try KeychainStore.saveIOTGatewayJWT(jwt, account: device.keychainAccount)
+        } else {
+            KeychainStore.deleteIOTGatewayJWT(account: device.keychainAccount)
+        }
+        if let streamClient = pdStreamClients.removeValue(forKey: device.id) {
+            Task { await streamClient.disconnect() }
+        }
+        iotJWTFetchAttempted.remove(device.id)
 
         device.name = name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? device.name : name
         device.psn = validation.info.psn
@@ -235,15 +253,24 @@ final class MonitorStore {
         (try? KeychainStore.loadMCPURL(account: device.keychainAccount)) ?? ""
     }
 
+    func iotGatewayJWT(for device: MirrorDevice) -> String {
+        (try? KeychainStore.loadIOTGatewayJWT(account: device.keychainAccount)) ?? ""
+    }
+
     func deleteSelectedDevice() {
         guard let modelContext, let device = selectedDevice else { return }
         stopPolling()
         KeychainStore.deleteMCPURL(account: device.keychainAccount)
+        KeychainStore.deleteIOTGatewayJWT(account: device.keychainAccount)
         let client = clients[device.id]
+        let streamClient = pdStreamClients[device.id]
         Task {
             await client?.disconnect()
+            await streamClient?.disconnect()
         }
         clients[device.id] = nil
+        pdStreamClients[device.id] = nil
+        iotJWTFetchAttempted.remove(device.id)
 
         let deviceID = device.id
         deleteRows(ChargingSession.self) { $0.deviceID == deviceID }
@@ -598,14 +625,17 @@ final class MonitorStore {
         temperatureModeLabel = temperature.modeName ?? "\(temperature.mode)"
         lastRefreshedAt = now
 
-        let pdByPort = Dictionary(uniqueKeysWithValues: (pd?.ports ?? []).map { ($0.port, $0) })
+        let mcpPDByPort = Dictionary(uniqueKeysWithValues: (pd?.ports ?? []).map { ($0.port, $0) })
+        let wsPDByPort = await pdStatusFromIOTStream(device: device, client: client)
         let detailsByPort = Dictionary(uniqueKeysWithValues: details.ports.map { ($0.port, $0) })
         livePorts = facts.ports.map { port in
             let detail = detailsByPort[port.index]
+            let fallbackPD = mcpPDByPort[port.index]
+            let pdStatus = wsPDByPort[port.index]?.merged(withFallback: fallbackPD) ?? fallbackPD
             return PortViewState(
                 port: port,
                 detail: detail,
-                pdStatus: pdByPort[port.index],
+                pdStatus: pdStatus,
                 charging: charging.statusBitmask & (1 << (port.index - 1)) != 0
             )
         }
@@ -631,6 +661,32 @@ final class MonitorStore {
         cachedFacts[device.id] = facts
         factsRefreshedAt[device.id] = now
         return facts
+    }
+
+    private func pdStatusFromIOTStream(device: DeviceSnapshot, client: MCPClient) async -> [Int: PDPortStatus] {
+        var jwt = sanitizedIOTGatewayJWT((try? KeychainStore.loadIOTGatewayJWT(account: device.keychainAccount)) ?? "")
+        if jwt == nil, iotJWTFetchAttempted.contains(device.id) == false {
+            iotJWTFetchAttempted.insert(device.id)
+            if let fetchedJWT = try? await client.iotGatewayJWT(psn: device.psn),
+               let sanitized = sanitizedIOTGatewayJWT(fetchedJWT) {
+                try? KeychainStore.saveIOTGatewayJWT(sanitized, account: device.keychainAccount)
+                jwt = sanitized
+            }
+        }
+
+        guard let jwt else { return [:] }
+        if let streamClient = pdStreamClients[device.id] {
+            return await streamClient.latestStatuses()
+        }
+
+        let streamClient = CandyIOTPDStatusClient(jwt: jwt)
+        pdStreamClients[device.id] = streamClient
+        return await streamClient.latestStatuses()
+    }
+
+    private func sanitizedIOTGatewayJWT(_ raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     private func saveStoreIfNeeded(force: Bool = false, at now: Date = Date()) {

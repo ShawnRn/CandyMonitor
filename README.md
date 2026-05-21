@@ -46,9 +46,12 @@ releases/CandyMonitor_<version>_x86_64.dmg
 1. Launch CandyMonitor.
 2. Click the add button in the toolbar.
 3. Enter a device name and MCP SSE URL.
-4. CandyMonitor validates the endpoint before saving it to the local encrypted app store.
+4. Optionally paste the mini-program IOT WS JWT to enable same-origin `stream_port_pd_status` PD battery data.
+5. CandyMonitor validates the endpoint before saving it to the local encrypted app store.
 
 CandyMonitor is sandboxed. MCP URLs are stored under the app container's `Library/Application Support/CandyMonitor/mcp-vault/` directory as AES-GCM encrypted, lightly obfuscated files. They are not written to SwiftData or the macOS keychain.
+
+PD status uses two sources. MCP `get_port_pd_status` is always the fallback. When an IOT WS JWT is configured, CandyMonitor also connects to the mini-program source stream at `wss://iot-gateway.minapp.com/ws/cp-02/v2/stats/`, listens for service `130` / `stream_port_pd_status`, normalizes its port ids, and prefers those battery fields over MCP values.
 
 ## Release Workflow
 

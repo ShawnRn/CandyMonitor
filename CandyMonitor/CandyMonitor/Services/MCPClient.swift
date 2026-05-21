@@ -138,6 +138,28 @@ actor MCPClient {
         }
     }
 
+    func iotGatewayJWT(psn: String?) async throws -> String? {
+        let arguments = psn.map { ["psn": $0] } ?? [:]
+        let toolNames = [
+            "get_iot_gateway_jwt",
+            "get_iotgw_jwt",
+            "get_ws_jwt",
+            "get_device_jwt"
+        ]
+
+        for toolName in toolNames {
+            do {
+                let object = try await callToolObject(toolName, arguments: arguments)
+                if let token = Self.extractToken(from: object) {
+                    return token
+                }
+            } catch {
+                continue
+            }
+        }
+        return nil
+    }
+
     private func callTool<T: Decodable>(_ name: String, arguments: [String: Any] = [:]) async throws -> T {
         let object = try await callToolObject(name, arguments: arguments)
         let data = try JSONSerialization.data(withJSONObject: object)
@@ -158,6 +180,22 @@ actor MCPClient {
             throw MCPError.invalidToolResponse(name)
         }
         return object
+    }
+
+    private static func extractToken(from object: [String: Any]) -> String? {
+        for key in ["token", "jwt", "iot_jwt", "iotJwt", "iot_gateway_jwt", "iotGatewayJWT"] {
+            if let value = object[key] as? String {
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty == false { return trimmed }
+            }
+        }
+        for value in object.values {
+            if let nested = value as? [String: Any],
+               let token = extractToken(from: nested) {
+                return token
+            }
+        }
+        return nil
     }
 
     private func waitForEndpoint() async throws -> URL {
@@ -305,5 +343,198 @@ enum MCPError: LocalizedError {
         case .disconnected:
             "MCP 连接已断开"
         }
+    }
+}
+
+actor CandyIOTPDStatusClient {
+    private let jwt: String
+    private var task: URLSessionWebSocketTask?
+    private var receiveTask: Task<Void, Never>?
+    private var latestByPort: [Int: PDPortStatus] = [:]
+
+    init(jwt: String) {
+        self.jwt = jwt
+    }
+
+    deinit {
+        receiveTask?.cancel()
+        task?.cancel(with: .goingAway, reason: nil)
+    }
+
+    func latestStatuses() async -> [Int: PDPortStatus] {
+        connectIfNeeded()
+        return latestByPort
+    }
+
+    func disconnect() {
+        receiveTask?.cancel()
+        receiveTask = nil
+        task?.cancel(with: .goingAway, reason: nil)
+        task = nil
+        latestByPort.removeAll()
+    }
+
+    private func connectIfNeeded() {
+        guard task == nil, let url = Self.webSocketURL(jwt: jwt) else { return }
+        let webSocketTask = URLSession.shared.webSocketTask(with: url)
+        task = webSocketTask
+        webSocketTask.resume()
+        receiveTask = Task { [weak self] in
+            await self?.receiveLoop(webSocketTask)
+        }
+    }
+
+    private func receiveLoop(_ webSocketTask: URLSessionWebSocketTask) async {
+        while !Task.isCancelled {
+            do {
+                let message = try await webSocketTask.receive()
+                await handle(message)
+            } catch {
+                disconnect()
+                return
+            }
+        }
+    }
+
+    private func handle(_ message: URLSessionWebSocketTask.Message) async {
+        switch message {
+        case .data(let data):
+            handleJSONData(data)
+        case .string(let text):
+            guard let data = text.data(using: .utf8) else { return }
+            handleJSONData(data)
+        @unknown default:
+            return
+        }
+    }
+
+    private func handleJSONData(_ data: Data) {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let service = Self.numberValue(object["service"]).map(Int.init),
+              service == 130,
+              let payload = object["payload"] as? [String: Any] else {
+            return
+        }
+
+        if let status = Self.numberValue(payload["status"]), Int(status) != 0 {
+            return
+        }
+
+        let streamObject = payload["stream_port_pd_status"]
+            ?? payload["streamPowerDeliveryStatus"]
+            ?? payload["powerDeliveryStatus"]
+        guard let stream = streamObject as? [String: Any] else { return }
+        guard let rawPort = Self.numberValue(stream["port"] ?? stream["portId"]).map(Int.init) else { return }
+        let pdPayload = (stream["pd_status"] as? [String: Any])
+            ?? (stream["pdStatus"] as? [String: Any])
+            ?? stream
+        let appPort = normalizePort(rawPort)
+        let status = Self.status(from: pdPayload, appPort: appPort)
+        guard status.hasUsefulPayload else { return }
+        latestByPort[appPort] = status
+    }
+
+    private static func status(from payload: [String: Any], appPort: Int) -> PDPortStatus {
+        let manufacturer = stringValue(payload, keys: [
+            "manufacturer", "vendor", "brand", "deviceManufacturer", "device_vendor"
+        ]) ?? manufacturerName(from: payload)
+        return PDPortStatus(
+            port: appPort,
+            batteryPercent: doubleValue(payload, keys: [
+                "capacityPercent", "capacity_percent", "batteryPercent", "battery_percent", "soc"
+            ]),
+            manufacturer: manufacturer,
+            modelName: stringValue(payload, keys: [
+                "model", "modelName", "model_name", "productName", "product_name"
+            ]),
+            serialNumber: stringValue(payload, keys: ["serial", "serialNumber", "serial_number", "sn"]),
+            batteryCapacityMWh: capacityValue(payload, keys: [
+                "batteryDesignCapacity", "battery_design_capacity", "batteryCapacityMWh", "battery_capacity_mwh"
+            ]),
+            batteryLastFullChargeCapacityMWh: capacityValue(payload, keys: [
+                "batteryLastFullChargeCapacity", "battery_last_full_charge_capacity",
+                "batteryLastFullChargeCapacityMWh", "battery_last_full_charge_capacity_mwh"
+            ]),
+            batteryPresentCapacityMWh: capacityValue(payload, keys: [
+                "batteryPresentCapacity", "battery_present_capacity",
+                "batteryPresentCapacityMWh", "battery_present_capacity_mwh"
+            ]),
+            batteryHealthPercent: doubleValue(payload, keys: [
+                "batteryHealth", "battery_health", "batteryHealthPercent", "battery_health_percent", "soh"
+            ]),
+            estimatedFullMinutes: doubleValue(payload, keys: [
+                "estimatedFullMinutes", "estimated_full_minutes", "timeToFullMinutes", "time_to_full_minutes"
+            ]),
+            remainingTimeText: stringValue(payload, keys: [
+                "remainingTimeStr", "remaining_time_str", "remainingTime", "remaining_time"
+            ]),
+            cycleCount: intValue(payload, keys: ["cycleCount", "cycle_count", "cycles"])
+        )
+    }
+
+    private static func webSocketURL(jwt: String) -> URL? {
+        var components = URLComponents()
+        components.scheme = "wss"
+        components.host = "iot-gateway.minapp.com"
+        components.path = "/ws/cp-02/v2/stats/"
+        components.queryItems = [URLQueryItem(name: "t", value: jwt)]
+        return components.url
+    }
+
+    private func normalizePort(_ rawPort: Int) -> Int {
+        if (0...4).contains(rawPort) {
+            return rawPort + 1
+        }
+        return rawPort
+    }
+
+    private static func capacityValue(_ payload: [String: Any], keys: [String]) -> Double? {
+        guard let value = doubleValue(payload, keys: keys), value > 0, value < 65535 else { return nil }
+        return value
+    }
+
+    private static func doubleValue(_ payload: [String: Any], keys: [String]) -> Double? {
+        for key in keys {
+            if let value = numberValue(payload[key]) {
+                return value
+            }
+        }
+        return nil
+    }
+
+    private static func intValue(_ payload: [String: Any], keys: [String]) -> Int? {
+        doubleValue(payload, keys: keys).map(Int.init)
+    }
+
+    private static func stringValue(_ payload: [String: Any], keys: [String]) -> String? {
+        for key in keys {
+            if let value = payload[key] as? String {
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty == false { return trimmed }
+            }
+        }
+        return nil
+    }
+
+    private static func manufacturerName(from payload: [String: Any]) -> String? {
+        let vendorIDs = [
+            intValue(payload, keys: ["batteryVid", "battery_vid"]),
+            intValue(payload, keys: ["manufacturerVid", "manufacturer_vid"])
+        ]
+        return vendorIDs.contains(0x05AC) ? "Apple" : nil
+    }
+
+    private static func numberValue(_ value: Any?) -> Double? {
+        if let value = value as? Double { return value }
+        if let value = value as? Int { return Double(value) }
+        if let value = value as? NSNumber { return value.doubleValue }
+        if let value = value as? String {
+            let trimmed = value.trimmingCharacters(in: CharacterSet(charactersIn: "% "))
+            if trimmed.lowercased().hasPrefix("0x") {
+                return Double(Int(trimmed.dropFirst(2), radix: 16) ?? 0)
+            }
+            return Double(trimmed)
+        }
+        return nil
     }
 }

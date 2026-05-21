@@ -4,14 +4,37 @@ import Foundation
 enum KeychainStore {
     private static let directoryName = "CandyMonitor"
     private static let storeName = "mcp-vault"
+    private static let iotJWTSuffix = ".iot-ws-jwt"
 
     static func saveMCPURL(_ url: String, account: String) throws {
-        let sealed = try seal(Data(url.utf8))
+        try saveSecret(url, account: account)
+    }
+
+    static func saveIOTGatewayJWT(_ jwt: String, account: String) throws {
+        try saveSecret(jwt, account: account + iotJWTSuffix)
+    }
+
+    private static func saveSecret(_ value: String, account: String) throws {
+        let sealed = try seal(Data(value.utf8))
         try FileManager.default.createDirectory(at: storeDirectory, withIntermediateDirectories: true)
         try sealed.write(to: fileURL(for: account), options: [.atomic])
     }
 
     static func loadMCPURL(account: String) throws -> String? {
+        try loadSecret(account: account, migrateWith: saveMCPURL)
+    }
+
+    static func loadIOTGatewayJWT(account: String) throws -> String? {
+        try loadSecret(account: account + iotJWTSuffix) { value, migratedAccount in
+            guard migratedAccount == account + iotJWTSuffix else { return }
+            try saveIOTGatewayJWT(value, account: account)
+        }
+    }
+
+    private static func loadSecret(
+        account: String,
+        migrateWith migrate: (String, String) throws -> Void
+    ) throws -> String? {
         for url in candidateFileURLs(for: account) {
             guard FileManager.default.fileExists(atPath: url.path) else { continue }
             let sealed = try Data(contentsOf: url)
@@ -20,7 +43,7 @@ enum KeychainStore {
                 throw CredentialStoreError.invalidData
             }
             if url != fileURL(for: account) {
-                try? saveMCPURL(urlString, account: account)
+                try? migrate(urlString, account)
             }
             return urlString
         }
@@ -33,6 +56,12 @@ enum KeychainStore {
 
     static func deleteMCPURL(account: String) {
         for url in candidateFileURLs(for: account) {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    static func deleteIOTGatewayJWT(account: String) {
+        for url in candidateFileURLs(for: account + iotJWTSuffix) {
             try? FileManager.default.removeItem(at: url)
         }
     }

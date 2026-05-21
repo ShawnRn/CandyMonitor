@@ -435,6 +435,34 @@ struct PDPortStatus: Codable, Hashable, Sendable {
     let remainingTimeText: String?
     let cycleCount: Int?
 
+    nonisolated init(
+        port: Int,
+        batteryPercent: Double? = nil,
+        manufacturer: String? = nil,
+        modelName: String? = nil,
+        serialNumber: String? = nil,
+        batteryCapacityMWh: Double? = nil,
+        batteryLastFullChargeCapacityMWh: Double? = nil,
+        batteryPresentCapacityMWh: Double? = nil,
+        batteryHealthPercent: Double? = nil,
+        estimatedFullMinutes: Double? = nil,
+        remainingTimeText: String? = nil,
+        cycleCount: Int? = nil
+    ) {
+        self.port = port
+        self.batteryPercent = Self.normalizedPercent(batteryPercent)
+        self.manufacturer = manufacturer
+        self.modelName = modelName
+        self.serialNumber = serialNumber
+        self.batteryCapacityMWh = batteryCapacityMWh
+        self.batteryLastFullChargeCapacityMWh = batteryLastFullChargeCapacityMWh
+        self.batteryPresentCapacityMWh = batteryPresentCapacityMWh
+        self.batteryHealthPercent = Self.normalizedPercent(batteryHealthPercent)
+        self.estimatedFullMinutes = estimatedFullMinutes
+        self.remainingTimeText = remainingTimeText
+        self.cycleCount = cycleCount
+    }
+
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: DynamicCodingKey.self)
         let nestedContainers = ["battery", "device", "product", "pd"]
@@ -507,6 +535,38 @@ struct PDPortStatus: Codable, Hashable, Sendable {
         try container.encodeIfPresent(cycleCount, forKey: .init("cycle_count"))
     }
 
+    nonisolated var hasUsefulPayload: Bool {
+        batteryPercent != nil ||
+            manufacturer != nil ||
+            modelName != nil ||
+            serialNumber != nil ||
+            batteryCapacityMWh != nil ||
+            batteryLastFullChargeCapacityMWh != nil ||
+            batteryPresentCapacityMWh != nil ||
+            batteryHealthPercent != nil ||
+            estimatedFullMinutes != nil ||
+            remainingTimeText != nil ||
+            cycleCount != nil
+    }
+
+    nonisolated func merged(withFallback fallback: PDPortStatus?) -> PDPortStatus {
+        guard let fallback else { return self }
+        return PDPortStatus(
+            port: port == 0 ? fallback.port : port,
+            batteryPercent: batteryPercent ?? fallback.batteryPercent,
+            manufacturer: manufacturer ?? fallback.manufacturer,
+            modelName: modelName ?? fallback.modelName,
+            serialNumber: serialNumber ?? fallback.serialNumber,
+            batteryCapacityMWh: batteryCapacityMWh ?? fallback.batteryCapacityMWh,
+            batteryLastFullChargeCapacityMWh: batteryLastFullChargeCapacityMWh ?? fallback.batteryLastFullChargeCapacityMWh,
+            batteryPresentCapacityMWh: batteryPresentCapacityMWh ?? fallback.batteryPresentCapacityMWh,
+            batteryHealthPercent: batteryHealthPercent ?? fallback.batteryHealthPercent,
+            estimatedFullMinutes: estimatedFullMinutes ?? fallback.estimatedFullMinutes,
+            remainingTimeText: remainingTimeText ?? fallback.remainingTimeText,
+            cycleCount: cycleCount ?? fallback.cycleCount
+        )
+    }
+
     private static func decodeFirstString(
         in containers: [KeyedDecodingContainer<DynamicCodingKey>],
         keys: [String]
@@ -564,7 +624,7 @@ struct PDPortStatus: Codable, Hashable, Sendable {
         return nil
     }
 
-    private static func normalizedPercent(_ value: Double?) -> Double? {
+    nonisolated private static func normalizedPercent(_ value: Double?) -> Double? {
         guard let value else { return nil }
         return value <= 1 ? value * 100 : value
     }

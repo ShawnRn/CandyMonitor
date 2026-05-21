@@ -2734,12 +2734,14 @@ private enum PendingControl: Identifiable {
 private enum SettingsField: Hashable {
     case name
     case url
+    case iotJWT
 }
 
 private struct SettingsView: View {
     let store: MonitorStore
     @State private var editingName = ""
     @State private var editingURL = ""
+    @State private var editingIOTJWT = ""
     @State private var isSaving = false
     @FocusState private var focusedField: SettingsField?
 
@@ -2786,9 +2788,17 @@ private struct SettingsView: View {
                                 }
                             }
 
-                            SettingsCard(title: "MCP 连接", icon: "network", subtitle: "CandyMonitor 通过这个 SSE 地址连接小电拼；地址会加密保存在本机应用目录，不再触发钥匙串授权。") {
+                            SettingsCard(title: "MCP 与小程序 WS", icon: "network", subtitle: "MCP SSE 负责控制与兜底读取；小程序同源 WS JWT 用来接入实时 PD status。") {
                                 TextField("https://.../sse", text: $editingURL)
                                     .textFieldStyle(.roundedBorder)
+                                    .focused($focusedField, equals: .url)
+                                SecureField("小程序 IOT WS JWT（可选）", text: $editingIOTJWT)
+                                    .textFieldStyle(.roundedBorder)
+                                    .focused($focusedField, equals: .iotJWT)
+                                LabeledContent("PD status") {
+                                    Text(editingIOTJWT.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "MCP fallback" : "小程序 WS 优先")
+                                        .foregroundStyle(.secondary)
+                                }
                                 HStack {
                                     Button {
                                         Task { await save(device) }
@@ -2858,12 +2868,13 @@ private struct SettingsView: View {
         guard let device = store.selectedDevice else { return }
         editingName = device.name
         editingURL = store.mcpURL(for: device)
+        editingIOTJWT = store.iotGatewayJWT(for: device)
     }
 
     private func save(_ device: MirrorDevice) async {
         isSaving = true
         defer { isSaving = false }
-        try? await store.updateDevice(device, name: editingName, sseURLString: editingURL)
+        try? await store.updateDevice(device, name: editingName, sseURLString: editingURL, iotJWTString: editingIOTJWT)
     }
 
     private func commitName(_ device: MirrorDevice) {
@@ -2877,6 +2888,7 @@ private struct AddDeviceSheet: View {
     let store: MonitorStore
     @State private var name = ""
     @State private var sseURL = ""
+    @State private var iotJWT = ""
     @State private var errorText: String?
     @State private var isSaving = false
 
@@ -2892,6 +2904,8 @@ private struct AddDeviceSheet: View {
             TextField("设备名称，例如 Shawn’s Mirror", text: $name)
                 .textFieldStyle(.roundedBorder)
             TextField("https://.../sse", text: $sseURL)
+                .textFieldStyle(.roundedBorder)
+            SecureField("小程序 IOT WS JWT（可选）", text: $iotJWT)
                 .textFieldStyle(.roundedBorder)
 
             if let errorText {
@@ -2922,7 +2936,7 @@ private struct AddDeviceSheet: View {
         isSaving = true
         errorText = nil
         do {
-            try await store.addDevice(name: name, sseURLString: sseURL)
+            try await store.addDevice(name: name, sseURLString: sseURL, iotJWTString: iotJWT)
             dismiss()
         } catch {
             errorText = error.localizedDescription
