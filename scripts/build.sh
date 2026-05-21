@@ -31,6 +31,7 @@ verify_sandbox_entitlement() {
   local app_bundle="$1"
   local entitlements_xml
 
+  xattr -cr "$app_bundle" 2>/dev/null || true
   codesign --verify --deep --strict --verbose=2 "$app_bundle"
   entitlements_xml=$(codesign -d --entitlements :- "$app_bundle" 2>/dev/null || true)
 
@@ -115,6 +116,7 @@ for TARGET_ARCH in arm64 x86_64; do
 
   mkdir -p "$TEMP_DMG_ROOT" "$TEMP_DMG_OUTPUT"
   cp -R "$ARCH_APP_BUNDLE" "$TEMP_DMG_ROOT/$APP_NAME"
+  verify_sandbox_entitlement "$TEMP_DMG_ROOT/$APP_NAME"
 
   echo "==> Creating DMG: $DMG_FINAL_PATH"
   create-dmg \
