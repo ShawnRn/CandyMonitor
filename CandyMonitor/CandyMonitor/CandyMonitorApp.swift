@@ -13,7 +13,7 @@ struct CandyMonitorApp: App {
     @State private var store = MonitorStore()
 
     var body: some Scene {
-        WindowGroup("CandyMonitor", id: "main") {
+        Window("CandyMonitor", id: "main") {
             ContentView(store: store)
         }
         .windowResizability(.contentSize)
