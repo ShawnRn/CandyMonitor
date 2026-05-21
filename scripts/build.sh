@@ -22,11 +22,6 @@ else
   XCODE_CONF="Release"
 fi
 
-command -v create-dmg >/dev/null 2>&1 || {
-  echo "error: create-dmg is required. Install with: brew install create-dmg"
-  exit 1
-}
-
 verify_sandbox_entitlement() {
   local app_bundle="$1"
   local entitlements_xml
@@ -115,30 +110,17 @@ for TARGET_ARCH in arm64 x86_64; do
   verify_sandbox_entitlement "$ARCH_APP_BUNDLE"
 
   mkdir -p "$TEMP_DMG_ROOT" "$TEMP_DMG_OUTPUT"
-  cp -R "$ARCH_APP_BUNDLE" "$TEMP_DMG_ROOT/$APP_NAME"
+  ditto --noextattr --noqtn "$ARCH_APP_BUNDLE" "$TEMP_DMG_ROOT/$APP_NAME"
   verify_sandbox_entitlement "$TEMP_DMG_ROOT/$APP_NAME"
 
   echo "==> Creating DMG: $DMG_FINAL_PATH"
-  create-dmg \
-    --overwrite \
-    --dmg-title="$PROJECT_NAME" \
-    "$TEMP_DMG_ROOT/$APP_NAME" \
-    "$TEMP_DMG_OUTPUT"
-
-  GENERATED_DMG=""
-  for candidate in "$TEMP_DMG_OUTPUT/${PROJECT_NAME} ${MARKETING_VERSION}.dmg" "$TEMP_DMG_OUTPUT/${PROJECT_NAME}.dmg" "$TEMP_DMG_OUTPUT/${PROJECT_NAME}"*.dmg; do
-    if [[ -f "$candidate" ]]; then
-      GENERATED_DMG="$candidate"
-      break
-    fi
-  done
-
-  if [[ -z "$GENERATED_DMG" ]]; then
-    echo "error: create-dmg did not produce a DMG for $TARGET_ARCH"
-    exit 1
-  fi
-
-  mv "$GENERATED_DMG" "$DMG_FINAL_PATH"
+  hdiutil create \
+    -volname "$PROJECT_NAME" \
+    -srcfolder "$TEMP_DMG_ROOT" \
+    -format UDZO \
+    -ov \
+    "$DMG_FINAL_PATH"
+  codesign --force --sign "-" "$DMG_FINAL_PATH"
 
   rm -rf "$TEMP_DMG_ROOT" "$TEMP_DMG_OUTPUT"
   echo "==> Done: $DMG_FINAL_PATH"
