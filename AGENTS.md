@@ -44,6 +44,13 @@ The release script creates separate DMGs for `arm64` and `x86_64` under `release
 - The short token in an MCP SSE URL is not the IOT WS JWT. The mini-program normally obtains the WS JWT from its BaaS `iotgw-jwt` endpoint after login. CandyMonitor stores an optional IOT WS JWT in the encrypted local vault next to the MCP URL and may auto-save one only if a future MCP wrapper exposes a JWT helper tool. If no JWT is present or the WS is unavailable, keep using MCP `get_port_pd_status` as a fallback instead of dropping PD UI data.
 - Do not persist the IOT WS JWT in SwiftData, logs, release notes, screenshots, or GitHub issues. Do not delete the MCP/WS encrypted vault while debugging missing battery data unless the user explicitly asks to reset connection credentials.
 
+## Charging Session Semantics
+
+- At most one unfinished `ChargingSession` may exist for the same `(deviceID, portIndex)`. Do not rely only on the in-memory `activeSessions` dictionary for this invariant; app reloads, polling restarts, or old dirty data can leave multiple unfinished rows in SwiftData.
+- Before creating a new charging session, check SwiftData for an existing unfinished session on that device and port. If duplicates are found, keep the earliest active session as canonical, move duplicate `PortSample.sessionID` values to it, recompute statistics from samples, then delete the duplicate session rows.
+- When adding session recording logic, preserve the healing path in `MonitorStore.loadSessions()` and `recordSamples(...)` so existing duplicate rows are cleaned automatically instead of merely hidden in the UI.
+- A duplicate active-session fix must not delete samples. Historical curves should be merged into the canonical session whenever possible.
+
 ## UI Conventions
 
 - The app accent is `CandyTheme.syrup`, matching the orange used by the 小电拼 UI.

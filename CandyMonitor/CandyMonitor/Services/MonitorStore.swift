@@ -139,7 +139,12 @@ final class MonitorStore {
     func loadSessions() {
         guard let modelContext else { return }
         let descriptor = FetchDescriptor<ChargingSession>(sortBy: [SortDescriptor(\.startedAt, order: .reverse)])
-        sessions = (try? modelContext.fetch(descriptor)) ?? []
+        var fetchedSessions = (try? modelContext.fetch(descriptor)) ?? []
+        if mergeDuplicateActiveSessions(in: fetchedSessions, at: Date()) {
+            try? modelContext.save()
+            fetchedSessions = (try? modelContext.fetch(descriptor)) ?? []
+        }
+        sessions = fetchedSessions
         if let selectedSession {
             self.selectedSession = sessions.first { $0.id == selectedSession.id } ?? sessions.first
         } else {
@@ -326,8 +331,14 @@ final class MonitorStore {
 
     private func restoreActiveSessions() {
         activeSessions.removeAll()
-        for session in sessions where session.endedAt == nil {
-            activeSessions[sessionKey(deviceID: session.deviceID, port: session.portIndex)] = session.id
+        let activeByKey = Dictionary(grouping: sessions.filter { $0.endedAt == nil }) {
+            sessionKey(deviceID: $0.deviceID, port: $0.portIndex)
+        }
+        for (key, activeGroup) in activeByKey {
+            guard let canonical = canonicalActiveSession(from: activeGroup) else { continue }
+            activeSessions[key] = canonical.id
+        }
+        for session in activeByKey.values.flatMap({ $0 }) {
             if session.protocolSummary.isEmpty == false {
                 knownProtocols[session.id] = Set(session.protocolSummary.components(separatedBy: " / "))
             }
@@ -757,6 +768,16 @@ final class MonitorStore {
             if activeSessionID != nil, session == nil {
                 activeSessions.removeValue(forKey: key)
             }
+            let storeActiveSessions = fetchActiveSessions(deviceID: deviceID, port: port.port.index)
+            if let canonical = canonicalActiveSession(from: storeActiveSessions) {
+                if storeActiveSessions.count > 1 {
+                    mergeDuplicateActiveSessions(storeActiveSessions, keeping: canonical, at: now)
+                    result.didMutateStore = true
+                    result.didChangeSessions = true
+                }
+                activeSessions[key] = canonical.id
+                session = canonical
+            }
 
             if session == nil, hasOutputPower {
                 let newSession = ChargingSession(
@@ -839,6 +860,9 @@ final class MonitorStore {
             result.didChangeSessions = true
         }
 
+        if result.didChangeSessions {
+            sessions.sort { $0.startedAt > $1.startedAt }
+        }
         let cutoff = Date().addingTimeInterval(-recentSampleWindow)
         recentSamples.removeAll { $0.timestamp < cutoff }
         return result
@@ -864,6 +888,123 @@ final class MonitorStore {
         )
         descriptor.fetchLimit = 1
         return try? modelContext.fetch(descriptor).first
+    }
+
+    private func fetchActiveSessions(deviceID: UUID, port: Int) -> [ChargingSession] {
+        guard let modelContext else { return [] }
+        let descriptor = FetchDescriptor<ChargingSession>(
+            predicate: #Predicate { session in
+                session.deviceID == deviceID && session.portIndex == port && session.endedAt == nil
+            },
+            sortBy: [SortDescriptor(\.startedAt, order: .forward)]
+        )
+        return (try? modelContext.fetch(descriptor)) ?? []
+    }
+
+    private func mergeDuplicateActiveSessions(in candidateSessions: [ChargingSession], at now: Date) -> Bool {
+        let activeGroups = Dictionary(grouping: candidateSessions.filter { $0.endedAt == nil }) {
+            sessionKey(deviceID: $0.deviceID, port: $0.portIndex)
+        }
+        var didMerge = false
+        for activeGroup in activeGroups.values where activeGroup.count > 1 {
+            guard let canonical = canonicalActiveSession(from: activeGroup) else { continue }
+            mergeDuplicateActiveSessions(activeGroup, keeping: canonical, at: now)
+            didMerge = true
+        }
+        return didMerge
+    }
+
+    private func mergeDuplicateActiveSessions(_ activeGroup: [ChargingSession], keeping canonical: ChargingSession, at now: Date) {
+        guard let modelContext else { return }
+        let duplicateSessions = activeGroup.filter { $0.id != canonical.id }
+        guard duplicateSessions.isEmpty == false else { return }
+
+        for duplicate in duplicateSessions {
+            migrateSamples(from: duplicate.id, to: canonical.id)
+            if canonical.connectedDeviceName == nil {
+                canonical.connectedDeviceName = duplicate.connectedDeviceName
+            }
+            if canonical.customTitle == nil {
+                canonical.customTitle = duplicate.customTitle
+            }
+            if let selectedSession, selectedSession.id == duplicate.id {
+                self.selectedSession = canonical
+            }
+            if let lowPowerSessionPrompt, lowPowerSessionPrompt.id == duplicate.id {
+                self.lowPowerSessionPrompt = canonical
+            }
+            knownProtocols[duplicate.id] = nil
+            modelContext.delete(duplicate)
+        }
+
+        recomputeStats(for: canonical)
+        let duplicateIDs = Set(duplicateSessions.map(\.id))
+        sessions.removeAll { duplicateIDs.contains($0.id) }
+        if sessions.contains(where: { $0.id == canonical.id }) == false {
+            sessions.insert(canonical, at: 0)
+        }
+        activeSessions[sessionKey(deviceID: canonical.deviceID, port: canonical.portIndex)] = canonical.id
+        logger.warning(
+            "duplicate_active_sessions_merged port=\(canonical.portIndex, privacy: .public) count=\(duplicateSessions.count + 1, privacy: .public) at=\(now, privacy: .public)"
+        )
+    }
+
+    private func canonicalActiveSession(from sessions: [ChargingSession]) -> ChargingSession? {
+        sessions.min { lhs, rhs in
+            if lhs.startedAt == rhs.startedAt {
+                return lhs.id.uuidString < rhs.id.uuidString
+            }
+            return lhs.startedAt < rhs.startedAt
+        }
+    }
+
+    private func migrateSamples(from sourceSessionID: UUID, to targetSessionID: UUID) {
+        guard let modelContext else { return }
+        let descriptor = FetchDescriptor<PortSample>(
+            predicate: #Predicate { sample in
+                sample.sessionID == sourceSessionID
+            }
+        )
+        let samples = (try? modelContext.fetch(descriptor)) ?? []
+        for sample in samples {
+            sample.sessionID = targetSessionID
+        }
+    }
+
+    private func recomputeStats(for session: ChargingSession) {
+        guard let modelContext else { return }
+        let sessionID = session.id
+        let descriptor = FetchDescriptor<PortSample>(
+            predicate: #Predicate { sample in
+                sample.sessionID == sessionID
+            },
+            sortBy: [SortDescriptor(\.timestamp, order: .forward)]
+        )
+        let samples = (try? modelContext.fetch(descriptor)) ?? []
+        session.sampleCount = 0
+        session.peakPowerW = 0
+        session.averagePowerW = 0
+        session.minVoltageMV = 0
+        session.maxVoltageMV = 0
+        session.protocolSummary = ""
+        session.hasBatteryData = false
+        session.finalBatteryPercent = nil
+        knownProtocols[session.id] = []
+
+        for sample in samples {
+            updateStats(
+                session: session,
+                with: SampleStats(
+                    powerW: sample.powerW,
+                    voltageMV: sample.voltageMV,
+                    protocolName: sample.protocolName,
+                    batteryPercent: sample.batteryPercent
+                )
+            )
+        }
+        if selectedSession?.id == session.id {
+            selectedSessionSamples = samples
+        }
     }
 
     private func updateStats(session: ChargingSession, with sample: SampleStats) {

@@ -53,6 +53,8 @@ CandyMonitor is sandboxed. MCP URLs are stored under the app container's `Librar
 
 PD status uses two sources. MCP `get_port_pd_status` is always the fallback. When an IOT WS JWT is configured, CandyMonitor also connects to the mini-program source stream at `wss://iot-gateway.minapp.com/ws/cp-02/v2/stats/`, listens for service `130` / `stream_port_pd_status`, normalizes its port ids, and prefers those battery fields over MCP values.
 
+Charging sessions are unique by device and port while they are active. If a previous build or a polling restart leaves multiple unfinished rows for the same port, CandyMonitor keeps the earliest active session, moves duplicate samples into it, recomputes the summary, and removes the duplicate rows without deleting curve data.
+
 ## Release Workflow
 
 This project follows the same high-level flow as MotrixMac:
