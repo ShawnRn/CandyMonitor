@@ -6,7 +6,7 @@ import SwiftUI
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.scenePhase) private var scenePhase
-    @State private var store = MonitorStore()
+    let store: MonitorStore
 
     var body: some View {
         NavigationSplitView {
@@ -34,7 +34,6 @@ struct ContentView: View {
             store.reloadPersistedState()
         }
         .onChange(of: scenePhase) { _, phase in
-            store.isRealtimeRefreshEnabled = phase == .active
             if phase == .active {
                 store.reloadPersistedState()
             }
@@ -3130,7 +3129,413 @@ private struct MetricCard: View {
     }
 }
 
+struct MenuBarPowerLabel: View {
+    let totalPowerW: Double
+    let connectionState: ConnectionState
+
+    var body: some View {
+        Image(nsImage: renderedCandyPowerImage)
+            .interpolation(.high)
+            .antialiased(true)
+            .fixedSize()
+            .accessibilityLabel("CandyMonitor 当前功率 \(powerText)")
+    }
+
+    private var powerText: String {
+        if totalPowerW >= 100 {
+            return "\(Int(totalPowerW.rounded()))W"
+        }
+        return String(format: "%.1fW", totalPowerW)
+    }
+
+    private var renderedCandyPowerImage: NSImage {
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
+        let foregroundColor: NSColor = isDarkMenuBarAppearance ? .white : .black
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: foregroundColor
+        ]
+        let text = powerText as NSString
+        let textSize = text.size(withAttributes: attributes)
+        let iconSize = NSSize(width: 20, height: 12)
+        let spacing: CGFloat = 5
+        let height: CGFloat = 18
+        let width = ceil(iconSize.width + spacing + textSize.width)
+        let image = NSImage(size: NSSize(width: width, height: height))
+
+        image.lockFocus()
+        NSColor.clear.setFill()
+        NSRect(origin: .zero, size: image.size).fill()
+
+        if let icon = NSImage(named: menuBarCandyIconAssetName) {
+            icon.draw(in: NSRect(
+                x: 0,
+                y: floor((height - iconSize.height) / 2) + 1,
+                width: iconSize.width,
+                height: iconSize.height
+            ))
+        }
+
+        text.draw(at: NSPoint(
+            x: iconSize.width + spacing,
+            y: floor((height - textSize.height) / 2) + 1
+        ), withAttributes: attributes)
+        image.unlockFocus()
+        image.isTemplate = false
+        return image
+    }
+
+    private var menuBarCandyIconAssetName: String {
+        isDarkMenuBarAppearance
+            ? "CandyMenuBarIconWhite"
+            : "CandyMenuBarIconBlack"
+    }
+
+    private var isDarkMenuBarAppearance: Bool {
+        NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+    }
+}
+
+struct CandyMenuBarView: View {
+    @Environment(\.modelContext) private var modelContext
+    @Environment(\.openWindow) private var openWindow
+    let store: MonitorStore
+
+    private var connectedPorts: Int {
+        store.livePorts.filter(\.connected).count
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            header
+
+            if store.hasDevices {
+                powerSummary
+                portsSection
+                activeSessionSection
+                footer
+            } else {
+                emptyState
+            }
+        }
+        .padding(16)
+        .frame(width: 390)
+        .background(MenuBarPanelBackground().ignoresSafeArea())
+        .task {
+            configureStore()
+        }
+        .onAppear {
+            configureStore()
+        }
+        .tint(CandyTheme.syrup)
+        .accentColor(CandyTheme.syrup)
+    }
+
+    private var header: some View {
+        HStack(alignment: .center, spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(CandyTheme.syrup)
+                Image(systemName: "bolt.badge.clock.fill")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(.white)
+            }
+            .frame(width: 36, height: 36)
+            .shadow(color: CandyTheme.syrup.opacity(0.28), radius: 9, y: 4)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(store.selectedDevice?.name ?? "CandyMonitor")
+                    .font(.headline)
+                    .lineLimit(1)
+                Text(store.selectedDevice?.productFamily ?? "CoCan Mirror")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer()
+            MenuBarConnectionBadge(state: store.connectionState)
+        }
+    }
+
+    private var powerSummary: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("实时总功率")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    HStack(alignment: .firstTextBaseline, spacing: 4) {
+                        Text(String(format: "%.1f", store.totalPowerW))
+                            .font(.system(size: 42, weight: .bold, design: .rounded))
+                            .monospacedDigit()
+                            .foregroundStyle(CandyTheme.syrup)
+                        Text("W")
+                            .font(.title3.weight(.bold))
+                            .foregroundStyle(CandyTheme.syrup)
+                    }
+                }
+                Spacer()
+                VStack(alignment: .trailing, spacing: 6) {
+                    StatusPill(text: "\(connectedPorts)/\(store.livePorts.count) 端口", color: connectedPorts > 0 ? CandyTheme.mint : .secondary)
+                    StatusPill(text: "\(store.activeChargingSessions.count) 记录中", color: store.activeChargingSessions.isEmpty ? .secondary : CandyTheme.caramel)
+                }
+            }
+
+            PowerCapacityBar(totalPowerW: store.totalPowerW, maxPowerW: max(store.selectedDevice?.maxPowerBudget ?? 160, 1))
+        }
+        .padding(14)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(.white.opacity(0.12), lineWidth: 1)
+        }
+    }
+
+    private var portsSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("端口详情", systemImage: "powerplug")
+                    .font(.headline)
+                Spacer()
+                SyncStatusView(date: store.lastRefreshedAt, isRefreshing: store.isRefreshingNow)
+            }
+
+            if store.livePorts.isEmpty {
+                Text("等待实时端口数据。")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 72)
+            } else {
+                VStack(spacing: 8) {
+                    ForEach(store.livePorts) { port in
+                        MenuBarPortRow(port: port)
+                    }
+                }
+            }
+        }
+    }
+
+    private var activeSessionSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("充电记录", systemImage: "waveform.path.ecg")
+                .font(.headline)
+
+            if let session = store.activeChargingSessions.first {
+                HStack(spacing: 10) {
+                    Image(systemName: "record.circle")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(CandyTheme.caramel)
+                        .frame(width: 30, height: 30)
+                        .background(CandyTheme.caramel.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(session.displayTitle)
+                            .font(.callout.weight(.semibold))
+                            .lineLimit(1)
+                        Text("峰值 \(String(format: "%.1f W", session.peakPowerW)) · 已采 \(session.sampleCount) 点")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+                .padding(10)
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            } else {
+                Text("接入负载并开始输出功率后会自动记录曲线。")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
+        }
+    }
+
+    private var footer: some View {
+        HStack(spacing: 10) {
+            Button {
+                Task { await store.refreshSelectedDeviceNow() }
+            } label: {
+                Label("刷新", systemImage: "arrow.clockwise")
+            }
+            .buttonStyle(SoftButtonStyle())
+            .disabled(store.isRefreshingNow)
+
+            Spacer()
+
+            Button {
+                openMainWindow(section: .monitor)
+            } label: {
+                Label("打开监控", systemImage: "rectangle.on.rectangle")
+            }
+            .buttonStyle(SoftButtonStyle(prominent: true))
+        }
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "bolt.horizontal.icloud")
+                .font(.system(size: 34, weight: .semibold))
+                .foregroundStyle(CandyTheme.syrup)
+            Text("还没有添加设备")
+                .font(.headline)
+            Text("打开主窗口填写 MCP SSE 地址后，菜单栏会开始显示实时功率。")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Button {
+                openMainWindow(section: .settings)
+                store.isShowingAddDevice = true
+            } label: {
+                Label("添加设备", systemImage: "plus.circle.fill")
+            }
+            .buttonStyle(SoftButtonStyle(prominent: true))
+        }
+        .padding(.vertical, 18)
+        .frame(maxWidth: .infinity)
+    }
+
+    private func configureStore() {
+        store.configure(modelContext: modelContext)
+        if store.isRealtimeRefreshEnabled == false {
+            store.isRealtimeRefreshEnabled = true
+        }
+    }
+
+    private func openMainWindow(section: AppSection) {
+        store.selectedSection = section
+        openWindow(id: "main")
+        NSApplication.shared.activate(ignoringOtherApps: true)
+    }
+}
+
+private struct MenuBarPanelBackground: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = .popover
+        view.blendingMode = .behindWindow
+        view.state = .active
+        view.isEmphasized = true
+        return view
+    }
+
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
+        nsView.material = .popover
+        nsView.blendingMode = .behindWindow
+        nsView.state = .active
+    }
+}
+
+private struct MenuBarConnectionBadge: View {
+    let state: ConnectionState
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Circle()
+                .fill(state.color)
+                .frame(width: 7, height: 7)
+            Text(state == .connected ? "在线" : state.label)
+                .font(.caption.weight(.semibold))
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 9)
+        .frame(height: 24)
+        .background(state.color.opacity(0.12), in: Capsule())
+    }
+}
+
+private struct PowerCapacityBar: View {
+    let totalPowerW: Double
+    let maxPowerW: Int
+
+    private var ratio: Double {
+        min(max(totalPowerW / Double(max(maxPowerW, 1)), 0), 1)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            GeometryReader { proxy in
+                ZStack(alignment: .leading) {
+                    Capsule()
+                        .fill(.secondary.opacity(0.12))
+                    Capsule()
+                        .fill(LinearGradient(colors: [CandyTheme.syrup, CandyTheme.caramel, CandyTheme.mint], startPoint: .leading, endPoint: .trailing))
+                        .frame(width: max(10, proxy.size.width * ratio))
+                }
+            }
+            .frame(height: 9)
+
+            HStack {
+                Text("功率预算")
+                Spacer()
+                Text("\(Int((ratio * 100).rounded()))% / \(maxPowerW)W")
+                    .monospacedDigit()
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct MenuBarPortRow: View {
+    let port: PortViewState
+
+    var body: some View {
+        HStack(spacing: 10) {
+            MirrorConnectorGlyph(connectorType: port.port.connectorType, activeColor: port.connected ? CandyTheme.mint : CandyTheme.syrup)
+                .frame(width: 36, height: 18)
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(port.port.displayName)
+                        .font(.callout.weight(.semibold))
+                    Circle()
+                        .fill(port.connected ? CandyTheme.mint : .secondary.opacity(0.45))
+                        .frame(width: 6, height: 6)
+                    Text(port.chargeStateLabel)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Text(portDetailText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer()
+
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(String(format: "%.1fW", port.powerW))
+                    .font(.system(size: 16, weight: .bold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(port.connected ? CandyTheme.mint : .secondary)
+                Text(port.protocolLabel)
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+        }
+        .padding(10)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(port.connected ? CandyTheme.mint : CandyTheme.syrup.opacity(0.35))
+                .frame(width: 3)
+        }
+    }
+
+    private var portDetailText: String {
+        let voltage = String(format: "%.2fV", Double(port.detail?.voutMV ?? 0) / 1000)
+        let current = String(format: "%.2fA", Double(port.detail?.ioutMA ?? 0) / 1000)
+        if let battery = port.batteryPercent {
+            return "\(voltage) / \(current) · 电量 \(Int(battery.rounded()))%"
+        }
+        return "\(voltage) / \(current) · 温度 \(port.temperatureLabel)"
+    }
+}
+
 #Preview {
-    ContentView()
+    ContentView(store: MonitorStore())
         .modelContainer(for: [MirrorDevice.self, ChargingSession.self, PortSample.self, ControlEvent.self], inMemory: true)
 }
