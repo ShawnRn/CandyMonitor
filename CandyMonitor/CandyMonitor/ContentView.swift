@@ -93,9 +93,12 @@ private struct CandySidebar: View {
     var body: some View {
         VStack(spacing: 0) {
             VStack(spacing: 12) {
-                Image(systemName: "bolt.badge.clock.fill")
-                    .font(.system(size: 36, weight: .semibold))
-                    .foregroundStyle(.white)
+                Image("CandyMenuBarIconWhite")
+                    .resizable()
+                    .interpolation(.high)
+                    .antialiased(true)
+                    .scaledToFit()
+                    .frame(width: 30, height: 30)
                     .frame(width: 64, height: 64)
                     .background(Color.accentColor, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
                     .shadow(color: Color.accentColor.opacity(0.3), radius: 12, y: 6)
@@ -3233,15 +3236,15 @@ struct CandyMenuBarView: View {
 
     private var header: some View {
         HStack(alignment: .center, spacing: 12) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .fill(CandyTheme.syrup)
-                Image(systemName: "bolt.badge.clock.fill")
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundStyle(.white)
-            }
-            .frame(width: 36, height: 36)
-            .shadow(color: CandyTheme.syrup.opacity(0.28), radius: 9, y: 4)
+            Image("CandyMenuBarIconWhite")
+                .resizable()
+                .interpolation(.high)
+                .antialiased(true)
+                .scaledToFit()
+                .frame(width: 18, height: 18)
+                .frame(width: 36, height: 36)
+                .background(CandyTheme.syrup, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                .shadow(color: CandyTheme.syrup.opacity(0.28), radius: 9, y: 4)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(store.selectedDevice?.name ?? "CandyMonitor")

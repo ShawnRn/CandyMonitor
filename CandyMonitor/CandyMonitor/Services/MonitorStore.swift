@@ -62,16 +62,22 @@ final class MonitorStore {
     @ObservationIgnored private var iotJWTFetchAttempted: Set<UUID> = []
     @ObservationIgnored private var pollingTask: Task<Void, Never>?
     @ObservationIgnored private var activeSessions: [String: UUID] = [:]
+    @ObservationIgnored private var trickleStoppedKeys = Set<String>()
+    @ObservationIgnored private var disconnectDebounce: [String: Int] = [:]
     @ObservationIgnored private var knownProtocols: [UUID: Set<String>] = [:]
     @ObservationIgnored private var cachedFacts: [UUID: MachineFacts] = [:]
     @ObservationIgnored private var factsRefreshedAt: [UUID: Date] = [:]
     @ObservationIgnored private var lastStoreSaveAt = Date.distantPast
+    @ObservationIgnored private var lastDiagnosticRefreshLogAt = Date.distantPast
     @ObservationIgnored private let selectedDeviceDefaultsKey = "CandyMonitor.SelectedDeviceID"
     @ObservationIgnored private let logger = Logger(subsystem: "com.shawnrain.CandyMonitor", category: "MonitorStore")
+    @ObservationIgnored private let diagnosticLog = DiagnosticLog()
     @ObservationIgnored private let recentSampleWindow: TimeInterval = 60 * 30
     @ObservationIgnored private let recordingPowerThresholdW = 0.5
     @ObservationIgnored private let factsRefreshInterval: TimeInterval = 60
     @ObservationIgnored private let sampleSaveInterval: TimeInterval = 5
+    @ObservationIgnored private let reconnectDelay: TimeInterval = 3
+    @ObservationIgnored private let disconnectDebounceThreshold = 3
 
     var selectedDevice: MirrorDevice? {
         guard let selectedDeviceID else { return nil }
@@ -99,6 +105,7 @@ final class MonitorStore {
     func configure(modelContext: ModelContext) {
         if self.modelContext == nil {
             self.modelContext = modelContext
+            diagnosticLog.record("store_configured", metadata: ["log": diagnosticLog.path])
             loadDevices()
             loadSessions()
         }
@@ -106,17 +113,18 @@ final class MonitorStore {
 
     func reloadPersistedState() {
         guard modelContext != nil else { return }
-        loadDevices()
+        loadDevices(restartPolling: false)
         loadSessions()
     }
 
-    func loadDevices() {
+    func loadDevices(restartPolling: Bool = true) {
         guard let modelContext else { return }
         let descriptor = FetchDescriptor<MirrorDevice>(sortBy: [SortDescriptor(\.createdAt, order: .forward)])
         do {
             devices = try modelContext.fetch(descriptor)
         } catch {
             logger.error("device_fetch_failed \(error.localizedDescription, privacy: .public)")
+            diagnosticLog.record("device_fetch_failed", metadata: ["error": error.localizedDescription])
             devices = []
         }
         if devices.isEmpty {
@@ -133,7 +141,13 @@ final class MonitorStore {
             selectedDeviceID = devices.first?.id
         }
         hydrateRecentSamplesForSelectedDevice()
-        restartPollingIfNeeded()
+        diagnosticLog.record("devices_loaded", metadata: [
+            "count": "\(devices.count)",
+            "selected": selectedDeviceID?.uuidString ?? "-"
+        ])
+        if restartPolling {
+            restartPollingIfNeeded()
+        }
     }
 
     func loadSessions() {
@@ -166,6 +180,36 @@ final class MonitorStore {
         lowPowerSessionPrompt = nil
         connectionState = .idle
         restartPollingIfNeeded()
+    }
+
+    func ensureMonitoringActive(reason: String) {
+        guard modelContext != nil else { return }
+        if selectedDeviceSnapshot == nil {
+            loadDevices()
+            return
+        }
+
+        // If a polling task is actively running, don't kill it.
+        // Only restart if the task is gone/cancelled, or if we're truly stale
+        // (meaning we *had* a refresh but it stopped updating).
+        let taskAlive = pollingTask != nil && pollingTask?.isCancelled == false
+        let isStale: Bool
+        if let lastRefreshedAt {
+            isStale = Date().timeIntervalSince(lastRefreshedAt) > (isRealtimeRefreshEnabled ? 12 : 75)
+        } else {
+            // Never refreshed yet — only restart if the task isn't running
+            isStale = !taskAlive
+        }
+
+        if !taskAlive || isStale {
+            diagnosticLog.record("polling_watchdog_restart", metadata: [
+                "reason": reason,
+                "stale": "\(isStale)",
+                "task_alive": "\(taskAlive)",
+                "last_refresh": lastRefreshedAt?.ISO8601Format() ?? "-"
+            ])
+            restartPollingIfNeeded()
+        }
     }
 
     func addDevice(name: String, sseURLString: String, iotJWTString: String = "") async throws {
@@ -488,11 +532,14 @@ final class MonitorStore {
         defer { isRefreshingNow = false }
 
         do {
-            let client = try await client(for: device)
-            try await refreshOnce(device: device, client: client)
+            try await refreshWithReconnect(device: device, reason: "manual_refresh")
         } catch {
             connectionState = .failed(error.localizedDescription)
             lastError = error.localizedDescription
+            diagnosticLog.record("manual_refresh_failed", metadata: [
+                "device": device.id.uuidString,
+                "error": error.localizedDescription
+            ])
         }
     }
 
@@ -565,9 +612,14 @@ final class MonitorStore {
             let client = try await client(for: device)
             try await operation(client)
             logControl(deviceID: device.id, deviceName: device.name, action: action, detail: detail, verified: true)
-            try await refreshOnce(device: device, client: client)
+            try await refreshWithReconnect(device: device, reason: "control_refresh")
         } catch {
             lastError = error.localizedDescription
+            diagnosticLog.record("control_failed", metadata: [
+                "action": action,
+                "device": device.id.uuidString,
+                "error": error.localizedDescription
+            ])
             logControl(deviceID: device.id, deviceName: device.name, action: action, detail: "\(detail) - \(error.localizedDescription)", verified: false)
         }
     }
@@ -576,9 +628,14 @@ final class MonitorStore {
         stopPolling()
         guard let selectedDevice = selectedDeviceSnapshot else {
             connectionState = .idle
+            diagnosticLog.record("polling_stopped_no_device")
             return
         }
 
+        diagnosticLog.record("polling_restarted", metadata: [
+            "device": selectedDevice.id.uuidString,
+            "name": selectedDevice.name
+        ])
         pollingTask = Task { [weak self] in
             await self?.pollingLoop(device: selectedDevice)
         }
@@ -591,19 +648,46 @@ final class MonitorStore {
 
     private func pollingLoop(device: DeviceSnapshot) async {
         connectionState = .connecting
+        var backoff = reconnectDelay
 
-        do {
-            let client = try await client(for: device)
-            while !Task.isCancelled, selectedDeviceID == device.id {
-                try await refreshOnce(device: device, client: client)
+        while !Task.isCancelled, selectedDeviceID == device.id {
+            do {
+                try await refreshWithReconnect(device: device, reason: "polling")
+                backoff = reconnectDelay // reset on success
                 let seconds = isRealtimeRefreshEnabled ? 1.0 : 30.0
                 try? await Task.sleep(for: .seconds(seconds))
-            }
-        } catch {
-            if !Task.isCancelled {
+            } catch {
+                guard !Task.isCancelled else { return }
                 connectionState = .failed(error.localizedDescription)
                 lastError = error.localizedDescription
+                diagnosticLog.record("polling_refresh_failed", metadata: [
+                    "device": device.id.uuidString,
+                    "error": error.localizedDescription,
+                    "backoff": String(format: "%.0f", backoff)
+                ])
+                try? await Task.sleep(for: .seconds(backoff))
+                backoff = min(backoff * 2, 60)
             }
+        }
+    }
+
+    private func refreshWithReconnect(device: DeviceSnapshot, reason: String) async throws {
+        do {
+            let client = try await client(for: device)
+            try await refreshOnce(device: device, client: client)
+        } catch {
+            diagnosticLog.record("refresh_attempt_failed_reconnecting", metadata: [
+                "device": device.id.uuidString,
+                "reason": reason,
+                "error": error.localizedDescription
+            ])
+            await resetClient(for: device, reason: reason)
+            let freshClient = try await client(for: device)
+            try await refreshOnce(device: device, client: freshClient)
+            diagnosticLog.record("refresh_recovered_after_reconnect", metadata: [
+                "device": device.id.uuidString,
+                "reason": reason
+            ])
         }
     }
 
@@ -654,6 +738,14 @@ final class MonitorStore {
         let recordingResult = recordSamples(deviceID: device.id, deviceName: device.name, ports: livePorts, at: now)
         connectionState = .connected
         lastError = nil
+        if now.timeIntervalSince(lastDiagnosticRefreshLogAt) >= 30 {
+            lastDiagnosticRefreshLogAt = now
+            diagnosticLog.record("refresh_success", metadata: [
+                "device": device.id.uuidString,
+                "power": String(format: "%.1f", totalPowerW),
+                "ports": "\(livePorts.count)"
+            ])
+        }
         if didUpdateDevice || recordingResult.didMutateStore {
             saveStoreIfNeeded(force: didUpdateDevice || recordingResult.didChangeSessions, at: now)
         }
@@ -742,6 +834,8 @@ final class MonitorStore {
             observedKeys.insert(key)
             if port.connected {
                 attachedKeys.insert(key)
+            } else {
+                trickleStoppedKeys.remove(key)
             }
 
             guard let detail = port.detail else { continue }
@@ -759,7 +853,8 @@ final class MonitorStore {
 
             let isAttached = port.connected
             let hasOutputPower = detail.powerW >= recordingPowerThresholdW
-            let shouldPersistSample = activeSessions[key] != nil || hasOutputPower
+            let isTrickleStopped = trickleStoppedKeys.contains(key)
+            let shouldPersistSample = activeSessions[key] != nil || (hasOutputPower && !isTrickleStopped)
             guard shouldPersistSample else { continue }
 
             var event: String?
@@ -779,7 +874,8 @@ final class MonitorStore {
                 session = canonical
             }
 
-            if session == nil, hasOutputPower {
+            var justCreated = false
+            if session == nil, hasOutputPower, !isTrickleStopped {
                 let newSession = ChargingSession(
                     deviceID: deviceID,
                     deviceName: deviceName,
@@ -792,6 +888,7 @@ final class MonitorStore {
                 activeSessions[key] = newSession.id
                 session = newSession
                 event = "session_started"
+                justCreated = true
                 knownProtocols[newSession.id] = []
                 sessions.insert(newSession, at: 0)
                 if selectedSession == nil {
@@ -799,21 +896,93 @@ final class MonitorStore {
                 }
                 result.didMutateStore = true
                 result.didChangeSessions = true
+                disconnectDebounce.removeValue(forKey: key)
                 logger.info("session_started port=\(port.port.index, privacy: .public) power=\(detail.powerW, privacy: .public)")
+                diagnosticLog.record("session_started", metadata: [
+                    "port": "\(port.port.index)",
+                    "power": String(format: "%.1f", detail.powerW),
+                    "connected": "\(isAttached)",
+                    "session": newSession.id.uuidString
+                ])
             }
 
-            if isAttached == false, let session {
-                event = "device_disconnected"
-                end(session, at: now, reason: "device_disconnected")
-                result.didMutateStore = true
-                result.didChangeSessions = true
+            // Debounced disconnect: require N consecutive disconnected readings
+            // to end a session, preventing transient signal flickers.
+            // Never end a session that was just created this cycle.
+            if isAttached, session != nil {
+                disconnectDebounce.removeValue(forKey: key)
+            } else if isAttached == false, let session, !justCreated {
+                let count = (disconnectDebounce[key] ?? 0) + 1
+                disconnectDebounce[key] = count
+                if count >= disconnectDebounceThreshold {
+                    event = "device_disconnected"
+                    end(session, at: now, reason: "device_disconnected")
+                    disconnectDebounce.removeValue(forKey: key)
+                    result.didMutateStore = true
+                    result.didChangeSessions = true
+                    diagnosticLog.record("session_ended", metadata: [
+                        "port": "\(port.port.index)",
+                        "reason": "device_disconnected",
+                        "session": session.id.uuidString
+                    ])
+                } else {
+                    diagnosticLog.record("session_debounce", metadata: [
+                        "port": "\(port.port.index)",
+                        "count": "\(count)",
+                        "threshold": "\(disconnectDebounceThreshold)",
+                        "connected": "\(isAttached)",
+                        "power": String(format: "%.1f", detail.powerW)
+                    ])
+                }
             }
 
-            if let session, let battery = port.batteryPercent, battery >= 99 {
-                event = "battery_full"
-                session.finalBatteryPercent = battery
-                end(session, at: now, reason: "battery_full")
-                result.didChangeSessions = true
+            // Check if full/charged (Either via direct battery percentage OR low-power trickle detection)
+            if let activeSession = session, activeSession.endedAt == nil {
+                var shouldStopForTrickle = false
+                
+                if let battery = port.batteryPercent, battery >= 99 {
+                    shouldStopForTrickle = true
+                    event = "battery_full"
+                    activeSession.finalBatteryPercent = battery
+                    end(activeSession, at: now, reason: "battery_full")
+                } else {
+                    // Smart Trickle Charge / Auto-Stop check:
+                    // Retrieve up to 150 most recent samples of this session, check if average power is below 1.5W for at least 3 minutes.
+                    let sessionID = activeSession.id
+                    var descriptor = FetchDescriptor<PortSample>(
+                        predicate: #Predicate { sample in
+                            sample.sessionID == sessionID
+                        },
+                        sortBy: [SortDescriptor(\.timestamp, order: .reverse)]
+                    )
+                    descriptor.fetchLimit = 150
+                    
+                    if let recentSamples = try? modelContext.fetch(descriptor), recentSamples.count >= 80 {
+                        if let newest = recentSamples.first, let oldest = recentSamples.last {
+                            let timeSpan = newest.timestamp.timeIntervalSince(oldest.timestamp)
+                            if timeSpan >= 180 { // 3 minutes
+                                let avgPower = recentSamples.map { $0.powerW }.reduce(0, +) / Double(recentSamples.count)
+                                if avgPower < 1.5 {
+                                    shouldStopForTrickle = true
+                                    event = "battery_full"
+                                    activeSession.finalBatteryPercent = 100
+                                    activeSession.hasBatteryData = true
+                                    end(activeSession, at: now, reason: "trickle_charge")
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                if shouldStopForTrickle {
+                    trickleStoppedKeys.insert(key)
+                    result.didChangeSessions = true
+                    diagnosticLog.record("session_ended", metadata: [
+                        "port": "\(port.port.index)",
+                        "reason": event == "battery_full" && port.batteryPercent == nil ? "trickle_charge" : "battery_full",
+                        "session": activeSession.id.uuidString
+                    ])
+                }
             }
 
             let stats = SampleStats(
@@ -855,9 +1024,19 @@ final class MonitorStore {
                 activeSessions.removeValue(forKey: key)
                 continue
             }
-            end(session, at: now, reason: "device_disconnected")
-            result.didMutateStore = true
-            result.didChangeSessions = true
+            let count = (disconnectDebounce[key] ?? 0) + 1
+            disconnectDebounce[key] = count
+            if count >= disconnectDebounceThreshold {
+                end(session, at: now, reason: "device_disconnected")
+                disconnectDebounce.removeValue(forKey: key)
+                result.didMutateStore = true
+                result.didChangeSessions = true
+                diagnosticLog.record("session_ended", metadata: [
+                    "port": key,
+                    "reason": "device_disconnected_sweep",
+                    "session": session.id.uuidString
+                ])
+            }
         }
 
         if result.didChangeSessions {
@@ -880,25 +1059,16 @@ final class MonitorStore {
     }
 
     private func fetchSession(id: UUID) -> ChargingSession? {
-        guard let modelContext else { return nil }
-        var descriptor = FetchDescriptor<ChargingSession>(
-            predicate: #Predicate { session in
-                session.id == id
-            }
-        )
-        descriptor.fetchLimit = 1
-        return try? modelContext.fetch(descriptor).first
+        // Use in-memory array instead of SwiftData #Predicate fetch,
+        // because #Predicate may not return recently-inserted unsaved objects.
+        return sessions.first { $0.id == id }
     }
 
     private func fetchActiveSessions(deviceID: UUID, port: Int) -> [ChargingSession] {
-        guard let modelContext else { return [] }
-        let descriptor = FetchDescriptor<ChargingSession>(
-            predicate: #Predicate { session in
-                session.deviceID == deviceID && session.portIndex == port && session.endedAt == nil
-            },
-            sortBy: [SortDescriptor(\.startedAt, order: .forward)]
-        )
-        return (try? modelContext.fetch(descriptor)) ?? []
+        // Use in-memory array instead of SwiftData #Predicate fetch,
+        // because #Predicate may not return recently-inserted unsaved objects.
+        return sessions.filter { $0.deviceID == deviceID && $0.portIndex == port && $0.endedAt == nil }
+            .sorted { $0.startedAt < $1.startedAt }
     }
 
     private func mergeDuplicateActiveSessions(in candidateSessions: [ChargingSession], at now: Date) -> Bool {
@@ -1033,17 +1203,52 @@ final class MonitorStore {
 
     private func client(for device: DeviceSnapshot) async throws -> MCPClient {
         if let client = clients[device.id] {
-            try await client.connect()
-            return client
+            // If the stream died silently, throw away the dead client
+            let alive = await client.isConnected
+            if alive {
+                try await client.connect()
+                return client
+            } else {
+                await resetClient(for: device, reason: "stale_stream_detected")
+            }
         }
         guard let urlString = try KeychainStore.loadMCPURL(account: device.keychainAccount),
               let url = URL(string: urlString) else {
+            diagnosticLog.record("client_missing_mcp_url", metadata: ["device": device.id.uuidString])
             throw MonitorError.missingMCPURL
         }
+        diagnosticLog.record("client_connecting", metadata: [
+            "device": device.id.uuidString,
+            "url": DiagnosticLog.redactedURL(urlString)
+        ])
         let client = MCPClient(sseURL: url)
-        try await client.connect()
-        clients[device.id] = client
-        return client
+        do {
+            try await client.connect()
+            clients[device.id] = client
+            diagnosticLog.record("client_connected", metadata: ["device": device.id.uuidString])
+            return client
+        } catch {
+            diagnosticLog.record("client_connect_failed", metadata: [
+                "device": device.id.uuidString,
+                "error": error.localizedDescription
+            ])
+            throw error
+        }
+    }
+
+    private func resetClient(for device: DeviceSnapshot, reason: String) async {
+        if let client = clients.removeValue(forKey: device.id) {
+            await client.disconnect()
+            diagnosticLog.record("client_reset", metadata: [
+                "device": device.id.uuidString,
+                "reason": reason
+            ])
+        }
+        cachedFacts.removeValue(forKey: device.id)
+        factsRefreshedAt.removeValue(forKey: device.id)
+        if let streamClient = pdStreamClients.removeValue(forKey: device.id) {
+            await streamClient.disconnect()
+        }
     }
 
     private func logControl(deviceID: UUID, deviceName: String, action: String, detail: String, verified: Bool) {

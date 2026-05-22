@@ -6,10 +6,17 @@ actor MCPClient {
     private var nextRequestID = 1
     private var streamTask: Task<Void, Never>?
     private var endpointContinuation: CheckedContinuation<URL, Error>?
+    private var endpointWaitGeneration = 0
     private var pendingResponses: [Int: CheckedContinuation<[String: Any], Error>] = [:]
+    private var streamAlive = false
+    private let requestTimeout: TimeInterval = 15
 
     init(sseURL: URL) {
         self.sseURL = sseURL
+    }
+
+    var isConnected: Bool {
+        endpointURL != nil && streamAlive && streamTask?.isCancelled == false
     }
 
     deinit {
@@ -21,7 +28,11 @@ actor MCPClient {
     }
 
     func connect() async throws {
-        if endpointURL != nil {
+        // If the stream died silently, reset so we reconnect
+        if endpointURL != nil && !streamAlive {
+            disconnect()
+        }
+        if endpointURL != nil && streamAlive {
             return
         }
 
@@ -36,6 +47,7 @@ actor MCPClient {
         }
 
         streamTask?.cancel()
+        streamAlive = true
         streamTask = Task { [weak self] in
             do {
                 for try await line in bytes.lines {
@@ -43,11 +55,11 @@ actor MCPClient {
                 }
                 await self?.markDisconnected()
             } catch {
-                await self?.failAll(error)
+                await self?.markDisconnected()
             }
         }
 
-        _ = try await waitForEndpoint()
+        _ = try await waitForEndpoint(timeout: 8)
         _ = try await request(method: "initialize", params: [
             "protocolVersion": "2024-11-05",
             "capabilities": [:],
@@ -60,9 +72,11 @@ actor MCPClient {
     }
 
     func disconnect() {
+        streamAlive = false
         streamTask?.cancel()
         streamTask = nil
         endpointURL = nil
+        endpointWaitGeneration += 1
         failAll(MCPError.disconnected)
     }
 
@@ -198,12 +212,18 @@ actor MCPClient {
         return nil
     }
 
-    private func waitForEndpoint() async throws -> URL {
+    private func waitForEndpoint(timeout seconds: TimeInterval) async throws -> URL {
         if let endpointURL {
             return endpointURL
         }
+        endpointWaitGeneration += 1
+        let generation = endpointWaitGeneration
         return try await withCheckedThrowingContinuation { continuation in
             endpointContinuation = continuation
+            Task { [weak self] in
+                try? await Task.sleep(for: .seconds(seconds))
+                await self?.failEndpointWaitIfNeeded(generation: generation)
+            }
         }
     }
 
@@ -221,6 +241,7 @@ actor MCPClient {
             "method": method,
             "params": params
         ]
+        let timeout = requestTimeout
         return try await withCheckedThrowingContinuation { continuation in
             pendingResponses[id] = continuation
             Task { [weak self] in
@@ -230,7 +251,16 @@ actor MCPClient {
                     await self?.resumeRequest(id: id, throwing: error)
                 }
             }
+            Task { [weak self] in
+                try? await Task.sleep(for: .seconds(timeout))
+                await self?.timeoutRequest(id: id)
+            }
         }
+    }
+
+    private func timeoutRequest(id: Int) {
+        guard let continuation = pendingResponses.removeValue(forKey: id) else { return }
+        continuation.resume(throwing: MCPError.requestTimeout)
     }
 
     private func sendNotification(method: String, params: [String: Any]) async throws {
@@ -271,6 +301,7 @@ actor MCPClient {
         if payload.hasPrefix("/") {
             let resolved = resolveEndpoint(payload)
             endpointURL = resolved
+            endpointWaitGeneration += 1
             endpointContinuation?.resume(returning: resolved)
             endpointContinuation = nil
             return
@@ -309,11 +340,23 @@ actor MCPClient {
     }
 
     private func markDisconnected() {
+        streamAlive = false
         endpointURL = nil
+        endpointWaitGeneration += 1
         failAll(MCPError.disconnected)
     }
 
+    private func failEndpointWaitIfNeeded(generation: Int) {
+        guard generation == endpointWaitGeneration else { return }
+        guard endpointURL == nil else { return }
+        endpointContinuation?.resume(throwing: MCPError.missingEndpoint)
+        endpointContinuation = nil
+        streamTask?.cancel()
+        streamTask = nil
+    }
+
     private func failAll(_ error: Error) {
+        endpointWaitGeneration += 1
         for continuation in pendingResponses.values {
             continuation.resume(throwing: error)
         }
@@ -329,6 +372,7 @@ enum MCPError: LocalizedError {
     case invalidToolResponse(String)
     case rpc(String)
     case disconnected
+    case requestTimeout
 
     var errorDescription: String? {
         switch self {
@@ -342,6 +386,8 @@ enum MCPError: LocalizedError {
             message
         case .disconnected:
             "MCP 连接已断开"
+        case .requestTimeout:
+            "MCP 请求超时"
         }
     }
 }
