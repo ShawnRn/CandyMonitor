@@ -3153,7 +3153,7 @@ struct MenuBarPowerLabel: View {
 
     private var renderedCandyPowerImage: NSImage {
         let font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
-        let foregroundColor: NSColor = isDarkMenuBarAppearance ? .white : .black
+        let foregroundColor: NSColor = .black
         let attributes: [NSAttributedString.Key: Any] = [
             .font: font,
             .foregroundColor: foregroundColor
@@ -3170,7 +3170,7 @@ struct MenuBarPowerLabel: View {
         NSColor.clear.setFill()
         NSRect(origin: .zero, size: image.size).fill()
 
-        if let icon = NSImage(named: menuBarCandyIconAssetName) {
+        if let icon = NSImage(named: "CandyMenuBarIconBlack") {
             icon.draw(in: NSRect(
                 x: 0,
                 y: floor((height - iconSize.height) / 2) + 1,
@@ -3184,18 +3184,8 @@ struct MenuBarPowerLabel: View {
             y: floor((height - textSize.height) / 2) + 1
         ), withAttributes: attributes)
         image.unlockFocus()
-        image.isTemplate = false
+        image.isTemplate = true
         return image
-    }
-
-    private var menuBarCandyIconAssetName: String {
-        isDarkMenuBarAppearance
-            ? "CandyMenuBarIconWhite"
-            : "CandyMenuBarIconBlack"
-    }
-
-    private var isDarkMenuBarAppearance: Bool {
-        NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
     }
 }
 
