@@ -28,7 +28,7 @@ struct CandyMonitorApp: App {
         MenuBarExtra {
             CandyMenuBarView(store: store)
         } label: {
-            MenuBarPowerLabel(totalPowerW: store.totalPowerW, connectionState: store.connectionState)
+            MenuBarStatusLabel(store: store)
         }
         .menuBarExtraStyle(.window)
         .modelContainer(for: [
