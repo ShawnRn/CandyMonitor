@@ -69,10 +69,28 @@ final class MonitorStore {
     @ObservationIgnored private var factsRefreshedAt: [UUID: Date] = [:]
     @ObservationIgnored private var lastStoreSaveAt = Date.distantPast
     @ObservationIgnored private var lastDiagnosticRefreshLogAt = Date.distantPast
+    
+    // EMA smooth cache to prevent main-thread computation bottlenecks
+    @ObservationIgnored private var emaPowerW: [String: Double] = [:]
+    @ObservationIgnored private var emaVoltageV: [String: Double] = [:]
+    @ObservationIgnored private var emaCurrentA: [String: Double] = [:]
+    @ObservationIgnored private var emaTemperatureScore: [String: Double] = [:]
+    @ObservationIgnored private var emaLastConnected: [String: Bool] = [:]
+    
+    // Status caching to prevent serial / network bottleneck
+    @ObservationIgnored private var cachedChargingStatus: [UUID: ChargingStatus] = [:]
+    @ObservationIgnored private var cachedTemperatureMode: [UUID: TemperatureModeResponse] = [:]
+    @ObservationIgnored private var cachedPDStatus: [UUID: PDStatusEnvelope] = [:]
+    @ObservationIgnored private var lastChargingRefreshedAt: [UUID: Date] = [:]
+    @ObservationIgnored private var lastTemperatureRefreshedAt: [UUID: Date] = [:]
+    @ObservationIgnored private var lastPDRefreshedAt: [UUID: Date] = [:]
+    
+    // App Nap prevention activity token
+    @ObservationIgnored private var activityToken: NSObjectProtocol?
     @ObservationIgnored private let selectedDeviceDefaultsKey = "CandyMonitor.SelectedDeviceID"
     @ObservationIgnored private let logger = Logger(subsystem: "com.shawnrain.CandyMonitor", category: "MonitorStore")
     @ObservationIgnored private let diagnosticLog = DiagnosticLog()
-    @ObservationIgnored private let recentSampleWindow: TimeInterval = 60 * 30
+    @ObservationIgnored private let recentSampleWindow: TimeInterval = 60
     @ObservationIgnored private let recordingPowerThresholdW = 0.5
     @ObservationIgnored private let factsRefreshInterval: TimeInterval = 60
     @ObservationIgnored private let sampleSaveInterval: TimeInterval = 5
@@ -612,6 +630,15 @@ final class MonitorStore {
             let client = try await client(for: device)
             try await operation(client)
             logControl(deviceID: device.id, deviceName: device.name, action: action, detail: detail, verified: true)
+            
+            // Invalidate status caches to force a fresh fetch immediately
+            cachedChargingStatus.removeValue(forKey: device.id)
+            cachedTemperatureMode.removeValue(forKey: device.id)
+            cachedPDStatus.removeValue(forKey: device.id)
+            lastChargingRefreshedAt.removeValue(forKey: device.id)
+            lastTemperatureRefreshedAt.removeValue(forKey: device.id)
+            lastPDRefreshedAt.removeValue(forKey: device.id)
+            
             try await refreshWithReconnect(device: device, reason: "control_refresh")
         } catch {
             lastError = error.localizedDescription
@@ -629,6 +656,7 @@ final class MonitorStore {
         guard let selectedDevice = selectedDeviceSnapshot else {
             connectionState = .idle
             diagnosticLog.record("polling_stopped_no_device")
+            releaseActivityToken()
             return
         }
 
@@ -636,6 +664,9 @@ final class MonitorStore {
             "device": selectedDevice.id.uuidString,
             "name": selectedDevice.name
         ])
+        
+        acquireActivityToken()
+        
         pollingTask = Task { [weak self] in
             await self?.pollingLoop(device: selectedDevice)
         }
@@ -644,6 +675,24 @@ final class MonitorStore {
     private func stopPolling() {
         pollingTask?.cancel()
         pollingTask = nil
+        releaseActivityToken()
+    }
+
+    private func acquireActivityToken() {
+        guard activityToken == nil else { return }
+        activityToken = ProcessInfo.processInfo.beginActivity(
+            options: .userInitiatedAllowingIdleSystemSleep,
+            reason: "CandyMonitor Background Polling"
+        )
+        diagnosticLog.record("activity_token_acquired")
+    }
+
+    private func releaseActivityToken() {
+        if let token = activityToken {
+            ProcessInfo.processInfo.endActivity(token)
+            activityToken = nil
+            diagnosticLog.record("activity_token_released")
+        }
     }
 
     private func pollingLoop(device: DeviceSnapshot) async {
@@ -694,20 +743,53 @@ final class MonitorStore {
     private func refreshOnce(device: DeviceSnapshot, client: MCPClient) async throws {
         let now = Date()
         let facts = try await machineFacts(for: device, client: client, at: now)
-        async let detailsTask = retry {
+        
+        // 1. Port details are always queried every second
+        let details = try await retry {
             try await client.portDetails()
         }
-        async let chargingTask = retry {
-            try await client.chargingStatus()
+        
+        // 2. Charging status: cached with 5 seconds expiration
+        let charging: ChargingStatus
+        if let cached = cachedChargingStatus[device.id],
+           let refreshedAt = lastChargingRefreshedAt[device.id],
+           now.timeIntervalSince(refreshedAt) < 5 {
+            charging = cached
+        } else {
+            charging = try await retry {
+                try await client.chargingStatus()
+            }
+            cachedChargingStatus[device.id] = charging
+            lastChargingRefreshedAt[device.id] = now
         }
-        async let temperatureTask = retry {
-            try await client.temperatureMode()
+        
+        // 3. Temperature mode: cached with 30 seconds expiration
+        let temperature: TemperatureModeResponse
+        if let cached = cachedTemperatureMode[device.id],
+           let refreshedAt = lastTemperatureRefreshedAt[device.id],
+           now.timeIntervalSince(refreshedAt) < 30 {
+            temperature = cached
+        } else {
+            temperature = try await retry {
+                try await client.temperatureMode()
+            }
+            cachedTemperatureMode[device.id] = temperature
+            lastTemperatureRefreshedAt[device.id] = now
         }
-
-        let details = try await detailsTask
-        let charging = try await chargingTask
-        let temperature = try await temperatureTask
-        let pd = try? await client.pdStatus()
+        
+        // 4. PD Status: cached with 10 seconds expiration (only queries MCP fallback if cached version is old)
+        let pd: PDStatusEnvelope?
+        if let cached = cachedPDStatus[device.id],
+           let refreshedAt = lastPDRefreshedAt[device.id],
+           now.timeIntervalSince(refreshedAt) < 10 {
+            pd = cached
+        } else {
+            pd = try? await client.pdStatus()
+            if let pd {
+                cachedPDStatus[device.id] = pd
+                lastPDRefreshedAt[device.id] = now
+            }
+        }
 
         guard selectedDeviceID == device.id else { return }
 
@@ -840,15 +922,53 @@ final class MonitorStore {
 
             guard let detail = port.detail else { continue }
 
+            let alpha = 0.25
+            let rawPower = detail.powerW
+            let rawVoltage = Double(detail.voutMV) / 1000
+            let rawCurrent = Double(detail.ioutMA) / 1000
+            let rawTemp = temperatureScore(detail.dieTemperature)
+
+            let lastPower = emaPowerW[key] ?? rawPower
+            let lastVoltage = emaVoltageV[key] ?? rawVoltage
+            let lastCurrent = emaCurrentA[key] ?? rawCurrent
+            let lastTemp = emaTemperatureScore[key] ?? rawTemp
+            let lastConn = emaLastConnected[key] ?? port.connected
+
+            let powerDiff = abs(rawPower - lastPower)
+            let voltDiff = abs(rawVoltage - lastVoltage)
+
+            let smoothedPower: Double
+            let smoothedVoltage: Double
+            let smoothedCurrent: Double
+            let smoothedTemp: Double
+
+            if powerDiff > 2.0 || voltDiff > 1.0 || port.connected != lastConn {
+                smoothedPower = rawPower
+                smoothedVoltage = rawVoltage
+                smoothedCurrent = rawCurrent
+                smoothedTemp = rawTemp
+            } else {
+                smoothedPower = lastPower + alpha * (rawPower - lastPower)
+                smoothedVoltage = lastVoltage + alpha * (rawVoltage - lastVoltage)
+                smoothedCurrent = lastCurrent + alpha * (rawCurrent - lastCurrent)
+                smoothedTemp = lastTemp + alpha * (rawTemp - lastTemp)
+            }
+
+            emaPowerW[key] = smoothedPower
+            emaVoltageV[key] = smoothedVoltage
+            emaCurrentA[key] = smoothedCurrent
+            emaTemperatureScore[key] = smoothedTemp
+            emaLastConnected[key] = port.connected
+
             recentSamples.append(ChartSamplePoint(
                 timestamp: now,
                 portIndex: port.port.index,
                 portName: port.port.name,
                 connected: port.connected,
-                powerW: detail.powerW,
-                voltageV: Double(detail.voutMV) / 1000,
-                currentA: Double(detail.ioutMA) / 1000,
-                temperatureScore: temperatureScore(detail.dieTemperature)
+                powerW: smoothedPower,
+                voltageV: smoothedVoltage,
+                currentA: smoothedCurrent,
+                temperatureScore: smoothedTemp
             ))
 
             let isAttached = port.connected
@@ -1246,6 +1366,14 @@ final class MonitorStore {
         }
         cachedFacts.removeValue(forKey: device.id)
         factsRefreshedAt.removeValue(forKey: device.id)
+        
+        cachedChargingStatus.removeValue(forKey: device.id)
+        cachedTemperatureMode.removeValue(forKey: device.id)
+        cachedPDStatus.removeValue(forKey: device.id)
+        lastChargingRefreshedAt.removeValue(forKey: device.id)
+        lastTemperatureRefreshedAt.removeValue(forKey: device.id)
+        lastPDRefreshedAt.removeValue(forKey: device.id)
+        
         if let streamClient = pdStreamClients.removeValue(forKey: device.id) {
             await streamClient.disconnect()
         }

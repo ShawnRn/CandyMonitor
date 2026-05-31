@@ -11,7 +11,7 @@ PROJECT_NAME="CandyMonitor"
 APP_NAME="CandyMonitor.app"
 ENTITLEMENTS_FILE="$PROJECT_DIR/CandyMonitor/CandyMonitor.entitlements"
 RELEASE_DIR="$ROOT/releases"
-BUILD_DIR="$ROOT/.build"
+BUILD_DIR="/tmp/CandyMonitor-build"
 ARCHIVE_DIR="$BUILD_DIR/archive"
 APP_BUILD_DIR="$BUILD_DIR/apps"
 DMG_WORK_DIR="$BUILD_DIR/dmg"
@@ -105,6 +105,7 @@ for TARGET_ARCH in arm64 x86_64; do
   fi
 
   echo "==> Signing app bundle for $TARGET_ARCH"
+  xattr -cr "$ARCH_APP_BUNDLE" 2>/dev/null || true
   codesign --force --deep --sign "-" --entitlements "$ENTITLEMENTS_FILE" "$ARCH_APP_BUNDLE"
   verify_sandbox_entitlement "$ARCH_APP_BUNDLE"
 

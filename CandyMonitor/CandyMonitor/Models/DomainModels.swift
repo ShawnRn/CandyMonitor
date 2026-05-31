@@ -655,7 +655,7 @@ struct PortViewState: Identifiable, Hashable {
 }
 
 struct ChartSamplePoint: Identifiable, Hashable {
-    let id = UUID()
+    let id: UUID
     let timestamp: Date
     let portIndex: Int
     let portName: String
@@ -664,6 +664,57 @@ struct ChartSamplePoint: Identifiable, Hashable {
     let voltageV: Double
     let currentA: Double
     let temperatureScore: Double
+
+    init(
+        timestamp: Date,
+        portIndex: Int,
+        portName: String,
+        connected: Bool,
+        powerW: Double,
+        voltageV: Double,
+        currentA: Double,
+        temperatureScore: Double
+    ) {
+        self.timestamp = timestamp
+        self.portIndex = portIndex
+        self.portName = portName
+        self.connected = connected
+        self.powerW = powerW
+        self.voltageV = voltageV
+        self.currentA = currentA
+        self.temperatureScore = temperatureScore
+
+        var bytes = [UInt8](repeating: 0, count: 16)
+        
+        // Port Index (4 bytes)
+        bytes[0] = UInt8((portIndex >> 24) & 0xFF)
+        bytes[1] = UInt8((portIndex >> 16) & 0xFF)
+        bytes[2] = UInt8((portIndex >> 8) & 0xFF)
+        bytes[3] = UInt8(portIndex & 0xFF)
+        
+        // Timestamp bits (8 bytes)
+        let timeBits = timestamp.timeIntervalSince1970.bitPattern
+        bytes[4] = UInt8((timeBits >> 56) & 0xFF)
+        bytes[5] = UInt8((timeBits >> 48) & 0xFF)
+        bytes[6] = UInt8((timeBits >> 40) & 0xFF)
+        bytes[7] = UInt8((timeBits >> 32) & 0xFF)
+        bytes[8] = UInt8((timeBits >> 24) & 0xFF)
+        bytes[9] = UInt8((timeBits >> 16) & 0xFF)
+        bytes[10] = UInt8((timeBits >> 8) & 0xFF)
+        bytes[11] = UInt8(timeBits & 0xFF)
+        
+        bytes[12] = 0xCA
+        bytes[13] = 0x4D
+        bytes[14] = 0x59
+        bytes[15] = 0x01
+        
+        self.id = UUID(uuid: (
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[8], bytes[9], bytes[10], bytes[11],
+            bytes[12], bytes[13], bytes[14], bytes[15]
+        ))
+    }
 }
 
 struct DeviceValidationResult {

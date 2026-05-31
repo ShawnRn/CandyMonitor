@@ -291,7 +291,6 @@ private struct NativeMonitorView: View {
     @State private var metric: ChartMetric = .power
     @State private var selectedPortIDs: Set<Int> = []
     @State private var portFilterAnchor: Int?
-    @State private var hoveredLiveSamples: [ChartSamplePoint] = []
     @State private var detailPort: PortViewState?
 
     private var effectivePortIDs: Set<Int> {
@@ -301,19 +300,15 @@ private struct NativeMonitorView: View {
     private var filteredSamples: [ChartSamplePoint] {
         store.recentSamples
             .filter { effectivePortIDs.contains($0.portIndex) }
-            .sorted { $0.timestamp < $1.timestamp }
     }
 
-    private var lineSamples: [ChartLinePoint] {
-        segmentedChartPoints(from: plottedSamples)
-    }
+    @State private var plottedSamplesCache: [ChartSamplePoint] = []
+    @State private var lineSamplesCache: [ChartLinePoint] = []
 
-    private var plottedSamples: [ChartSamplePoint] {
-        downsampleChartSamples(filteredSamples, metric: metric)
-    }
-
-    private var hoveredSampleIDs: Set<UUID> {
-        Set(hoveredLiveSamples.map(\.id))
+    private func updateChartCache(with samples: [ChartSamplePoint], metric: ChartMetric) {
+        let plotted = downsampleChartSamples(samples, metric: metric)
+        self.plottedSamplesCache = plotted
+        self.lineSamplesCache = segmentedChartPoints(from: plotted)
     }
 
     var body: some View {
@@ -330,6 +325,7 @@ private struct NativeMonitorView: View {
                 VStack(alignment: .leading, spacing: 12) {
                     MirrorDeviceHero(
                         deviceName: store.selectedDevice?.name ?? "AI 小电拼",
+                        productFamily: store.selectedDevice?.productFamily,
                         connectionState: store.connectionState,
                         lastRefreshedAt: store.lastRefreshedAt,
                         temperatureMode: LocalizedTelemetry.temperatureModeLabel(store.temperatureModeLabel),
@@ -375,6 +371,15 @@ private struct NativeMonitorView: View {
                 store: store
             )
         }
+        .onChange(of: store.recentSamples, initial: true) { _, _ in
+            updateChartCache(with: filteredSamples, metric: metric)
+        }
+        .onChange(of: selectedPortIDs) { _, _ in
+            updateChartCache(with: filteredSamples, metric: metric)
+        }
+        .onChange(of: metric) { _, newMetric in
+            updateChartCache(with: filteredSamples, metric: newMetric)
+        }
     }
 
     private var nativeMetrics: some View {
@@ -391,7 +396,9 @@ private struct NativeMonitorView: View {
             totalPowerW: store.totalPowerW,
             selectedPortIDs: selectedPortIDs,
             selectPort: { detailPort = $0 },
-            togglePort: selectPortFilter
+            togglePort: selectPortFilter,
+            productFamily: store.selectedDevice?.productFamily,
+            maxPowerBudget: store.selectedDevice?.maxPowerBudget ?? 0
         )
     }
 
@@ -420,58 +427,11 @@ private struct NativeMonitorView: View {
 
             portFilterBar
 
-            ZStack(alignment: .topLeading) {
-                Chart {
-                    ForEach(lineSamples) { point in
-                        LineMark(
-                            x: .value("Time", point.sample.timestamp),
-                            y: .value(metric.title, metric.displayValue(point.sample)),
-                            series: .value("Segment", point.seriesID)
-                        )
-                        .foregroundStyle(by: .value("Port", point.sample.portName))
-                        .lineStyle(StrokeStyle(lineWidth: 2.5, lineCap: .round, lineJoin: .round))
-                        .interpolationMethod(.linear)
-
-                        if hoveredSampleIDs.contains(point.sample.id) {
-                            PointMark(
-                                x: .value("Time", point.sample.timestamp),
-                                y: .value(metric.title, metric.displayValue(point.sample))
-                            )
-                            .foregroundStyle(CandyTheme.syrup)
-                            .symbolSize(90)
-                        }
-                    }
-
-                    if let hoveredTimestamp = hoveredLiveSamples.first?.timestamp {
-                        RuleMark(x: .value("Time", hoveredTimestamp))
-                            .foregroundStyle(CandyTheme.syrup.opacity(0.42))
-                            .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 4]))
-                    }
-                }
-                .chartYAxisLabel(metric.axisLabel)
-                .chartYScale(domain: metric.displayDomain(for: filteredSamples))
-                .chartOverlay { proxy in
-                    GeometryReader { geometry in
-                        Rectangle()
-                            .fill(.clear)
-                            .contentShape(Rectangle())
-                            .onContinuousHover { phase in
-                                switch phase {
-                                case .active(let location):
-                                    updateHover(location: location, proxy: proxy, geometry: geometry)
-                                case .ended:
-                                    hoveredLiveSamples = []
-                                }
-                            }
-                    }
-                }
-                .frame(height: 220)
-
-                if hoveredLiveSamples.isEmpty == false {
-                    ChartReadout(samples: hoveredLiveSamples, metric: metric)
-                        .padding(14)
-                }
-            }
+            LiveMonitorChartView(
+                lineSamplesCache: lineSamplesCache,
+                plottedSamplesCache: plottedSamplesCache,
+                metric: metric
+            )
             .padding(14)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             .overlay {
@@ -479,7 +439,7 @@ private struct NativeMonitorView: View {
                     .stroke(CandyTheme.separator, lineWidth: 1)
             }
 
-            if filteredSamples.isEmpty {
+            if plottedSamplesCache.isEmpty {
                 Text("暂无采样。连接负载后会自动开始记录完整充电曲线。")
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -581,28 +541,28 @@ private struct NativeMonitorView: View {
         portFilterAnchor = port
     }
 
-    private func updateHover(location: CGPoint, proxy: ChartProxy, geometry: GeometryProxy) {
-        guard let plotAnchor = proxy.plotFrame else {
-            hoveredLiveSamples = []
-            return
-        }
-        let plotFrame = geometry[plotAnchor]
-        guard plotFrame.contains(location),
-              let date: Date = proxy.value(atX: location.x - plotFrame.origin.x) else {
-            hoveredLiveSamples = []
-            return
-        }
-
-        hoveredLiveSamples = nearestSamplesByPort(to: date, in: plottedSamples)
-    }
 }
 
 private struct MirrorDeviceHero: View {
     let deviceName: String
+    let productFamily: String?
     let connectionState: ConnectionState
     let lastRefreshedAt: Date?
     let temperatureMode: String
     let activeSessions: Int
+
+    private var displayFamilyName: String {
+        guard let pf = productFamily?.uppercased() else {
+            return "Mirror"
+        }
+        if pf.contains("CP-02S") || pf.contains("02S") {
+            return "02S"
+        } else if pf.contains("CP-02") || pf.contains("ULTRA") {
+            return "Ultra"
+        } else {
+            return "Mirror"
+        }
+    }
 
     var body: some View {
         HStack(alignment: .center, spacing: 16) {
@@ -611,7 +571,7 @@ private struct MirrorDeviceHero: View {
                     Text("CoCan")
                         .font(.system(size: 15, weight: .semibold, design: .rounded))
                         .foregroundStyle(.secondary)
-                    Text("Mirror")
+                    Text(displayFamilyName)
                         .font(.system(size: 15, weight: .semibold, design: .rounded).italic())
                         .foregroundStyle(CandyTheme.syrup)
                 }
@@ -672,6 +632,27 @@ private struct MirrorPowerTopologyPanel: View {
     let selectedPortIDs: Set<Int>
     let selectPort: (PortViewState) -> Void
     let togglePort: (Int) -> Void
+    let productFamily: String?
+    let maxPowerBudget: Int
+
+    private var maxPowerW: Double {
+        let budget = Double(maxPowerBudget)
+        return budget > 0 ? budget : 160.0
+    }
+
+    private var portsConfigLabel: String {
+        let typeC = ports.filter { !$0.port.connectorType.lowercased().contains("a") }.count
+        let usbA = ports.filter { $0.port.connectorType.lowercased().contains("a") }.count
+        if typeC > 0 && usbA > 0 {
+            return "\(typeC)C \(usbA)A"
+        } else if typeC > 0 {
+            return "\(typeC)C"
+        } else if usbA > 0 {
+            return "\(usbA)A"
+        } else {
+            return "\(ports.count)P"
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -707,11 +688,22 @@ private struct MirrorPowerTopologyPanel: View {
             ZStack(alignment: .bottom) {
                 GeometryReader { proxy in
                     ForEach(Array(ports.enumerated()), id: \.element.id) { index, port in
+                        let isCharging = port.connected && port.powerW > 0.5
+                        let strokeColor = isCharging 
+                            ? CandyTheme.syrup.opacity(0.88) 
+                            : CandyTheme.syrup.opacity(0.28)
+                        
+                        let strokeStyle: StrokeStyle = {
+                            if isCharging {
+                                let w = 3.0 + min(port.powerW / 140.0, 1.0) * 13.0
+                                return StrokeStyle(lineWidth: w, lineCap: .round, lineJoin: .round)
+                            } else {
+                                return StrokeStyle(lineWidth: 1.8, lineCap: .round, dash: [1, 6])
+                            }
+                        }()
+                        
                         MirrorCablePath(index: index, total: max(ports.count, 1))
-                            .stroke(
-                                port.connected ? CandyTheme.syrup.opacity(0.55) : CandyTheme.syrup.opacity(0.26),
-                                style: StrokeStyle(lineWidth: 2, lineCap: .round, dash: [1, 7])
-                            )
+                            .stroke(strokeColor, style: strokeStyle)
                             .frame(width: proxy.size.width, height: proxy.size.height)
                     }
                 }
@@ -731,7 +723,7 @@ private struct MirrorPowerTopologyPanel: View {
                         }
                     }
                     Spacer()
-                    MirrorChargerIllustration()
+                    MirrorChargerIllustration(productFamily: productFamily)
                         .frame(width: MirrorTopologyLayout.chargerWidth, height: MirrorTopologyLayout.chargerHeight)
                 }
                 .padding(.horizontal, 8)
@@ -749,11 +741,11 @@ private struct MirrorPowerTopologyPanel: View {
 
     private var capacityBadge: some View {
         HStack(spacing: 6) {
-            Text("4C 1A")
+            Text(portsConfigLabel)
                 .font(.caption.weight(.bold))
-            Text("160W")
+            Text("\(Int(maxPowerW))W")
                 .font(.callout.weight(.bold).monospacedDigit())
-            Text("\(Int(min(totalPowerW / 160, 1) * 100))%")
+            Text("\(Int(min(totalPowerW / maxPowerW, 1) * 100))%")
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(CandyTheme.syrup)
         }
@@ -867,12 +859,40 @@ private struct MirrorCablePath: Shape {
 }
 
 private struct MirrorChargerIllustration: View {
+    let productFamily: String?
+    
     var body: some View {
-        Image("Mirror4C1ADevice")
+        Image(assetName)
             .resizable()
             .scaledToFit()
             .shadow(color: .black.opacity(0.18), radius: 10, y: 5)
-            .accessibilityLabel("小电拼 4C1A 图示")
+            .accessibilityLabel("小电拼 \(displayName) 图示")
+    }
+    
+    private var assetName: String {
+        guard let pf = productFamily?.uppercased() else {
+            return "Mirror4C1ADevice"
+        }
+        if pf.contains("CP-02S") || pf.contains("02S") {
+            return "Mirror02sDevice"
+        } else if pf.contains("CP-02") || pf.contains("ULTRA") {
+            return "Ultra02Device"
+        } else {
+            return "Mirror4C1ADevice"
+        }
+    }
+    
+    private var displayName: String {
+        guard let pf = productFamily?.uppercased() else {
+            return "4C1A"
+        }
+        if pf.contains("CP-02S") || pf.contains("02S") {
+            return "02S"
+        } else if pf.contains("CP-02") || pf.contains("ULTRA") {
+            return "02 Ultra"
+        } else {
+            return "4C1A"
+        }
     }
 }
 
@@ -982,284 +1002,7 @@ private struct MirrorSubstatus: View {
     }
 }
 
-private struct MonitorView: View {
-    let store: MonitorStore
-    @State private var metric: ChartMetric = .power
-    @State private var selectedPortIDs: Set<Int> = []
-    @State private var portFilterAnchor: Int?
-    @State private var hoveredLiveSamples: [ChartSamplePoint] = []
-    @State private var detailPort: PortViewState?
 
-    private var effectivePortIDs: Set<Int> {
-        selectedPortIDs.isEmpty ? Set(store.livePorts.map(\.port.index)) : selectedPortIDs
-    }
-
-    private var filteredSamples: [ChartSamplePoint] {
-        store.recentSamples
-            .filter { effectivePortIDs.contains($0.portIndex) }
-            .sorted { $0.timestamp < $1.timestamp }
-    }
-
-    private var lineSamples: [ChartLinePoint] {
-        segmentedChartPoints(from: plottedSamples)
-    }
-
-    private var plottedSamples: [ChartSamplePoint] {
-        downsampleChartSamples(filteredSamples, metric: metric)
-    }
-
-    private var hoveredSampleIDs: Set<UUID> {
-        Set(hoveredLiveSamples.map(\.id))
-    }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            HeaderBar(title: "今日的糖流", subtitle: store.selectedDevice?.name ?? "-") {
-                Button {
-                    store.selectedSection = .sessions
-                } label: {
-                    Label("全程记录", systemImage: "clock.arrow.circlepath")
-                }
-            }
-            ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    recordingPanel
-                    metrics
-                    portGrid
-                    chartPanel
-                }
-                .padding(24)
-            }
-        }
-        .onChange(of: store.livePorts) { _, ports in
-            selectedPortIDs = selectedPortIDs.intersection(Set(ports.map(\.port.index)))
-            if let detailPort,
-               let refreshed = ports.first(where: { $0.port.index == detailPort.port.index }) {
-                self.detailPort = refreshed
-            }
-        }
-        .sheet(item: $detailPort) { port in
-            PortDetailSheet(
-                port: port,
-                session: store.activeSession(for: port.port.index),
-                store: store
-            )
-        }
-    }
-
-    private var metrics: some View {
-        HStack(spacing: 12) {
-            MetricCard(title: "总功率", value: String(format: "%.1f W", store.totalPowerW), icon: "bolt.fill")
-            MetricCard(title: "温控", value: LocalizedTelemetry.temperatureModeLabel(store.temperatureModeLabel), icon: "thermometer.medium")
-            MetricCard(title: "端口", value: "\(store.livePorts.filter(\.connected).count)/\(store.livePorts.count)", icon: "powerplug")
-            MetricCard(title: "记录", value: "\(store.sessions.filter { $0.endedAt == nil }.count)", icon: "record.circle")
-        }
-    }
-
-    private var portGrid: some View {
-        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 5), spacing: 12) {
-            ForEach(store.livePorts) { port in
-                PortCard(
-                    port: port,
-                    isSelected: selectedPortIDs.contains(port.port.index)
-                ) {
-                    detailPort = port
-                }
-            }
-        }
-    }
-
-    private var chartPanel: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(alignment: .firstTextBaseline) {
-                    Text("半小时曲线")
-                        .font(.headline)
-                    Text("点接口卡片查看详情；下方芯片切换单路曲线。")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Picker("指标", selection: $metric) {
-                        ForEach(ChartMetric.allCases) { item in
-                            Text(item.title).tag(item)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .frame(width: 320)
-                }
-                portFilterBar
-            }
-
-            ZStack(alignment: .topLeading) {
-                Chart {
-                    ForEach(lineSamples) { point in
-                        LineMark(
-                            x: .value("Time", point.sample.timestamp),
-                            y: .value(metric.title, metric.displayValue(point.sample)),
-                            series: .value("Segment", point.seriesID)
-                        )
-                        .foregroundStyle(by: .value("Port", point.sample.portName))
-                        .lineStyle(StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
-                        .interpolationMethod(.linear)
-
-                        if hoveredSampleIDs.contains(point.sample.id) {
-                            PointMark(
-                                x: .value("Time", point.sample.timestamp),
-                                y: .value(metric.title, metric.displayValue(point.sample))
-                            )
-                            .foregroundStyle(CandyTheme.berry)
-                            .symbolSize(90)
-                        }
-                    }
-
-                    if let hoveredTimestamp = hoveredLiveSamples.first?.timestamp {
-                        RuleMark(x: .value("Time", hoveredTimestamp))
-                            .foregroundStyle(CandyTheme.berry.opacity(0.45))
-                            .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 4]))
-                    }
-                }
-                .chartYAxisLabel(metric.axisLabel)
-                .chartYScale(domain: metric.displayDomain(for: filteredSamples))
-                .chartOverlay { proxy in
-                    GeometryReader { geometry in
-                        Rectangle()
-                            .fill(.clear)
-                            .contentShape(Rectangle())
-                            .onContinuousHover { phase in
-                                switch phase {
-                                case .active(let location):
-                                    updateHover(location: location, proxy: proxy, geometry: geometry)
-                                case .ended:
-                                    hoveredLiveSamples = []
-                                }
-                            }
-                    }
-                }
-                .frame(height: 300)
-
-                if hoveredLiveSamples.isEmpty == false {
-                    ChartReadout(samples: hoveredLiveSamples, metric: metric)
-                        .padding(14)
-                }
-            }
-            .padding(16)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-
-            if filteredSamples.isEmpty {
-                Text("暂无采样。连接负载后会自动开始记录完整充电曲线。")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
-        }
-    }
-
-    private var recordingPanel: some View {
-        HStack(spacing: 16) {
-            VStack(alignment: .leading, spacing: 8) {
-                Label("全程充电记录", systemImage: "sparkles")
-                    .font(.headline)
-                    .foregroundStyle(CandyTheme.ink)
-                Text(recordingText)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
-
-            Spacer()
-
-            if let session = store.activeChargingSessions.first {
-                Button {
-                    store.selectSession(session)
-                    store.selectedSection = .sessions
-                } label: {
-                    Label("查看曲线", systemImage: "chart.xyaxis.line")
-                }
-                Button {
-                    store.exportSessionCSV(session)
-                } label: {
-                    Label("导出 CSV", systemImage: "square.and.arrow.up")
-                }
-                .buttonStyle(.borderedProminent)
-            } else {
-                Text("接上设备后自动开始")
-                    .font(.callout.weight(.medium))
-                    .foregroundStyle(CandyTheme.mint)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 7)
-                    .background(CandyTheme.mint.opacity(0.12), in: Capsule())
-            }
-        }
-        .padding(18)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-    }
-
-    private var recordingText: String {
-        if let session = store.activeChargingSessions.first {
-            let minutes = Int(Date().timeIntervalSince(session.startedAt) / 60)
-            return "\(session.portName) 正在记录全程曲线，已采 \(session.sampleCount) 个点，持续 \(minutes) 分钟。"
-        }
-        return "每个端口独立记录，从有功率输出开始，到满电、拔掉或手动停止结束。CSV 会保留逐采样数据和摘要。"
-    }
-
-    private var portFilterBar: some View {
-        HStack(spacing: 8) {
-            FilterChip(title: "全部", isSelected: selectedPortIDs.isEmpty) {
-                selectedPortIDs.removeAll()
-            }
-            ForEach(store.livePorts) { port in
-                FilterChip(
-                    title: port.port.displayName,
-                    isSelected: selectedPortIDs.contains(port.port.index)
-                ) {
-                    selectPortFilter(port.port.index)
-                }
-            }
-        }
-    }
-
-    private func selectPortFilter(_ port: Int) {
-        let modifiers = NSEvent.modifierFlags
-        let availablePorts = store.livePorts.map(\.port.index)
-
-        if modifiers.contains(.shift),
-           let anchor = portFilterAnchor ?? selectedPortIDs.sorted().first,
-           let anchorIndex = availablePorts.firstIndex(of: anchor),
-           let currentIndex = availablePorts.firstIndex(of: port) {
-            let range = anchorIndex <= currentIndex ? anchorIndex...currentIndex : currentIndex...anchorIndex
-            let rangeSelection = Set(range.map { availablePorts[$0] })
-            if modifiers.contains(.command) {
-                selectedPortIDs.formUnion(rangeSelection)
-            } else {
-                selectedPortIDs = rangeSelection
-            }
-        } else if modifiers.contains(.command) {
-            if selectedPortIDs.contains(port) {
-                selectedPortIDs.remove(port)
-            } else {
-                selectedPortIDs.insert(port)
-            }
-        } else {
-            selectedPortIDs = [port]
-        }
-
-        portFilterAnchor = port
-    }
-
-    private func updateHover(location: CGPoint, proxy: ChartProxy, geometry: GeometryProxy) {
-        guard let plotAnchor = proxy.plotFrame else {
-            hoveredLiveSamples = []
-            return
-        }
-        let plotFrame = geometry[plotAnchor]
-        guard plotFrame.contains(location),
-              let date: Date = proxy.value(atX: location.x - plotFrame.origin.x) else {
-            hoveredLiveSamples = []
-            return
-        }
-
-        hoveredLiveSamples = nearestSamplesByPort(to: date, in: plottedSamples)
-    }
-}
 
 private enum ChartMetric: String, CaseIterable, Identifiable {
     case power
@@ -1330,45 +1073,64 @@ private enum ChartMetric: String, CaseIterable, Identifiable {
     private static let idleCurrentDeadband = 0.05
 }
 
-private struct ChartLinePoint: Identifiable {
+private struct ChartLinePoint: Identifiable, Equatable {
     let id: String
     let sample: ChartSamplePoint
     let seriesID: String
 }
 
+
+
 private func downsampleChartSamples(
     _ samples: [ChartSamplePoint],
     metric: ChartMetric,
-    maxSamplesPerPort: Int = 240
+    maxSamplesPerPort: Int = 120
 ) -> [ChartSamplePoint] {
     let grouped = Dictionary(grouping: samples) { $0.portIndex }
+    var result: [ChartSamplePoint] = []
 
-    return grouped.keys.sorted().flatMap { portIndex in
-        let sortedSamples = (grouped[portIndex] ?? []).sorted { $0.timestamp < $1.timestamp }
-        guard sortedSamples.count > maxSamplesPerPort else { return sortedSamples }
+    for portIndex in grouped.keys.sorted() {
+        let portSamples = grouped[portIndex] ?? []
+        guard portSamples.count > maxSamplesPerPort else {
+            result.append(contentsOf: portSamples)
+            continue
+        }
 
-        let bucketSize = Int(ceil(Double(sortedSamples.count) / Double(maxSamplesPerPort)))
+        let bucketSize = Int(ceil(Double(portSamples.count) / Double(maxSamplesPerPort)))
         var reduced: [ChartSamplePoint] = []
-        reduced.reserveCapacity(maxSamplesPerPort * 2)
+        reduced.reserveCapacity(maxSamplesPerPort * 3)
 
-        for bucketStart in stride(from: 0, to: sortedSamples.count, by: bucketSize) {
-            let bucketEnd = min(bucketStart + bucketSize, sortedSamples.count)
-            let bucket = Array(sortedSamples[bucketStart..<bucketEnd])
-            if let first = bucket.first {
-                reduced.append(first)
+        for bucketStart in stride(from: 0, to: portSamples.count, by: bucketSize) {
+            let bucketEnd = min(bucketStart + bucketSize, portSamples.count)
+            let slice = portSamples[bucketStart..<bucketEnd]
+
+            guard let first = slice.first else { continue }
+
+            var extreme = first
+            var extremeVal = metric.displayValue(first)
+            for item in slice {
+                let val = metric.displayValue(item)
+                if val > extremeVal {
+                    extremeVal = val
+                    extreme = item
+                }
             }
-            if let extreme = bucket.max(by: { metric.displayValue($0) < metric.displayValue($1) }),
-               extreme.id != reduced.last?.id {
+
+            let last = slice.last ?? first
+
+            reduced.append(first)
+
+            if extreme.id != first.id && extreme.id != last.id {
                 reduced.append(extreme)
             }
-            if let last = bucket.last,
-               last.id != reduced.last?.id {
+
+            if last.id != first.id && last.id != extreme.id {
                 reduced.append(last)
             }
         }
-
-        return reduced.sorted { $0.timestamp < $1.timestamp }
+        result.append(contentsOf: reduced)
     }
+    return result
 }
 
 private func segmentedChartPoints(from samples: [ChartSamplePoint]) -> [ChartLinePoint] {
@@ -1376,11 +1138,11 @@ private func segmentedChartPoints(from samples: [ChartSamplePoint]) -> [ChartLin
     var points: [ChartLinePoint] = []
 
     for portIndex in grouped.keys.sorted() {
-        let sortedSamples = (grouped[portIndex] ?? []).sorted { $0.timestamp < $1.timestamp }
+        let portSamples = grouped[portIndex] ?? []
         var segment = 0
         var previous: ChartSamplePoint?
 
-        for sample in sortedSamples {
+        for sample in portSamples {
             if let previous,
                sample.timestamp.timeIntervalSince(previous.timestamp) > 4 || sample.connected != previous.connected {
                 segment += 1
@@ -1410,6 +1172,180 @@ private func nearestSamplesByPort(to date: Date, in samples: [ChartSamplePoint])
             return nil
         }
         return nearest
+    }
+}
+
+private struct StaticSessionChart: View, Equatable {
+    let plottedSamples: [PortSample]
+
+    static func == (lhs: StaticSessionChart, rhs: StaticSessionChart) -> Bool {
+        lhs.plottedSamples.count == rhs.plottedSamples.count &&
+        lhs.plottedSamples.last?.id == rhs.plottedSamples.last?.id
+    }
+
+    var body: some View {
+        Chart(plottedSamples) { sample in
+            LineMark(
+                x: .value("时间", sample.timestamp),
+                y: .value("功率", sample.powerW)
+            )
+            .foregroundStyle(CandyTheme.syrup)
+            .lineStyle(StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
+            .interpolationMethod(.linear)
+        }
+        .chartYAxisLabel("W")
+    }
+}
+
+private struct StaticLiveChart: View, Equatable {
+    let lineSamplesCache: [ChartLinePoint]
+    let metric: ChartMetric
+    let plottedSamplesCache: [ChartSamplePoint]
+
+    static func == (lhs: StaticLiveChart, rhs: StaticLiveChart) -> Bool {
+        lhs.metric == rhs.metric &&
+        lhs.lineSamplesCache.count == rhs.lineSamplesCache.count &&
+        lhs.lineSamplesCache.last?.id == rhs.lineSamplesCache.last?.id &&
+        lhs.metric.displayDomain(for: lhs.plottedSamplesCache) == rhs.metric.displayDomain(for: rhs.plottedSamplesCache)
+    }
+
+    var body: some View {
+        Chart {
+            ForEach(lineSamplesCache) { point in
+                LineMark(
+                    x: .value("Time", point.sample.timestamp),
+                    y: .value(metric.title, metric.displayValue(point.sample)),
+                    series: .value("Segment", point.seriesID)
+                )
+                .foregroundStyle(by: .value("Port", point.sample.portName))
+                .lineStyle(StrokeStyle(lineWidth: 2.5, lineCap: .round, lineJoin: .round))
+                .interpolationMethod(.catmullRom)
+            }
+
+            ForEach(lineSamplesCache) { point in
+                AreaMark(
+                    x: .value("Time", point.sample.timestamp),
+                    y: .value(metric.title, metric.displayValue(point.sample)),
+                    series: .value("Segment", point.seriesID)
+                )
+                .foregroundStyle(by: .value("Port", point.sample.portName))
+                .opacity(0.12)
+                .interpolationMethod(.catmullRom)
+            }
+        }
+        .chartYAxisLabel(metric.axisLabel)
+        .chartYScale(domain: metric.displayDomain(for: plottedSamplesCache))
+    }
+}
+
+private struct LiveMonitorChartView: View {
+    let lineSamplesCache: [ChartLinePoint]
+    let plottedSamplesCache: [ChartSamplePoint]
+    let metric: ChartMetric
+
+    @State private var hoveredLiveSamples: [ChartSamplePoint] = []
+    @State private var hoverX: CGFloat?
+    @State private var hoverPoints: [CGPoint] = []
+    @State private var hoverLocation: CGPoint?
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack(alignment: .topLeading) {
+                StaticLiveChart(
+                    lineSamplesCache: lineSamplesCache,
+                    metric: metric,
+                    plottedSamplesCache: plottedSamplesCache
+                )
+                .equatable()
+                .frame(height: 220)
+                .chartOverlay { proxy in
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .onContinuousHover { phase in
+                            switch phase {
+                            case .active(let location):
+                                self.hoverLocation = location
+                                updateHover(location: location, proxy: proxy, geometry: geometry)
+                            case .ended:
+                                hoveredLiveSamples = []
+                                hoverX = nil
+                                hoverPoints = []
+                                self.hoverLocation = nil
+                            }
+                        }
+                        .onChange(of: lineSamplesCache) { _, _ in
+                            if let hoverLocation {
+                                updateHover(location: hoverLocation, proxy: proxy, geometry: geometry)
+                            }
+                        }
+                }
+
+                if let hoverX {
+                    Path { path in
+                        path.move(to: CGPoint(x: hoverX, y: 0))
+                        path.addLine(to: CGPoint(x: hoverX, y: 200))
+                    }
+                    .stroke(CandyTheme.syrup.opacity(0.42), style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
+                    .allowsHitTesting(false)
+
+                    ForEach(Array(hoverPoints.enumerated()), id: \.offset) { _, pt in
+                        Circle()
+                            .fill(CandyTheme.syrup)
+                            .frame(width: 8, height: 8)
+                            .overlay {
+                                Circle()
+                                    .stroke(Color.white, lineWidth: 1.5)
+                            }
+                            .shadow(radius: 1)
+                            .position(pt)
+                            .allowsHitTesting(false)
+                    }
+                }
+
+                if hoveredLiveSamples.isEmpty == false {
+                    ChartReadout(samples: hoveredLiveSamples, metric: metric)
+                        .padding(14)
+                }
+            }
+        }
+        .frame(height: 220)
+    }
+
+    private func updateHover(location: CGPoint, proxy: ChartProxy, geometry: GeometryProxy) {
+        guard let plotAnchor = proxy.plotFrame else {
+            hoveredLiveSamples = []
+            hoverX = nil
+            hoverPoints = []
+            return
+        }
+        let plotFrame = geometry[plotAnchor]
+        guard plotFrame.contains(location),
+              let date: Date = proxy.value(atX: location.x - plotFrame.origin.x) else {
+            hoveredLiveSamples = []
+            hoverX = nil
+            hoverPoints = []
+            return
+        }
+
+        let nearest = nearestSamplesByPort(to: date, in: plottedSamplesCache)
+        hoveredLiveSamples = nearest
+
+        if let firstSample = nearest.first,
+           let firstX = proxy.position(forX: firstSample.timestamp) {
+            self.hoverX = firstX + plotFrame.origin.x
+            
+            var points: [CGPoint] = []
+            for sample in nearest {
+                if let xPos = proxy.position(forX: sample.timestamp),
+                   let yPos = proxy.position(forY: metric.displayValue(sample)) {
+                    points.append(CGPoint(x: xPos + plotFrame.origin.x, y: yPos + plotFrame.origin.y))
+                }
+            }
+            self.hoverPoints = points
+        } else {
+            self.hoverX = nil
+            self.hoverPoints = []
+        }
     }
 }
 
@@ -1568,32 +1504,48 @@ private struct PortDetailSheet: View {
 
                     PortMapView(selectedPort: port.port.index)
 
-                    sectionHeader("\(portTitle) \(port.connected ? "在充设备" : "未接入设备")")
+                    if port.connected && hasPDDeviceInfo {
+                        sectionHeader("\(portTitle) 在充设备")
 
-                    detailCard {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text(deviceTitle)
-                                .font(.title2.weight(.semibold))
-                            Text(deviceSubtitle)
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
+                        detailCard {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text(deviceTitle)
+                                    .font(.title2.weight(.semibold))
+                                Text(deviceSubtitle)
+                                    .font(.callout)
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+
+                            LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 3), spacing: 18) {
+                                if deviceBrand != "-" {
+                                    PortDetailMetric(title: "品牌", value: deviceBrand)
+                                }
+                                if deviceModel != "-" && deviceModel != "未知设备型号" && deviceModel != "澎湃秒充" {
+                                    PortDetailMetric(title: "型号", value: deviceModel)
+                                }
+                                if batteryCapacityText != "-" && !batteryCapacityText.contains("500") {
+                                    PortDetailMetric(title: "电池设计容量", value: batteryCapacityText)
+                                }
+                                if batteryLastFullCapacityText != "-" && !batteryLastFullCapacityText.contains("500") {
+                                    PortDetailMetric(title: "当前最大容量", value: batteryLastFullCapacityText)
+                                }
+                                if batteryHealthText != "-" {
+                                    PortDetailMetric(title: "健康度", value: batteryHealthText)
+                                }
+                                if batteryPercentText != "-" {
+                                    PortDetailMetric(title: "当前电量", value: batteryPercentText)
+                                }
+                                if estimatedFullText != "-" {
+                                    PortDetailMetric(title: "预计充满时间", value: estimatedFullText)
+                                }
+                            }
                         }
 
-                        LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 3), spacing: 18) {
-                            PortDetailMetric(title: "品牌", value: deviceBrand)
-                            PortDetailMetric(title: "型号", value: deviceModel)
-                            PortDetailMetric(title: "电池设计容量", value: batteryCapacityText)
-                            PortDetailMetric(title: "当前最大容量", value: batteryLastFullCapacityText)
-                            PortDetailMetric(title: "健康度", value: batteryHealthText)
-                            PortDetailMetric(title: "当前电量", value: batteryPercentText)
-                            PortDetailMetric(title: "预计充满时间", value: estimatedFullText)
-                        }
+                        Text("仅支持 PD 协议，且部分设备厂商信息不准，仅供参考")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
-
-                    Text("仅支持 PD 协议，且部分设备厂商信息不准，仅供参考")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
 
                     sectionHeader("\(portTitle) 充电口")
 
@@ -1708,16 +1660,15 @@ private struct PortDetailSheet: View {
     }
 
     private var hasPDDeviceInfo: Bool {
-        port.pdStatus?.manufacturer != nil ||
-            port.pdStatus?.modelName != nil ||
-            port.pdStatus?.batteryCapacityMWh != nil ||
-            port.pdStatus?.batteryLastFullChargeCapacityMWh != nil ||
-            port.pdStatus?.batteryPresentCapacityMWh != nil ||
-            port.pdStatus?.batteryHealthPercent != nil ||
-            port.pdStatus?.batteryPercent != nil ||
-            port.pdStatus?.estimatedFullMinutes != nil ||
-            port.pdStatus?.remainingTimeText != nil ||
-            portStats.isEmpty == false
+        let count = [
+            deviceBrand != "-" ? 1 : 0,
+            (deviceModel != "-" && deviceModel != "未知设备型号" && deviceModel != "澎湃秒充") ? 1 : 0,
+            (batteryLastFullCapacityText != "-" && !batteryLastFullCapacityText.contains("500")) ? 1 : 0,
+            batteryHealthText != "-" ? 1 : 0,
+            batteryPercentText != "-" ? 1 : 0,
+            estimatedFullText != "-" ? 1 : 0
+        ].reduce(0, +)
+        return count > 0
     }
 
     private var deviceBrand: String {
@@ -1806,20 +1757,6 @@ private struct PortDetailSheet: View {
             "最高 \(port.port.power) W",
             "温度 \(port.temperatureLabel)"
         ]
-        if let battery = port.batteryPercent {
-            items.append("电量 \(Int(battery))%")
-        } else {
-            items.append("无电量数据")
-        }
-        if let health = port.pdStatus?.batteryHealthPercent {
-            items.append("健康度 \(Int(health.rounded()))%")
-        }
-        if let capacity = port.pdStatus?.batteryCapacityMWh {
-            items.append("设计容量 \(Int(capacity.rounded())) mWh")
-        }
-        if let capacity = port.pdStatus?.batteryLastFullChargeCapacityMWh {
-            items.append("当前最大 \(Int(capacity.rounded())) mWh")
-        }
         if let cycleCount = port.pdStatus?.cycleCount {
             items.append("循环 \(cycleCount) 次")
         }
@@ -1985,13 +1922,16 @@ private struct FlowChips: View {
     let items: [String]
 
     var body: some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: 120), spacing: 10)], alignment: .leading, spacing: 10) {
-            ForEach(items, id: \.self) { item in
-                Text(item)
-                    .font(.callout.weight(.medium))
-                    .padding(.horizontal, 12)
-                    .frame(height: 32)
-                    .background(.secondary.opacity(0.08), in: Capsule())
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(items, id: \.self) { item in
+                    Text(item)
+                        .font(.callout.weight(.medium))
+                        .padding(.horizontal, 12)
+                        .frame(height: 32)
+                        .background(.secondary.opacity(0.08), in: Capsule())
+                        .fixedSize()
+                }
             }
         }
     }
@@ -2297,104 +2237,143 @@ private struct RenameSessionSheet: View {
 private struct SessionPowerChart: View {
     let samples: [PortSample]
     @State private var hoveredSample: PortSample?
-
-    private var displaySamples: [PortSample] {
-        downsamplePortSamples(samples)
-    }
+    @State private var plottedSamples: [PortSample] = []
+    @State private var hoverLocation: CGPoint?
+    @State private var hoverX: CGFloat?
+    @State private var hoverY: CGFloat?
 
     var body: some View {
-        ZStack(alignment: .topLeading) {
-            Chart(displaySamples) { sample in
-                LineMark(
-                    x: .value("时间", sample.timestamp),
-                    y: .value("功率", sample.powerW)
-                )
-                .foregroundStyle(CandyTheme.syrup)
-                .lineStyle(StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
-                .interpolationMethod(.linear)
-
-                if hoveredSample?.id == sample.id {
-                    RuleMark(x: .value("时间", sample.timestamp))
-                        .foregroundStyle(CandyTheme.berry.opacity(0.45))
-                        .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 4]))
-                    PointMark(
-                        x: .value("时间", sample.timestamp),
-                        y: .value("功率", sample.powerW)
-                    )
-                    .foregroundStyle(CandyTheme.berry)
-                    .symbolSize(90)
-                }
-            }
-            .chartYAxisLabel("W")
-            .chartOverlay { proxy in
-                GeometryReader { geometry in
-                    Rectangle()
-                        .fill(.clear)
-                        .contentShape(Rectangle())
-                        .onContinuousHover { phase in
-                            switch phase {
-                            case .active(let location):
-                                updateHover(location: location, proxy: proxy, geometry: geometry)
-                            case .ended:
-                                hoveredSample = nil
+        GeometryReader { geometry in
+            ZStack(alignment: .topLeading) {
+                StaticSessionChart(plottedSamples: plottedSamples)
+                    .equatable()
+                    .frame(height: 300)
+                    .chartOverlay { proxy in
+                        Color.clear
+                            .contentShape(Rectangle())
+                            .onContinuousHover { phase in
+                                switch phase {
+                                case .active(let location):
+                                    self.hoverLocation = location
+                                    updateHover(location: location, proxy: proxy, geometry: geometry)
+                                case .ended:
+                                    hoveredSample = nil
+                                    hoverX = nil
+                                    hoverY = nil
+                                    self.hoverLocation = nil
+                                }
                             }
-                        }
-                }
-            }
-            .frame(height: 300)
+                            .onChange(of: plottedSamples) { _, _ in
+                                if let hoverLocation {
+                                    updateHover(location: hoverLocation, proxy: proxy, geometry: geometry)
+                                }
+                            }
+                    }
 
-            if let hoveredSample {
-                SessionReadout(sample: hoveredSample)
-                    .padding(14)
+                // 顶层指示虚线
+                if let hoverX, let hoverY {
+                    Path { path in
+                        path.move(to: CGPoint(x: hoverX, y: 0))
+                        path.addLine(to: CGPoint(x: hoverX, y: 280))
+                    }
+                    .stroke(CandyTheme.berry.opacity(0.45), style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
+                    .allowsHitTesting(false)
+
+                    Circle()
+                        .fill(CandyTheme.berry)
+                        .frame(width: 8, height: 8)
+                        .overlay {
+                            Circle()
+                                .stroke(Color.white, lineWidth: 2)
+                        }
+                        .shadow(radius: 2)
+                        .position(x: hoverX, y: hoverY)
+                        .allowsHitTesting(false)
+                }
+
+                if let hoveredSample {
+                    SessionReadout(sample: hoveredSample)
+                        .padding(14)
+                }
             }
         }
+        .frame(height: 300)
         .padding(16)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .task(id: samples) {
+            let downsampled = downsamplePortSamples(samples)
+            await MainActor.run {
+                self.plottedSamples = downsampled
+            }
+        }
     }
 
     private func updateHover(location: CGPoint, proxy: ChartProxy, geometry: GeometryProxy) {
         guard let plotAnchor = proxy.plotFrame else {
             hoveredSample = nil
+            hoverX = nil
+            hoverY = nil
             return
         }
         let plotFrame = geometry[plotAnchor]
         guard plotFrame.contains(location),
               let date: Date = proxy.value(atX: location.x - plotFrame.origin.x) else {
             hoveredSample = nil
+            hoverX = nil
+            hoverY = nil
             return
         }
 
-        hoveredSample = displaySamples.min {
+        if let nearest = plottedSamples.min(by: {
             abs($0.timestamp.timeIntervalSince(date)) < abs($1.timestamp.timeIntervalSince(date))
+        }) {
+            hoveredSample = nearest
+            
+            if let xPos = proxy.position(forX: nearest.timestamp),
+               let yPos = proxy.position(forY: nearest.powerW) {
+                self.hoverX = xPos + plotFrame.origin.x
+                self.hoverY = yPos + plotFrame.origin.y
+            }
         }
     }
 }
 
 private func downsamplePortSamples(_ samples: [PortSample], maxSamples: Int = 600) -> [PortSample] {
-    let sortedSamples = samples.sorted { $0.timestamp < $1.timestamp }
-    guard sortedSamples.count > maxSamples else { return sortedSamples }
+    guard samples.count > maxSamples else { return samples }
 
-    let bucketSize = Int(ceil(Double(sortedSamples.count) / Double(maxSamples)))
+    let bucketSize = Int(ceil(Double(samples.count) / Double(maxSamples)))
     var reduced: [PortSample] = []
-    reduced.reserveCapacity(maxSamples * 2)
+    reduced.reserveCapacity(maxSamples * 3)
 
-    for bucketStart in stride(from: 0, to: sortedSamples.count, by: bucketSize) {
-        let bucketEnd = min(bucketStart + bucketSize, sortedSamples.count)
-        let bucket = Array(sortedSamples[bucketStart..<bucketEnd])
-        if let first = bucket.first {
-            reduced.append(first)
+    for bucketStart in stride(from: 0, to: samples.count, by: bucketSize) {
+        let bucketEnd = min(bucketStart + bucketSize, samples.count)
+        let slice = samples[bucketStart..<bucketEnd]
+        
+        guard let first = slice.first else { continue }
+        
+        var peak = first
+        var peakVal = first.powerW
+        for item in slice {
+            if item.powerW > peakVal {
+                peakVal = item.powerW
+                peak = item
+            }
         }
-        if let peak = bucket.max(by: { $0.powerW < $1.powerW }),
-           peak.id != reduced.last?.id {
+        
+        let last = slice.last ?? first
+
+        reduced.append(first)
+        
+        if peak.id != first.id && peak.id != last.id {
             reduced.append(peak)
         }
-        if let last = bucket.last,
-           last.id != reduced.last?.id {
+        
+        if last.id != first.id && last.id != peak.id {
             reduced.append(last)
         }
     }
 
-    return reduced.sorted { $0.timestamp < $1.timestamp }
+    return reduced
 }
 
 private struct SessionReadout: View {
