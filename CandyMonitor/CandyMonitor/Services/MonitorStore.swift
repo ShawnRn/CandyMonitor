@@ -529,6 +529,16 @@ final class MonitorStore {
         exportSessionCSV(session)
     }
 
+    func exportSelectedSessionZIP() {
+        guard let session = selectedSession else { return }
+        exportSessionZIP(session)
+    }
+
+    func exportSelectedSessionShareImage() {
+        guard let session = selectedSession else { return }
+        exportSessionShareImage(session)
+    }
+
     func activeSession(for portIndex: Int) -> ChargingSession? {
         activeChargingSessions.first { $0.portIndex == portIndex }
     }
@@ -543,6 +553,68 @@ final class MonitorStore {
         if panel.runModal() == .OK, let url = panel.url {
             let csv = CSVExporter.makeCSV(session: session, samples: samples)
             try? csv.write(to: url, atomically: true, encoding: .utf8)
+        }
+    }
+
+    func exportSessionZIP(_ session: ChargingSession) {
+        let samples = samples(for: session)
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [UTType(filenameExtension: "zip")!]
+        panel.nameFieldStringValue = "\(session.displayTitle)-full-charge.zip"
+        panel.canCreateDirectories = true
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        let tempRoot = FileManager.default.temporaryDirectory.appendingPathComponent("CandyMonitorExport-\(UUID().uuidString)", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+            try CSVExporter.makeREADME(session: session).write(to: tempRoot.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+            try CSVExporter.makeCSV(session: session, samples: samples).write(to: tempRoot.appendingPathComponent("samples.csv"), atomically: true, encoding: .utf8)
+            try CSVExporter.makeEventsCSV(session: session, samples: samples).write(to: tempRoot.appendingPathComponent("events.csv"), atomically: true, encoding: .utf8)
+            try CSVExporter.makeMetadataJSON(session: session, samples: samples).write(to: tempRoot.appendingPathComponent("metadata.json"), options: .atomic)
+            try CSVExporter.makeAISummaryJSON(session: session, samples: samples).write(to: tempRoot.appendingPathComponent("ai_summary.json"), options: .atomic)
+            try CSVExporter.makeSchemaJSON().write(to: tempRoot.appendingPathComponent("schema.json"), options: .atomic)
+            if FileManager.default.fileExists(atPath: url.path) {
+                try FileManager.default.removeItem(at: url)
+            }
+            try zipDirectory(tempRoot, destination: url)
+        } catch {
+            logger.error("session_zip_export_failed \(error.localizedDescription, privacy: .public)")
+        }
+        try? FileManager.default.removeItem(at: tempRoot)
+    }
+
+    func exportSessionShareImage(_ session: ChargingSession) {
+        let samples = samples(for: session)
+        guard let png = SessionShareImageRenderer.pngData(session: session, samples: samples) else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.png]
+        panel.nameFieldStringValue = "\(session.displayTitle)-share.png"
+        panel.canCreateDirectories = true
+
+        if panel.runModal() == .OK, let url = panel.url {
+            try? png.write(to: url, options: .atomic)
+        }
+    }
+
+    func previewSamples(for session: ChargingSession, limit: Int = 180) -> [PortSample] {
+        let allSamples = samples(for: session)
+        guard allSamples.count > limit else { return allSamples }
+        let stride = Double(allSamples.count - 1) / Double(max(limit - 1, 1))
+        return (0..<limit).map { index in
+            allSamples[Int((Double(index) * stride).rounded())]
+        }
+    }
+
+    private func zipDirectory(_ source: URL, destination: URL) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        process.arguments = ["-c", "-k", "--sequesterRsrc", "--keepParent", source.lastPathComponent, destination.path]
+        process.currentDirectoryURL = source.deletingLastPathComponent()
+        try process.run()
+        process.waitUntilExit()
+        if process.terminationStatus != 0 {
+            throw CocoaError(.fileWriteUnknown)
         }
     }
 
@@ -1253,46 +1325,68 @@ final class MonitorStore {
 
     private func mergeDuplicateActiveSessions(_ activeGroup: [ChargingSession], keeping canonical: ChargingSession, at now: Date) {
         guard let modelContext else { return }
-        let duplicateSessions = activeGroup.filter { $0.id != canonical.id }
-        guard duplicateSessions.isEmpty == false else { return }
+        let ordered = activeGroup.sorted { $0.startedAt < $1.startedAt }
+        guard let newest = ordered.last else { return }
 
-        for duplicate in duplicateSessions {
-            migrateSamples(from: duplicate.id, to: canonical.id)
-            if canonical.connectedDeviceName == nil {
-                canonical.connectedDeviceName = duplicate.connectedDeviceName
+        for session in ordered.dropLast() {
+            if sampleCount(for: session) == 0 {
+                if let selectedSession, selectedSession.id == session.id {
+                    self.selectedSession = newest
+                }
+                if let lowPowerSessionPrompt, lowPowerSessionPrompt.id == session.id {
+                    self.lowPowerSessionPrompt = newest
+                }
+                knownProtocols[session.id] = nil
+                modelContext.delete(session)
+                sessions.removeAll { $0.id == session.id }
+            } else {
+                let endDate = min(lastSampleDate(for: session) ?? newest.startedAt, newest.startedAt)
+                end(session, at: endDate, reason: "superseded_by_new_session")
+                recomputeStats(for: session)
             }
-            if canonical.customTitle == nil {
-                canonical.customTitle = duplicate.customTitle
-            }
-            if let selectedSession, selectedSession.id == duplicate.id {
-                self.selectedSession = canonical
-            }
-            if let lowPowerSessionPrompt, lowPowerSessionPrompt.id == duplicate.id {
-                self.lowPowerSessionPrompt = canonical
-            }
-            knownProtocols[duplicate.id] = nil
-            modelContext.delete(duplicate)
         }
 
-        recomputeStats(for: canonical)
-        let duplicateIDs = Set(duplicateSessions.map(\.id))
-        sessions.removeAll { duplicateIDs.contains($0.id) }
-        if sessions.contains(where: { $0.id == canonical.id }) == false {
-            sessions.insert(canonical, at: 0)
+        recomputeStats(for: newest)
+        if sessions.contains(where: { $0.id == newest.id }) == false {
+            sessions.insert(newest, at: 0)
         }
-        activeSessions[sessionKey(deviceID: canonical.deviceID, port: canonical.portIndex)] = canonical.id
+        activeSessions[sessionKey(deviceID: newest.deviceID, port: newest.portIndex)] = newest.id
         logger.warning(
-            "duplicate_active_sessions_merged port=\(canonical.portIndex, privacy: .public) count=\(duplicateSessions.count + 1, privacy: .public) at=\(now, privacy: .public)"
+            "duplicate_active_sessions_healed port=\(newest.portIndex, privacy: .public) count=\(ordered.count, privacy: .public) at=\(now, privacy: .public)"
         )
     }
 
     private func canonicalActiveSession(from sessions: [ChargingSession]) -> ChargingSession? {
-        sessions.min { lhs, rhs in
+        sessions.max { lhs, rhs in
             if lhs.startedAt == rhs.startedAt {
                 return lhs.id.uuidString < rhs.id.uuidString
             }
             return lhs.startedAt < rhs.startedAt
         }
+    }
+
+    private func sampleCount(for session: ChargingSession) -> Int {
+        guard let modelContext else { return 0 }
+        let sessionID = session.id
+        let descriptor = FetchDescriptor<PortSample>(
+            predicate: #Predicate { sample in
+                sample.sessionID == sessionID
+            }
+        )
+        return ((try? modelContext.fetch(descriptor)) ?? []).count
+    }
+
+    private func lastSampleDate(for session: ChargingSession) -> Date? {
+        guard let modelContext else { return nil }
+        let sessionID = session.id
+        var descriptor = FetchDescriptor<PortSample>(
+            predicate: #Predicate { sample in
+                sample.sessionID == sessionID
+            },
+            sortBy: [SortDescriptor(\.timestamp, order: .reverse)]
+        )
+        descriptor.fetchLimit = 1
+        return (try? modelContext.fetch(descriptor))?.first?.timestamp
     }
 
     private func migrateSamples(from sourceSessionID: UUID, to targetSessionID: UUID) {

@@ -130,7 +130,7 @@ struct IonBridgeSnapshot: Sendable {
                 fcProtocol: "\(port.fcProtocol)",
                 ioutMA: port.current,
                 port: port.id + 1,
-                sessionChargeMWh: port.sessionCharge,
+                sessionChargeMWh: 0,
                 vinMV: port.vinValue,
                 voutMV: port.voltage,
                 deviceNameEN: nil,

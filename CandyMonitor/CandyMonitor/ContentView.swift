@@ -470,19 +470,19 @@ private struct NativeMonitorView: View {
                                     .foregroundStyle(.secondary)
                             }
                             Spacer(minLength: 4)
+                        }
+                        HStack(spacing: 8) {
                             Button {
                                 store.selectSession(session)
                                 store.selectedSection = .sessions
                             } label: {
                                 Label("曲线", systemImage: "chart.xyaxis.line")
+                                    .frame(minWidth: 70)
                             }
-                            Button {
-                                store.exportSessionCSV(session)
-                            } label: {
-                                Label("CSV", systemImage: "square.and.arrow.up")
-                            }
-                            .buttonStyle(.borderedProminent)
+                            .buttonStyle(SoftButtonStyle(prominent: true))
+                            SessionExportMenu(store: store, session: session, compact: true)
                         }
+                        .frame(maxWidth: .infinity, alignment: .trailing)
                     }
                 }
             } else {
@@ -786,29 +786,45 @@ private struct MirrorPowerTopologyPanel: View {
 
 private struct RotatingPowerBadge: View, Equatable {
     let powerW: Double
+    @State private var referenceDate = Date()
+    @State private var phaseAtReference = 0.0
+    @State private var speedAtReference = 0.0
+
+    static func == (lhs: RotatingPowerBadge, rhs: RotatingPowerBadge) -> Bool {
+        lhs.powerW == rhs.powerW
+    }
 
     private var isActive: Bool { powerW > 0.5 }
 
-    private var degreesPerSecond: Double {
+    private var targetDegreesPerSecond: Double {
+        guard isActive else { return 0 }
         let normalized = min(max(powerW / 140.0, 0), 1)
         return 28 + normalized * 132
     }
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !isActive)) { timeline in
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: false)) { timeline in
             Image(systemName: "seal.fill")
                 .font(.system(size: 18, weight: .semibold))
                 .symbolRenderingMode(.monochrome)
                 .foregroundStyle(CandyTheme.syrup)
                 .frame(width: 24, height: 24, alignment: .center)
-                .rotationEffect(.degrees(rotationAngle(at: timeline.date)))
+                .rotationEffect(.degrees(phase(at: timeline.date)))
                 .accessibilityHidden(true)
+        }
+        .onAppear {
+            speedAtReference = targetDegreesPerSecond
+        }
+        .onChange(of: powerW) { _, _ in
+            let now = Date()
+            phaseAtReference = phase(at: now).truncatingRemainder(dividingBy: 360)
+            referenceDate = now
+            speedAtReference = targetDegreesPerSecond
         }
     }
 
-    private func rotationAngle(at date: Date) -> Double {
-        guard isActive else { return 0 }
-        return date.timeIntervalSinceReferenceDate * degreesPerSecond
+    private func phase(at date: Date) -> Double {
+        phaseAtReference + date.timeIntervalSince(referenceDate) * speedAtReference
     }
 }
 
@@ -2166,6 +2182,38 @@ private struct SessionRow: View {
     }
 }
 
+private struct SessionExportMenu: View {
+    let store: MonitorStore
+    let session: ChargingSession
+    var compact = false
+
+    var body: some View {
+        Menu {
+            Button {
+                store.exportSessionCSV(session)
+            } label: {
+                Label("CSV", systemImage: "tablecells")
+            }
+            Button {
+                store.exportSessionZIP(session)
+            } label: {
+                Label("ZIP", systemImage: "doc.zipper")
+            }
+            Divider()
+            Button {
+                store.exportSessionShareImage(session)
+            } label: {
+                Label("分享图", systemImage: "photo")
+            }
+        } label: {
+            Label("导出", systemImage: "square.and.arrow.up")
+                .labelStyle(.titleAndIcon)
+                .frame(minWidth: compact ? 70 : 76)
+        }
+        .buttonStyle(SoftButtonStyle(prominent: true))
+    }
+}
+
 private struct SessionDetailView: View {
     let store: MonitorStore
     @State private var renamingSession: ChargingSession?
@@ -2190,12 +2238,7 @@ private struct SessionDetailView: View {
                     } label: {
                         Label("删除", systemImage: "trash")
                     }
-                    Button {
-                        store.exportSelectedSessionCSV()
-                    } label: {
-                        Label("导出 CSV", systemImage: "square.and.arrow.up")
-                    }
-                    .buttonStyle(.borderedProminent)
+                    SessionExportMenu(store: store, session: session)
                 }
 
                 ScrollView {
@@ -2740,6 +2783,7 @@ private enum SettingsField: Hashable {
 
 private struct SettingsView: View {
     let store: MonitorStore
+    @AppStorage("showInDock") private var showInDock = true
     @State private var editingName = ""
     @State private var editingURL = ""
     @State private var editingIOTJWT = ""
@@ -2835,6 +2879,21 @@ private struct SettingsView: View {
                                 }
                             }
 
+                            SettingsCard(title: "桌面集成", icon: "dock.rectangle", subtitle: "菜单栏常驻可继续使用；隐藏 Dock 图标后，仍可从菜单栏打开主窗口。") {
+                                Toggle("在 Dock 中显示", isOn: $showInDock)
+                                    .toggleStyle(.switch)
+                                LabeledContent("主窗口入口") {
+                                    Text(showInDock ? "Dock 与菜单栏" : "仅菜单栏")
+                                        .foregroundStyle(.secondary)
+                                }
+                                LabeledContent("菜单栏状态") {
+                                    Text("始终显示")
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+
+                        HStack(alignment: .top, spacing: 16) {
                             SettingsCard(title: "本地数据", icon: "externaldrive", subtitle: "充电会话、采样点和控制日志保存在本机 SwiftData；CSV 从完整采样导出。") {
                                 LabeledContent("历史会话") {
                                     Text("\(store.sessions.count) 条")
@@ -2850,6 +2909,17 @@ private struct SettingsView: View {
                                     Label("删除这台设备及本地记录", systemImage: "trash")
                                 }
                                 .buttonStyle(SoftButtonStyle(destructive: true))
+                            }
+
+                            SettingsCard(title: "应用版本", icon: "shippingbox", subtitle: "当前安装包信息与本地运行状态。") {
+                                LabeledContent("版本") {
+                                    Text(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "-")
+                                        .foregroundStyle(.secondary)
+                                }
+                                LabeledContent("构建") {
+                                    Text(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "-")
+                                        .foregroundStyle(.secondary)
+                                }
                             }
                         }
                     }
@@ -3223,6 +3293,9 @@ struct CandyMenuBarView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.openWindow) private var openWindow
     let store: MonitorStore
+    @State private var hoveredPortID: Int?
+    @State private var hoveredSessionID: UUID?
+    @State private var previewArrowEdge: Edge = .trailing
 
     private var connectedPorts: Int {
         store.livePorts.filter(\.connected).count
@@ -3333,6 +3406,21 @@ struct CandyMenuBarView: View {
                 VStack(spacing: 8) {
                     ForEach(store.livePorts) { port in
                         MenuBarPortRow(port: port)
+                            .onHover { isHovering in
+                                hoveredPortID = isHovering ? port.id : (hoveredPortID == port.id ? nil : hoveredPortID)
+                                if isHovering { hoveredSessionID = nil }
+                                if isHovering { previewArrowEdge = preferredPreviewEdge() }
+                            }
+                            .popover(isPresented: Binding(
+                                get: { hoveredPortID == port.id },
+                                set: { if !$0 && hoveredPortID == port.id { hoveredPortID = nil } }
+                            ), arrowEdge: previewArrowEdge) {
+                                if let preview = portPreview(for: port) {
+                                    MenuBarChartPreviewPanel(preview: preview)
+                                        .padding(.horizontal, 12)
+                                        .padding(.vertical, 6)
+                                }
+                            }
                     }
                 }
             }
@@ -3371,6 +3459,19 @@ struct CandyMenuBarView: View {
                         }
                         .padding(10)
                         .background(CandyTheme.menuRowBackground, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .onHover { isHovering in
+                            hoveredSessionID = isHovering ? session.id : (hoveredSessionID == session.id ? nil : hoveredSessionID)
+                            if isHovering { hoveredPortID = nil }
+                            if isHovering { previewArrowEdge = preferredPreviewEdge() }
+                        }
+                        .popover(isPresented: Binding(
+                            get: { hoveredSessionID == session.id },
+                            set: { if !$0 && hoveredSessionID == session.id { hoveredSessionID = nil } }
+                        ), arrowEdge: previewArrowEdge) {
+                            MenuBarChartPreviewPanel(preview: sessionPreview(for: session))
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 6)
+                        }
                     }
                 }
             } else {
@@ -3437,8 +3538,199 @@ struct CandyMenuBarView: View {
 
     private func openMainWindow(section: AppSection) {
         store.selectedSection = section
-        openWindow(id: "main")
-        NSApplication.shared.activate(ignoringOtherApps: true)
+        if let window = NSApp.windows.first(where: { window in
+            window.canBecomeMain && window.styleMask.contains(.titled)
+        }) {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        } else {
+            openWindow(id: "main")
+            DispatchQueue.main.async {
+                NSApp.windows.first(where: { $0.canBecomeMain && $0.styleMask.contains(.titled) })?.makeKeyAndOrderFront(nil)
+                NSApp.activate(ignoringOtherApps: true)
+            }
+        }
+    }
+
+    private func portPreview(for port: PortViewState) -> MenuBarChartPreview? {
+        let samples = store.recentSamples
+            .filter { $0.portIndex == port.id }
+            .map { MenuBarChartPoint(timestamp: $0.timestamp, powerW: $0.powerW) }
+        return MenuBarChartPreview(
+            title: port.port.displayName,
+            subtitle: "最近 10 秒",
+            value: String(format: "%.1f W", port.powerW),
+            samples: samples
+        )
+    }
+
+    private func sessionPreview(for session: ChargingSession) -> MenuBarChartPreview {
+        let samples = store.previewSamples(for: session, limit: 360)
+            .map { MenuBarChartPoint(timestamp: $0.timestamp, powerW: $0.powerW) }
+        return MenuBarChartPreview(
+            title: session.portName,
+            subtitle: "完整曲线",
+            value: String(format: "%.1f W", session.peakPowerW),
+            samples: samples
+        )
+    }
+
+    private func preferredPreviewEdge() -> Edge {
+        let location = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { $0.frame.contains(location) } ?? NSScreen.main
+        guard let visibleFrame = screen?.visibleFrame else { return .trailing }
+        let rightSpace = visibleFrame.maxX - location.x
+        let leftSpace = location.x - visibleFrame.minX
+        return rightSpace >= leftSpace ? .trailing : .leading
+    }
+}
+
+private struct MenuBarChartPoint: Identifiable {
+    let id = UUID()
+    let timestamp: Date
+    let powerW: Double
+}
+
+private struct MenuBarChartPreview: Equatable {
+    let title: String
+    let subtitle: String
+    let value: String
+    let samples: [MenuBarChartPoint]
+
+    static func == (lhs: MenuBarChartPreview, rhs: MenuBarChartPreview) -> Bool {
+        lhs.title == rhs.title &&
+        lhs.subtitle == rhs.subtitle &&
+        lhs.value == rhs.value &&
+        lhs.samples.count == rhs.samples.count &&
+        lhs.samples.last?.timestamp == rhs.samples.last?.timestamp
+    }
+}
+
+private struct MenuBarChartPreviewPanel: View {
+    let preview: MenuBarChartPreview
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(preview.title)
+                        .font(.headline)
+                    Text(preview.subtitle)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Text(preview.value)
+                    .font(.title3.weight(.bold))
+                    .monospacedDigit()
+                    .foregroundStyle(CandyTheme.syrup)
+            }
+
+            MenuBarMiniPowerChart(samples: preview.samples)
+                .frame(height: 145)
+        }
+        .padding(14)
+        .frame(width: 300)
+        .background(CandyTheme.menuCardBackground, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(CandyTheme.syrup.opacity(0.35), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.18), radius: 18, y: 10)
+    }
+}
+
+private struct MenuBarMiniPowerChart: View {
+    let samples: [MenuBarChartPoint]
+    @State private var hoveredSample: MenuBarChartPoint?
+
+    var body: some View {
+        if samples.count > 1 {
+            ZStack(alignment: .topLeading) {
+                Chart {
+                    ForEach(samples) { sample in
+                        LineMark(
+                            x: .value("时间", sample.timestamp),
+                            y: .value("功率", sample.powerW)
+                        )
+                        .foregroundStyle(CandyTheme.syrup)
+                        .lineStyle(StrokeStyle(lineWidth: 2.6, lineCap: .round, lineJoin: .round))
+                        .interpolationMethod(.linear)
+                    }
+                    if let hoveredSample {
+                        RuleMark(x: .value("时间", hoveredSample.timestamp))
+                            .foregroundStyle(CandyTheme.syrup.opacity(0.35))
+                            .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 4]))
+                        PointMark(
+                            x: .value("时间", hoveredSample.timestamp),
+                            y: .value("功率", hoveredSample.powerW)
+                        )
+                        .foregroundStyle(CandyTheme.syrup)
+                    }
+                }
+                .chartYAxisLabel("W")
+                .chartXAxis {
+                    AxisMarks(values: .automatic(desiredCount: 3)) {
+                        AxisGridLine(stroke: StrokeStyle(lineWidth: 1, dash: [3, 4]))
+                            .foregroundStyle(.secondary.opacity(0.24))
+                        AxisValueLabel(format: .dateTime.hour().minute().second())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .chartYAxis {
+                    AxisMarks(position: .trailing, values: .automatic(desiredCount: 4)) {
+                        AxisGridLine()
+                            .foregroundStyle(.secondary.opacity(0.20))
+                        AxisValueLabel()
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .chartYScale(domain: 0...(max(5, ceil((samples.map(\.powerW).max() ?? 0) * 1.15))))
+                .chartOverlay { proxy in
+                    GeometryReader { geometry in
+                        Rectangle()
+                            .fill(.clear)
+                            .contentShape(Rectangle())
+                            .onContinuousHover { phase in
+                                switch phase {
+                                case .active(let location):
+                                    guard let plotFrame = proxy.plotFrame else { return }
+                                    let frame = geometry[plotFrame]
+                                    guard frame.contains(location),
+                                          let date: Date = proxy.value(atX: location.x - frame.minX) else {
+                                        hoveredSample = nil
+                                        return
+                                    }
+                                    hoveredSample = samples.min {
+                                        abs($0.timestamp.timeIntervalSince(date)) < abs($1.timestamp.timeIntervalSince(date))
+                                    }
+                                case .ended:
+                                    hoveredSample = nil
+                                }
+                            }
+                    }
+                }
+
+                if let hoveredSample {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(hoveredSample.timestamp, format: .dateTime.hour().minute().second())
+                        Text(String(format: "%.1f W", hoveredSample.powerW))
+                            .font(.caption.weight(.bold))
+                    }
+                    .font(.caption2)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .stroke(CandyTheme.syrup.opacity(0.28), lineWidth: 1)
+                    }
+                }
+            }
+        } else {
+            ContentUnavailableView("暂无曲线", systemImage: "chart.xyaxis.line")
+                .font(.caption)
+        }
     }
 }
 
