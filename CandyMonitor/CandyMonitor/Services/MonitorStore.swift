@@ -84,18 +84,20 @@ final class MonitorStore {
     @ObservationIgnored private var lastChargingRefreshedAt: [UUID: Date] = [:]
     @ObservationIgnored private var lastTemperatureRefreshedAt: [UUID: Date] = [:]
     @ObservationIgnored private var lastPDRefreshedAt: [UUID: Date] = [:]
+    @ObservationIgnored private let ionBridgeDiscovery = IonBridgeDiscovery()
     
     // App Nap prevention activity token
     @ObservationIgnored private var activityToken: NSObjectProtocol?
     @ObservationIgnored private let selectedDeviceDefaultsKey = "CandyMonitor.SelectedDeviceID"
     @ObservationIgnored private let logger = Logger(subsystem: "com.shawnrain.CandyMonitor", category: "MonitorStore")
     @ObservationIgnored private let diagnosticLog = DiagnosticLog()
-    @ObservationIgnored private let recentSampleWindow: TimeInterval = 60
+    @ObservationIgnored private let recentSampleWindow: TimeInterval = 10
     @ObservationIgnored private let recordingPowerThresholdW = 0.5
     @ObservationIgnored private let factsRefreshInterval: TimeInterval = 60
     @ObservationIgnored private let sampleSaveInterval: TimeInterval = 5
+    @ObservationIgnored private let selectedSessionChartSampleLimit = 900
     @ObservationIgnored private let reconnectDelay: TimeInterval = 3
-    @ObservationIgnored private let disconnectDebounceThreshold = 3
+    @ObservationIgnored private let disconnectDebounceThreshold = 1
 
     var selectedDevice: MirrorDevice? {
         guard let selectedDeviceID else { return nil }
@@ -460,7 +462,7 @@ final class MonitorStore {
             },
             sortBy: [SortDescriptor(\.timestamp, order: .forward)]
         )
-        selectedSessionSamples = (try? modelContext.fetch(descriptor)) ?? []
+        selectedSessionSamples = downsampleSessionSamples((try? modelContext.fetch(descriptor)) ?? [])
     }
 
     func stopSession(_ session: ChargingSession, reason: String = "manual") {
@@ -742,6 +744,21 @@ final class MonitorStore {
 
     private func refreshOnce(device: DeviceSnapshot, client: MCPClient) async throws {
         let now = Date()
+        if let local = await ionBridgeDiscovery.snapshot(for: device.id, psn: device.psn) {
+            applyRefreshSnapshot(
+                device: device,
+                facts: local.facts,
+                details: local.details,
+                charging: local.chargingStatus,
+                temperature: local.temperatureMode,
+                pd: local.pdStatus,
+                wsPDByPort: [:],
+                at: now,
+                source: "ionbridge"
+            )
+            return
+        }
+
         let facts = try await machineFacts(for: device, client: client, at: now)
         
         // 1. Port details are always queried every second
@@ -791,6 +808,31 @@ final class MonitorStore {
             }
         }
 
+        let wsPDByPort = await pdStatusFromIOTStream(device: device, client: client)
+        applyRefreshSnapshot(
+            device: device,
+            facts: facts,
+            details: details,
+            charging: charging,
+            temperature: temperature,
+            pd: pd,
+            wsPDByPort: wsPDByPort,
+            at: now,
+            source: "mcp"
+        )
+    }
+
+    private func applyRefreshSnapshot(
+        device: DeviceSnapshot,
+        facts: MachineFacts,
+        details: PortDetailsEnvelope,
+        charging: ChargingStatus,
+        temperature: TemperatureModeResponse,
+        pd: PDStatusEnvelope?,
+        wsPDByPort: [Int: PDPortStatus],
+        at now: Date,
+        source: String
+    ) {
         guard selectedDeviceID == device.id else { return }
 
         let didUpdateDevice = updateDeviceMetadata(
@@ -803,7 +845,6 @@ final class MonitorStore {
         lastRefreshedAt = now
 
         let mcpPDByPort = Dictionary(uniqueKeysWithValues: (pd?.ports ?? []).map { ($0.port, $0) })
-        let wsPDByPort = await pdStatusFromIOTStream(device: device, client: client)
         let detailsByPort = Dictionary(uniqueKeysWithValues: details.ports.map { ($0.port, $0) })
         livePorts = facts.ports.map { port in
             let detail = detailsByPort[port.index]
@@ -825,7 +866,8 @@ final class MonitorStore {
             diagnosticLog.record("refresh_success", metadata: [
                 "device": device.id.uuidString,
                 "power": String(format: "%.1f", totalPowerW),
-                "ports": "\(livePorts.count)"
+                "ports": "\(livePorts.count)",
+                "source": source
             ])
         }
         if didUpdateDevice || recordingResult.didMutateStore {
@@ -1017,6 +1059,8 @@ final class MonitorStore {
                 result.didMutateStore = true
                 result.didChangeSessions = true
                 disconnectDebounce.removeValue(forKey: key)
+                selectedSession = newSession
+                selectedSessionSamples = []
                 logger.info("session_started port=\(port.port.index, privacy: .public) power=\(detail.powerW, privacy: .public)")
                 diagnosticLog.record("session_started", metadata: [
                     "port": "\(port.port.index)",
@@ -1135,6 +1179,9 @@ final class MonitorStore {
             modelContext.insert(sample)
             if sample.sessionID == selectedSession?.id {
                 selectedSessionSamples.append(sample)
+                if selectedSessionSamples.count > selectedSessionChartSampleLimit * 3 {
+                    selectedSessionSamples = downsampleSessionSamples(selectedSessionSamples)
+                }
             }
             result.didMutateStore = true
         }
@@ -1293,8 +1340,40 @@ final class MonitorStore {
             )
         }
         if selectedSession?.id == session.id {
-            selectedSessionSamples = samples
+            selectedSessionSamples = downsampleSessionSamples(samples)
         }
+    }
+
+    private func downsampleSessionSamples(_ samples: [PortSample]) -> [PortSample] {
+        guard samples.count > selectedSessionChartSampleLimit else { return samples }
+
+        let bucketSize = Int(ceil(Double(samples.count) / Double(selectedSessionChartSampleLimit)))
+        var reduced: [PortSample] = []
+        reduced.reserveCapacity(selectedSessionChartSampleLimit * 3)
+
+        for bucketStart in stride(from: 0, to: samples.count, by: bucketSize) {
+            let bucketEnd = min(bucketStart + bucketSize, samples.count)
+            let slice = samples[bucketStart..<bucketEnd]
+            guard let first = slice.first else { continue }
+
+            var peak = first
+            var peakPower = first.powerW
+            for sample in slice where sample.powerW > peakPower {
+                peak = sample
+                peakPower = sample.powerW
+            }
+
+            let last = slice.last ?? first
+            reduced.append(first)
+            if peak.id != first.id && peak.id != last.id {
+                reduced.append(peak)
+            }
+            if last.id != first.id && last.id != peak.id {
+                reduced.append(last)
+            }
+        }
+
+        return reduced
     }
 
     private func updateStats(session: ChargingSession, with sample: SampleStats) {

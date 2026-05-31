@@ -329,7 +329,8 @@ private struct NativeMonitorView: View {
                         connectionState: store.connectionState,
                         lastRefreshedAt: store.lastRefreshedAt,
                         temperatureMode: LocalizedTelemetry.temperatureModeLabel(store.temperatureModeLabel),
-                        activeSessions: store.activeChargingSessions.count
+                        activeSessions: store.activeChargingSessions.count,
+                        totalPowerW: store.totalPowerW
                     )
 
                     ViewThatFits(in: .horizontal) {
@@ -456,20 +457,33 @@ private struct NativeMonitorView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            if let session = store.activeChargingSessions.first {
-                HStack {
-                    Button {
-                        store.selectSession(session)
-                        store.selectedSection = .sessions
-                    } label: {
-                        Label("曲线", systemImage: "chart.xyaxis.line")
+            if store.activeChargingSessions.isEmpty == false {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(store.activeChargingSessions) { session in
+                        HStack(spacing: 8) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(session.displayTitle)
+                                    .font(.caption.weight(.semibold))
+                                    .lineLimit(1)
+                                Text("已采 \(session.sampleCount) 点")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer(minLength: 4)
+                            Button {
+                                store.selectSession(session)
+                                store.selectedSection = .sessions
+                            } label: {
+                                Label("曲线", systemImage: "chart.xyaxis.line")
+                            }
+                            Button {
+                                store.exportSessionCSV(session)
+                            } label: {
+                                Label("CSV", systemImage: "square.and.arrow.up")
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
                     }
-                    Button {
-                        store.exportSessionCSV(session)
-                    } label: {
-                        Label("CSV", systemImage: "square.and.arrow.up")
-                    }
-                    .buttonStyle(.borderedProminent)
                 }
             } else {
                 Text("接上设备后自动开始")
@@ -490,9 +504,15 @@ private struct NativeMonitorView: View {
     }
 
     private var recordingText: String {
-        if let session = store.activeChargingSessions.first {
+        let active = store.activeChargingSessions
+        if active.count == 1, let session = active.first {
             let minutes = Int(Date().timeIntervalSince(session.startedAt) / 60)
             return "\(session.portName) 正在记录全程曲线，已采 \(session.sampleCount) 个点，持续 \(minutes) 分钟。"
+        }
+        if active.isEmpty == false {
+            let totalSamples = active.reduce(0) { $0 + $1.sampleCount }
+            let ports = active.map(\.portName).joined(separator: "、")
+            return "\(ports) 正在分别记录全程曲线，合计已采 \(totalSamples) 个点。"
         }
         return "每个端口独立记录，从有功率输出开始，到满电、拔掉或手动停止结束。"
     }
@@ -550,14 +570,13 @@ private struct MirrorDeviceHero: View {
     let lastRefreshedAt: Date?
     let temperatureMode: String
     let activeSessions: Int
+    let totalPowerW: Double
 
     private var displayFamilyName: String {
-        guard let pf = productFamily?.uppercased() else {
-            return "Mirror"
-        }
-        if pf.contains("CP-02S") || pf.contains("02S") {
+        let family = CandyProductFamily(productFamily)
+        if family.is02S {
             return "02S"
-        } else if pf.contains("CP-02") || pf.contains("ULTRA") {
+        } else if family.isUltra {
             return "Ultra"
         } else {
             return "Mirror"
@@ -576,13 +595,13 @@ private struct MirrorDeviceHero: View {
                         .foregroundStyle(CandyTheme.syrup)
                 }
 
-                HStack(spacing: 8) {
+                HStack(alignment: .center, spacing: 8) {
                     Text(deviceName)
                         .font(.system(size: 30, weight: .bold, design: .rounded))
                         .lineLimit(1)
-                    Image(systemName: "seal.fill")
-                        .font(.system(size: 18, weight: .semibold))
-                        .foregroundStyle(CandyTheme.syrup)
+                    RotatingPowerBadge(powerW: totalPowerW)
+                        .frame(width: 24, height: 24)
+                        .offset(y: 1)
                 }
 
                 HStack(spacing: 8) {
@@ -640,6 +659,13 @@ private struct MirrorPowerTopologyPanel: View {
         return budget > 0 ? budget : 160.0
     }
 
+    private var activeMaxPowerW: Double {
+        ports
+            .filter { $0.connected && $0.powerW > 0.5 }
+            .map(\.powerW)
+            .max() ?? 0
+    }
+
     private var portsConfigLabel: String {
         let typeC = ports.filter { !$0.port.connectorType.lowercased().contains("a") }.count
         let usbA = ports.filter { $0.port.connectorType.lowercased().contains("a") }.count
@@ -688,22 +714,8 @@ private struct MirrorPowerTopologyPanel: View {
             ZStack(alignment: .bottom) {
                 GeometryReader { proxy in
                     ForEach(Array(ports.enumerated()), id: \.element.id) { index, port in
-                        let isCharging = port.connected && port.powerW > 0.5
-                        let strokeColor = isCharging 
-                            ? CandyTheme.syrup.opacity(0.88) 
-                            : CandyTheme.syrup.opacity(0.28)
-                        
-                        let strokeStyle: StrokeStyle = {
-                            if isCharging {
-                                let w = 3.0 + min(port.powerW / 140.0, 1.0) * 13.0
-                                return StrokeStyle(lineWidth: w, lineCap: .round, lineJoin: .round)
-                            } else {
-                                return StrokeStyle(lineWidth: 1.8, lineCap: .round, dash: [1, 6])
-                            }
-                        }()
-                        
                         MirrorCablePath(index: index, total: max(ports.count, 1))
-                            .stroke(strokeColor, style: strokeStyle)
+                            .stroke(cableStrokeColor(for: port), style: cableStrokeStyle(for: port))
                             .frame(width: proxy.size.width, height: proxy.size.height)
                     }
                 }
@@ -756,6 +768,47 @@ private struct MirrorPowerTopologyPanel: View {
             Capsule()
                 .stroke(CandyTheme.syrup.opacity(0.65), lineWidth: 1)
         }
+    }
+
+    private func cableStrokeColor(for port: PortViewState) -> Color {
+        CandyTheme.syrup
+    }
+
+    private func cableStrokeStyle(for port: PortViewState) -> StrokeStyle {
+        guard port.connected && port.powerW > 0.5 else {
+            return StrokeStyle(lineWidth: 1.45, lineCap: .round, dash: [2.4, 6.2])
+        }
+        let ratio = min(max(port.powerW / max(activeMaxPowerW, 1), 0), 1)
+        let width = 2.8 + pow(ratio, 0.82) * 3.8
+        return StrokeStyle(lineWidth: width, lineCap: .round, lineJoin: .round)
+    }
+}
+
+private struct RotatingPowerBadge: View, Equatable {
+    let powerW: Double
+
+    private var isActive: Bool { powerW > 0.5 }
+
+    private var degreesPerSecond: Double {
+        let normalized = min(max(powerW / 140.0, 0), 1)
+        return 28 + normalized * 132
+    }
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !isActive)) { timeline in
+            Image(systemName: "seal.fill")
+                .font(.system(size: 18, weight: .semibold))
+                .symbolRenderingMode(.monochrome)
+                .foregroundStyle(CandyTheme.syrup)
+                .frame(width: 24, height: 24, alignment: .center)
+                .rotationEffect(.degrees(rotationAngle(at: timeline.date)))
+                .accessibilityHidden(true)
+        }
+    }
+
+    private func rotationAngle(at date: Date) -> Double {
+        guard isActive else { return 0 }
+        return date.timeIntervalSinceReferenceDate * degreesPerSecond
     }
 }
 
@@ -870,12 +923,10 @@ private struct MirrorChargerIllustration: View {
     }
     
     private var assetName: String {
-        guard let pf = productFamily?.uppercased() else {
-            return "Mirror4C1ADevice"
-        }
-        if pf.contains("CP-02S") || pf.contains("02S") {
+        let family = CandyProductFamily(productFamily)
+        if family.is02S {
             return "Mirror02sDevice"
-        } else if pf.contains("CP-02") || pf.contains("ULTRA") {
+        } else if family.isUltra {
             return "Ultra02Device"
         } else {
             return "Mirror4C1ADevice"
@@ -883,12 +934,10 @@ private struct MirrorChargerIllustration: View {
     }
     
     private var displayName: String {
-        guard let pf = productFamily?.uppercased() else {
-            return "4C1A"
-        }
-        if pf.contains("CP-02S") || pf.contains("02S") {
+        let family = CandyProductFamily(productFamily)
+        if family.is02S {
             return "02S"
-        } else if pf.contains("CP-02") || pf.contains("ULTRA") {
+        } else if family.isUltra {
             return "02 Ultra"
         } else {
             return "4C1A"
@@ -1218,18 +1267,7 @@ private struct StaticLiveChart: View, Equatable {
                     series: .value("Segment", point.seriesID)
                 )
                 .foregroundStyle(by: .value("Port", point.sample.portName))
-                .lineStyle(StrokeStyle(lineWidth: 2.5, lineCap: .round, lineJoin: .round))
-                .interpolationMethod(.catmullRom)
-            }
-
-            ForEach(lineSamplesCache) { point in
-                AreaMark(
-                    x: .value("Time", point.sample.timestamp),
-                    y: .value(metric.title, metric.displayValue(point.sample)),
-                    series: .value("Segment", point.seriesID)
-                )
-                .foregroundStyle(by: .value("Port", point.sample.portName))
-                .opacity(0.12)
+                .lineStyle(StrokeStyle(lineWidth: 3.2, lineCap: .round, lineJoin: .round))
                 .interpolationMethod(.catmullRom)
             }
         }
@@ -1407,6 +1445,14 @@ private enum CandyTheme {
     static let mint = Color(red: 0.10, green: 0.68, blue: 0.24)
     static let berry = Color(red: 0.84, green: 0.24, blue: 0.34)
     static let caramel = Color(red: 0.95, green: 0.55, blue: 0.18)
+    static let menuCardBackground = adaptive(
+        light: NSColor(calibratedWhite: 0.96, alpha: 0.96),
+        dark: NSColor(calibratedWhite: 0.15, alpha: 0.96)
+    )
+    static let menuRowBackground = adaptive(
+        light: NSColor(calibratedWhite: 0.92, alpha: 0.92),
+        dark: NSColor(calibratedWhite: 0.11, alpha: 0.92)
+    )
     static let sidebarDeviceSelection = adaptive(
         light: NSColor(calibratedWhite: 0.90, alpha: 1),
         dark: NSColor(calibratedWhite: 0.24, alpha: 1)
@@ -1417,6 +1463,25 @@ private enum CandyTheme {
         Color(nsColor: NSColor(name: nil) { appearance in
             appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light
         })
+    }
+}
+
+private struct CandyProductFamily {
+    private let normalized: String
+
+    init(_ value: String?) {
+        normalized = (value ?? "").uppercased()
+            .replacingOccurrences(of: "-", with: "")
+            .replacingOccurrences(of: "_", with: "")
+            .replacingOccurrences(of: " ", with: "")
+    }
+
+    var is02S: Bool {
+        normalized.contains("CP02S") || normalized.contains("02S")
+    }
+
+    var isUltra: Bool {
+        normalized.contains("CP02") || normalized.contains("ULTRA")
     }
 }
 
@@ -2237,7 +2302,6 @@ private struct RenameSessionSheet: View {
 private struct SessionPowerChart: View {
     let samples: [PortSample]
     @State private var hoveredSample: PortSample?
-    @State private var plottedSamples: [PortSample] = []
     @State private var hoverLocation: CGPoint?
     @State private var hoverX: CGFloat?
     @State private var hoverY: CGFloat?
@@ -2245,7 +2309,7 @@ private struct SessionPowerChart: View {
     var body: some View {
         GeometryReader { geometry in
             ZStack(alignment: .topLeading) {
-                StaticSessionChart(plottedSamples: plottedSamples)
+                StaticSessionChart(plottedSamples: samples)
                     .equatable()
                     .frame(height: 300)
                     .chartOverlay { proxy in
@@ -2263,7 +2327,7 @@ private struct SessionPowerChart: View {
                                     self.hoverLocation = nil
                                 }
                             }
-                            .onChange(of: plottedSamples) { _, _ in
+                            .onChange(of: samples) { _, _ in
                                 if let hoverLocation {
                                     updateHover(location: hoverLocation, proxy: proxy, geometry: geometry)
                                 }
@@ -2300,12 +2364,6 @@ private struct SessionPowerChart: View {
         .frame(height: 300)
         .padding(16)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .task(id: samples) {
-            let downsampled = downsamplePortSamples(samples)
-            await MainActor.run {
-                self.plottedSamples = downsampled
-            }
-        }
     }
 
     private func updateHover(location: CGPoint, proxy: ChartProxy, geometry: GeometryProxy) {
@@ -2324,7 +2382,7 @@ private struct SessionPowerChart: View {
             return
         }
 
-        if let nearest = plottedSamples.min(by: {
+        if let nearest = samples.min(by: {
             abs($0.timestamp.timeIntervalSince(date)) < abs($1.timestamp.timeIntervalSince(date))
         }) {
             hoveredSample = nearest
@@ -2336,44 +2394,6 @@ private struct SessionPowerChart: View {
             }
         }
     }
-}
-
-private func downsamplePortSamples(_ samples: [PortSample], maxSamples: Int = 600) -> [PortSample] {
-    guard samples.count > maxSamples else { return samples }
-
-    let bucketSize = Int(ceil(Double(samples.count) / Double(maxSamples)))
-    var reduced: [PortSample] = []
-    reduced.reserveCapacity(maxSamples * 3)
-
-    for bucketStart in stride(from: 0, to: samples.count, by: bucketSize) {
-        let bucketEnd = min(bucketStart + bucketSize, samples.count)
-        let slice = samples[bucketStart..<bucketEnd]
-        
-        guard let first = slice.first else { continue }
-        
-        var peak = first
-        var peakVal = first.powerW
-        for item in slice {
-            if item.powerW > peakVal {
-                peakVal = item.powerW
-                peak = item
-            }
-        }
-        
-        let last = slice.last ?? first
-
-        reduced.append(first)
-        
-        if peak.id != first.id && peak.id != last.id {
-            reduced.append(peak)
-        }
-        
-        if last.id != first.id && last.id != peak.id {
-            reduced.append(last)
-        }
-    }
-
-    return reduced
 }
 
 private struct SessionReadout: View {
@@ -3288,10 +3308,10 @@ struct CandyMenuBarView: View {
             PowerCapacityBar(totalPowerW: store.totalPowerW, maxPowerW: max(store.selectedDevice?.maxPowerBudget ?? 160, 1))
         }
         .padding(14)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .background(CandyTheme.menuCardBackground, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(.white.opacity(0.12), lineWidth: 1)
+                .stroke(CandyTheme.separator, lineWidth: 1)
         }
     }
 
@@ -3324,32 +3344,42 @@ struct CandyMenuBarView: View {
             Label("充电记录", systemImage: "waveform.path.ecg")
                 .font(.headline)
 
-            if let session = store.activeChargingSessions.first {
-                HStack(spacing: 10) {
-                    Image(systemName: "record.circle")
-                        .font(.system(size: 18, weight: .semibold))
-                        .foregroundStyle(CandyTheme.caramel)
-                        .frame(width: 30, height: 30)
-                        .background(CandyTheme.caramel.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(session.displayTitle)
-                            .font(.callout.weight(.semibold))
-                            .lineLimit(1)
-                        Text("峰值 \(String(format: "%.1f W", session.peakPowerW)) · 已采 \(session.sampleCount) 点")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+            if store.activeChargingSessions.isEmpty == false {
+                VStack(spacing: 8) {
+                    ForEach(store.activeChargingSessions) { session in
+                        HStack(spacing: 10) {
+                            Image(systemName: "record.circle")
+                                .font(.system(size: 18, weight: .semibold))
+                                .foregroundStyle(CandyTheme.caramel)
+                                .frame(width: 30, height: 30)
+                                .background(CandyTheme.caramel.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(session.displayTitle)
+                                    .font(.callout.weight(.semibold))
+                                    .lineLimit(1)
+                                Text("峰值 \(String(format: "%.1f W", session.peakPowerW)) · 已采 \(session.sampleCount) 点")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Text("记录中")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(CandyTheme.caramel)
+                                .padding(.horizontal, 8)
+                                .frame(height: 22)
+                                .background(CandyTheme.caramel.opacity(0.12), in: Capsule())
+                        }
+                        .padding(10)
+                        .background(CandyTheme.menuRowBackground, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                     }
-                    Spacer()
                 }
-                .padding(10)
-                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
             } else {
                 Text("接入负载并开始输出功率后会自动记录曲线。")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .padding(10)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .background(CandyTheme.menuRowBackground, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
             }
         }
     }
@@ -3462,7 +3492,7 @@ private struct PowerCapacityBar: View {
                     Capsule()
                         .fill(.secondary.opacity(0.12))
                     Capsule()
-                        .fill(LinearGradient(colors: [CandyTheme.syrup, CandyTheme.caramel, CandyTheme.mint], startPoint: .leading, endPoint: .trailing))
+                        .fill(CandyTheme.syrup)
                         .frame(width: max(10, proxy.size.width * ratio))
                 }
             }
