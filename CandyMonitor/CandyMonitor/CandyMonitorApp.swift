@@ -159,11 +159,7 @@ final class CandyMonitorAppDelegate: NSObject, NSApplicationDelegate {
             button.target = self
         }
 
-        let popover = NSPopover()
-        popover.contentSize = NSSize(width: 390, height: 500)
-        popover.behavior = .transient
-        
-        // Setup power observer to update the custom rendered image
+        // 定时 1 秒更新菜单栏电量渲染图
         Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self = self, let button = self.statusItem?.button else { return }
             button.image = self.renderedCandyPowerImage(totalPowerW: self.store.totalPowerW)
@@ -172,47 +168,69 @@ final class CandyMonitorAppDelegate: NSObject, NSApplicationDelegate {
 
     private func renderedCandyPowerImage(totalPowerW: Double) -> NSImage {
         let font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
-        // Foreground color is black for the template mask (macOS will tint it automatically)
         let attributes: [NSAttributedString.Key: Any] = [
             .font: font,
             .foregroundColor: NSColor.black
         ]
         
-        let powerText: String
-        if totalPowerW >= 100 {
-            powerText = "\(Int(totalPowerW.rounded()))W"
-        } else {
-            powerText = String(format: "%.1fW", totalPowerW)
-        }
-        
-        let text = powerText as NSString
-        let textSize = text.size(withAttributes: attributes)
         let iconSize = NSSize(width: 20, height: 12)
-        let spacing: CGFloat = 5
         let height: CGFloat = 18
-        let width = ceil(iconSize.width + spacing + textSize.width)
-        let image = NSImage(size: NSSize(width: width, height: height))
+        
+        if totalPowerW > 0.0 {
+            let powerText: String
+            if totalPowerW >= 100 {
+                powerText = "\(Int(totalPowerW.rounded()))W"
+            } else {
+                powerText = String(format: "%.1fW", totalPowerW)
+            }
+            
+            let text = powerText as NSString
+            let textSize = text.size(withAttributes: attributes)
+            let spacing: CGFloat = 5
+            let width = ceil(iconSize.width + spacing + textSize.width)
+            let image = NSImage(size: NSSize(width: width, height: height))
 
-        image.lockFocus()
-        NSColor.clear.setFill()
-        NSRect(origin: .zero, size: image.size).fill()
+            image.lockFocus()
+            NSColor.clear.setFill()
+            NSRect(origin: .zero, size: image.size).fill()
 
-        if let icon = NSImage(named: "CandyMenuBarIconBlack") {
-            icon.draw(in: NSRect(
-                x: 0,
-                y: floor((height - iconSize.height) / 2) + 1,
-                width: iconSize.width,
-                height: iconSize.height
-            ))
+            if let icon = NSImage(named: "CandyMenuBarIconBlack") {
+                icon.draw(in: NSRect(
+                    x: 0,
+                    y: floor((height - iconSize.height) / 2) + 1,
+                    width: iconSize.width,
+                    height: iconSize.height
+                ))
+            }
+
+            text.draw(at: NSPoint(
+                x: iconSize.width + spacing,
+                y: floor((height - textSize.height) / 2) + 1
+            ), withAttributes: attributes)
+            image.unlockFocus()
+            image.isTemplate = true
+            return image
+        } else {
+            let width = iconSize.width
+            let image = NSImage(size: NSSize(width: width, height: height))
+
+            image.lockFocus()
+            NSColor.clear.setFill()
+            NSRect(origin: .zero, size: image.size).fill()
+
+            if let icon = NSImage(named: "CandyMenuBarIconBlack") {
+                icon.draw(in: NSRect(
+                    x: 0,
+                    y: floor((height - iconSize.height) / 2) + 1,
+                    width: iconSize.width,
+                    height: iconSize.height
+                ))
+            }
+
+            image.unlockFocus()
+            image.isTemplate = true
+            return image
         }
-
-        text.draw(at: NSPoint(
-            x: iconSize.width + spacing,
-            y: floor((height - textSize.height) / 2) + 1
-        ), withAttributes: attributes)
-        image.unlockFocus()
-        image.isTemplate = true
-        return image
     }
 
     @objc private func togglePopover(_ sender: AnyObject?) {

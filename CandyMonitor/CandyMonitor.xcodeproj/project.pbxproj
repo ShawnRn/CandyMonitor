@@ -267,6 +267,7 @@
 				ENABLE_USER_SELECTED_FILES = readwrite;
 				GENERATE_INFOPLIST_FILE = YES;
 					INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
+					INFOPLIST_KEY_LSUIElement = YES;
 					INFOPLIST_KEY_NSHumanReadableCopyright = "";
 					INFOPLIST_KEY_SUFeedURL = "https://raw.githubusercontent.com/ShawnRn/CandyMonitor/main/appcast.xml";
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -300,6 +301,7 @@
 				ENABLE_USER_SELECTED_FILES = readwrite;
 				GENERATE_INFOPLIST_FILE = YES;
 					INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
+					INFOPLIST_KEY_LSUIElement = YES;
 					INFOPLIST_KEY_NSHumanReadableCopyright = "";
 					INFOPLIST_KEY_SUFeedURL = "https://raw.githubusercontent.com/ShawnRn/CandyMonitor/main/appcast.xml";
 				LD_RUNPATH_SEARCH_PATHS = (

@@ -3379,11 +3379,22 @@ struct MenuBarStatusLabel: View {
     let store: MonitorStore
 
     var body: some View {
-        if store.totalPowerW > 0.0 {
-            Text(String(format: "%.1fW", store.totalPowerW))
-        } else {
-            Image(systemName: "bolt.fill")
+        HStack(spacing: 5) {
+            Image("CandyMenuBarIconBlack")
+                .renderingMode(.template)
+            if store.totalPowerW > 0.0 {
+                Text(powerText)
+                    .font(.system(size: 13, weight: .semibold, design: .monospaced))
+            }
         }
+        .padding(.horizontal, 2)
+    }
+
+    private var powerText: String {
+        if store.totalPowerW >= 100 {
+            return "\(Int(store.totalPowerW.rounded()))W"
+        }
+        return String(format: "%.1fW", store.totalPowerW)
     }
 }
 
