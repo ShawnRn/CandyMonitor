@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		46C051B72F2841AF00440FFE /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = 46C051B62F2841AF00440FFE /* Sparkle */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		46D420A82FBD39C800833D78 /* CandyMonitor.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CandyMonitor.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -23,6 +27,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				46C051B72F2841AF00440FFE /* Sparkle in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -65,6 +70,7 @@
 			);
 			name = CandyMonitor;
 			packageProductDependencies = (
+				46C051B62F2841AF00440FFE /* Sparkle */,
 			);
 			productName = CandyMonitor;
 			productReference = 46D420A82FBD39C800833D78 /* CandyMonitor.app */;
@@ -95,6 +101,9 @@
 			mainGroup = 46D4209F2FBD39C800833D78;
 			minimizedProjectReferenceProxies = 1;
 			preferredProjectObjectVersion = 77;
+			packageReferences = (
+				46C051B52F2841AF00440FFE /* XCRemoteSwiftPackageReference "Sparkle" */,
+			);
 			productRefGroup = 46D420A92FBD39C800833D78 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
@@ -257,7 +266,9 @@
 				ENABLE_USER_SELECTED_FILES = readwrite;
 				GENERATE_INFOPLIST_FILE = YES;
 					INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
+					INFOPLIST_KEY_LSUIElement = YES;
 					INFOPLIST_KEY_NSHumanReadableCopyright = "";
+					INFOPLIST_KEY_SUFeedURL = "https://raw.githubusercontent.com/ShawnRn/CandyMonitor/main/appcast.xml";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
@@ -289,7 +300,9 @@
 				ENABLE_USER_SELECTED_FILES = readwrite;
 				GENERATE_INFOPLIST_FILE = YES;
 					INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
+					INFOPLIST_KEY_LSUIElement = YES;
 					INFOPLIST_KEY_NSHumanReadableCopyright = "";
+					INFOPLIST_KEY_SUFeedURL = "https://raw.githubusercontent.com/ShawnRn/CandyMonitor/main/appcast.xml";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
@@ -329,6 +342,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		46C051B52F2841AF00440FFE /* XCRemoteSwiftPackageReference "Sparkle" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/sparkle-project/Sparkle";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 2.8.1;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		46C051B62F2841AF00440FFE /* Sparkle */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 46C051B52F2841AF00440FFE /* XCRemoteSwiftPackageReference "Sparkle" */;
+			productName = Sparkle;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 46D420A02FBD39C800833D78 /* Project object */;
 }

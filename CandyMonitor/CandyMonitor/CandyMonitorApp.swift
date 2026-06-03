@@ -8,6 +8,7 @@
 import SwiftUI
 import SwiftData
 import AppKit
+import Sparkle
 
 @main
 struct CandyMonitorApp: App {
@@ -45,8 +46,16 @@ struct CandyMonitorApp: App {
 final class CandyMonitorAppDelegate: NSObject, NSApplicationDelegate {
     private let showInDockKey = "showInDock"
     private var lastShowInDock: Bool?
+    var updaterController: SPUStandardUpdaterController?
+    private var isStartupPhase = true
+
+    override init() {
+        super.init()
+        self.updaterController = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        ProcessInfo.processInfo.disableSuddenTermination()
         if UserDefaults.standard.object(forKey: showInDockKey) == nil {
             UserDefaults.standard.set(true, forKey: showInDockKey)
         }
@@ -57,10 +66,33 @@ final class CandyMonitorAppDelegate: NSObject, NSApplicationDelegate {
             name: UserDefaults.didChangeNotification,
             object: nil
         )
+
+        // 如果开启了 Dock 显示，就在启动时发送通知打开主窗口
+        if UserDefaults.standard.bool(forKey: showInDockKey) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                NotificationCenter.default.post(name: NSNotification.Name("OpenMainWindow"), object: nil)
+            }
+        }
+
+        // 启动 1 秒后结束启动阶段，允许后续正常的用户或系统级退出
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.isStartupPhase = false
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         NotificationCenter.default.removeObserver(self)
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if isStartupPhase {
+            return .terminateCancel
+        }
+        return .terminateNow
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        return false
     }
 
     @objc private func dockPreferenceChanged() {
