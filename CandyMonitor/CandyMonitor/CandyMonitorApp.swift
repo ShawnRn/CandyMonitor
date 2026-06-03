@@ -13,27 +13,13 @@ import Sparkle
 @main
 struct CandyMonitorApp: App {
     @NSApplicationDelegateAdaptor(CandyMonitorAppDelegate.self) private var appDelegate
-    @State private var store = MonitorStore()
 
     var body: some Scene {
         Window("CandyMonitor", id: "main") {
-            ContentView(store: store)
+            ContentView(store: appDelegate.store)
         }
         .windowResizability(.contentSize)
         .defaultSize(width: 1180, height: 760)
-        .modelContainer(for: [
-            MirrorDevice.self,
-            ChargingSession.self,
-            PortSample.self,
-            ControlEvent.self
-        ])
-
-        MenuBarExtra {
-            CandyMenuBarView(store: store)
-        } label: {
-            MenuBarStatusLabel(store: store)
-        }
-        .menuBarExtraStyle(.window)
         .modelContainer(for: [
             MirrorDevice.self,
             ChargingSession.self,
@@ -44,10 +30,13 @@ struct CandyMonitorApp: App {
 }
 
 final class CandyMonitorAppDelegate: NSObject, NSApplicationDelegate {
+    let store = MonitorStore()
     private let showInDockKey = "showInDock"
     private var lastShowInDock: Bool?
     var updaterController: SPUStandardUpdaterController?
     private var isStartupPhase = true
+    private var statusItem: NSStatusItem?
+    private var popover: NSPopover?
 
     override init() {
         super.init()
@@ -66,6 +55,8 @@ final class CandyMonitorAppDelegate: NSObject, NSApplicationDelegate {
             name: UserDefaults.didChangeNotification,
             object: nil
         )
+        
+        setupMenuBar()
 
         // 如果开启了 Dock 显示，就在启动时确保主窗口打开
         if UserDefaults.standard.bool(forKey: showInDockKey) {
@@ -151,5 +142,66 @@ final class CandyMonitorAppDelegate: NSObject, NSApplicationDelegate {
             window.makeKeyAndOrderFront(nil)
         }
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func setupMenuBar() {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if let button = statusItem?.button {
+            button.image = NSImage(named: "CandyMenuBarIconBlack")
+            button.image?.isTemplate = true
+            button.action = #selector(togglePopover(_:))
+            button.target = self
+        }
+
+        let popover = NSPopover()
+        popover.contentSize = NSSize(width: 390, height: 500)
+        popover.behavior = .transient
+        // Important: we must pass modelContainer explicitly to NSHostingController if we don't inject it here,
+        // but CandyMenuBarView already uses @Environment(\.modelContext) which requires it.
+        // To fix this cleanly, we can inject modelContainer in NSHostingController if needed, 
+        // but ContentView sets it. We will wrap CandyMenuBarView in a modelContainer setup.
+        
+        // Setup power observer
+        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self = self, let button = self.statusItem?.button else { return }
+            let power = self.store.totalPowerW
+            if power > 0.0 {
+                if power >= 100 {
+                    button.title = "\(Int(power.rounded()))W"
+                } else {
+                    button.title = String(format: "%.1fW", power)
+                }
+                button.font = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
+                button.image = NSImage(named: "CandyMenuBarIconBlack")
+                button.image?.isTemplate = true
+                button.imagePosition = .imageLeft
+            } else {
+                button.title = ""
+                button.image = NSImage(named: "CandyMenuBarIconBlack")
+                button.image?.isTemplate = true
+                button.imagePosition = .imageOnly
+            }
+        }
+    }
+
+    @objc private func togglePopover(_ sender: AnyObject?) {
+        guard let button = statusItem?.button else { return }
+        if popover == nil {
+            let container = try? SwiftData.ModelContainer(for: MirrorDevice.self, ChargingSession.self, PortSample.self, ControlEvent.self)
+            let view = CandyMenuBarView(store: store)
+                .modelContainer(container!)
+            let popover = NSPopover()
+            popover.contentSize = NSSize(width: 390, height: 500)
+            popover.behavior = .transient
+            popover.contentViewController = NSHostingController(rootView: view)
+            self.popover = popover
+        }
+        
+        if popover?.isShown == true {
+            popover?.performClose(sender)
+        } else {
+            popover?.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            NSApp.activate(ignoringOtherApps: true)
+        }
     }
 }

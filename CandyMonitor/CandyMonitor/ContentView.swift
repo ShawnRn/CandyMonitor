@@ -3357,11 +3357,14 @@ struct MenuBarPowerLabel: View {
     let connectionState: ConnectionState
 
     var body: some View {
-        Image(nsImage: renderedCandyPowerImage)
-            .interpolation(.high)
-            .antialiased(true)
-            .fixedSize()
-            .accessibilityLabel("CandyMonitor 当前功率 \(powerText)")
+        Label {
+            Text(powerText)
+                .font(.system(size: 13, weight: .semibold, design: .monospaced))
+        } icon: {
+            Image("CandyMenuBarIconBlack")
+                .renderingMode(.template)
+        }
+        .accessibilityLabel("CandyMonitor 当前功率 \(powerText)")
     }
 
     private var powerText: String {
@@ -3370,50 +3373,17 @@ struct MenuBarPowerLabel: View {
         }
         return String(format: "%.1fW", totalPowerW)
     }
-
-    private var renderedCandyPowerImage: NSImage {
-        let font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
-        let foregroundColor: NSColor = .black
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .foregroundColor: foregroundColor
-        ]
-        let text = powerText as NSString
-        let textSize = text.size(withAttributes: attributes)
-        let iconSize = NSSize(width: 20, height: 12)
-        let spacing: CGFloat = 5
-        let height: CGFloat = 18
-        let width = ceil(iconSize.width + spacing + textSize.width)
-        let image = NSImage(size: NSSize(width: width, height: height))
-
-        image.lockFocus()
-        NSColor.clear.setFill()
-        NSRect(origin: .zero, size: image.size).fill()
-
-        if let icon = NSImage(named: "CandyMenuBarIconBlack") {
-            icon.draw(in: NSRect(
-                x: 0,
-                y: floor((height - iconSize.height) / 2) + 1,
-                width: iconSize.width,
-                height: iconSize.height
-            ))
-        }
-
-        text.draw(at: NSPoint(
-            x: iconSize.width + spacing,
-            y: floor((height - textSize.height) / 2) + 1
-        ), withAttributes: attributes)
-        image.unlockFocus()
-        image.isTemplate = true
-        return image
-    }
 }
 
 struct MenuBarStatusLabel: View {
     let store: MonitorStore
 
     var body: some View {
-        MenuBarPowerLabel(totalPowerW: store.totalPowerW, connectionState: store.connectionState)
+        if store.totalPowerW > 0.0 {
+            Text(String(format: "%.1fW", store.totalPowerW))
+        } else {
+            Image(systemName: "bolt.fill")
+        }
     }
 }
 
