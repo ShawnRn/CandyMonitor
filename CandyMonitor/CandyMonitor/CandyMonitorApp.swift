@@ -67,10 +67,10 @@ final class CandyMonitorAppDelegate: NSObject, NSApplicationDelegate {
             object: nil
         )
 
-        // 如果开启了 Dock 显示，就在启动时发送通知打开主窗口
+        // 如果开启了 Dock 显示，就在启动时确保主窗口打开
         if UserDefaults.standard.bool(forKey: showInDockKey) {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-                NotificationCenter.default.post(name: NSNotification.Name("OpenMainWindow"), object: nil)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+                self?.openMainWindow()
             }
         }
 
@@ -93,6 +93,22 @@ final class CandyMonitorAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         return false
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag {
+            openMainWindow()
+        }
+        return true
+    }
+
+    private func openMainWindow() {
+        if let window = NSApp.windows.first(where: { $0.title == "CandyMonitor" }) {
+            window.makeKeyAndOrderFront(nil)
+        } else {
+            // For SwiftUI Window scenes that were closed, use standard NSApp sendAction to reopen
+            NSApp.sendAction(Selector(("showWindow:")), to: nil, from: nil)
+        }
     }
 
     @objc private func dockPreferenceChanged() {

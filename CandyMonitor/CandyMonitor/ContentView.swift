@@ -3410,37 +3410,10 @@ struct MenuBarPowerLabel: View {
 }
 
 struct MenuBarStatusLabel: View {
-    @Environment(\.modelContext) private var modelContext
-    @Environment(\.openWindow) private var openWindow
     let store: MonitorStore
 
     var body: some View {
         MenuBarPowerLabel(totalPowerW: store.totalPowerW, connectionState: store.connectionState)
-            .onAppear {
-                startMonitoringIfNeeded(reason: "menu_bar_label_appeared")
-            }
-            .task {
-                startMonitoringIfNeeded(reason: "menu_bar_label_task")
-                
-                // Active Watchdog Loop:
-                // Periodically verifies that the background polling thread is active,
-                // and restarts it if it goes stale or died due to network errors.
-                while !Task.isCancelled {
-                    try? await Task.sleep(for: .seconds(5))
-                    store.ensureMonitoringActive(reason: "menu_bar_label_watchdog")
-                }
-            }
-            .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("OpenMainWindow"))) { _ in
-                openWindow(id: "main")
-            }
-    }
-
-    private func startMonitoringIfNeeded(reason: String) {
-        store.configure(modelContext: modelContext)
-        if store.isRealtimeRefreshEnabled == false {
-            store.isRealtimeRefreshEnabled = true
-        }
-        store.ensureMonitoringActive(reason: reason)
     }
 }
 

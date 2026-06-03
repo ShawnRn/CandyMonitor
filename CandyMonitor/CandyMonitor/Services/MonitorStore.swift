@@ -56,6 +56,27 @@ final class MonitorStore {
         }
     }
 
+    var currentPollingInterval: TimeInterval {
+        // 如果有活跃录制 Session，必须保持 1 秒刷新以高频记录充电曲线
+        if !activeChargingSessions.isEmpty {
+            return 1.0
+        }
+        
+        // 如果当前有端口已连接负载，且我们在实时监控页面，也保持 1 秒
+        let hasConnectedLoad = livePorts.contains(where: { $0.connected })
+        if hasConnectedLoad && isRealtimeRefreshEnabled {
+            return 1.0
+        }
+        
+        // 如果没有活跃 session，也没有连接负载，但我们在前台实时监控页面，可以降频到 3.0 秒 (待机时没必要 1 秒)
+        if isRealtimeRefreshEnabled {
+            return 3.0
+        }
+        
+        // 否则（比如应用在后台，或者在非 monitor 页面），采用 30 秒轮询
+        return 30.0
+    }
+
     @ObservationIgnored private var modelContext: ModelContext?
     @ObservationIgnored private var clients: [UUID: MCPClient] = [:]
     @ObservationIgnored private var pdStreamClients: [UUID: CandyIOTPDStatusClient] = [:]
@@ -128,6 +149,15 @@ final class MonitorStore {
             diagnosticLog.record("store_configured", metadata: ["log": diagnosticLog.path])
             loadDevices()
             loadSessions()
+            
+            Task {
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .seconds(5))
+                    await MainActor.run {
+                        self.ensureMonitoringActive(reason: "store_watchdog")
+                    }
+                }
+            }
         }
     }
 
@@ -173,12 +203,20 @@ final class MonitorStore {
     func loadSessions() {
         guard let modelContext else { return }
         let descriptor = FetchDescriptor<ChargingSession>(sortBy: [SortDescriptor(\.startedAt, order: .reverse)])
-        var fetchedSessions = (try? modelContext.fetch(descriptor)) ?? []
+        var fetchedSessions: [ChargingSession] = []
+        do {
+            fetchedSessions = try modelContext.fetch(descriptor)
+        } catch {
+            logger.error("session_fetch_failed: \(error.localizedDescription, privacy: .public)")
+            diagnosticLog.record("session_fetch_failed", metadata: ["error": error.localizedDescription])
+        }
         if mergeDuplicateActiveSessions(in: fetchedSessions, at: Date()) {
             try? modelContext.save()
             fetchedSessions = (try? modelContext.fetch(descriptor)) ?? []
         }
         sessions = fetchedSessions
+        logger.info("sessions_loaded count=\(self.sessions.count)")
+        diagnosticLog.record("sessions_loaded", metadata: ["count": "\(self.sessions.count)"])
         if let selectedSession {
             self.selectedSession = sessions.first { $0.id == selectedSession.id } ?? sessions.first
         } else {
@@ -777,7 +815,7 @@ final class MonitorStore {
             do {
                 try await refreshWithReconnect(device: device, reason: "polling")
                 backoff = reconnectDelay // reset on success
-                let seconds = isRealtimeRefreshEnabled ? 1.0 : 30.0
+                let seconds = currentPollingInterval
                 try? await Task.sleep(for: .seconds(seconds))
             } catch {
                 guard !Task.isCancelled else { return }
@@ -1092,6 +1130,7 @@ final class MonitorStore {
             guard shouldPersistSample else { continue }
 
             var event: String?
+            var sessionEndedThisCycle = false
             let activeSessionID = activeSessions[key]
             var session = activeSessionID.flatMap { fetchSession(id: $0) }
             if activeSessionID != nil, session == nil {
@@ -1153,6 +1192,7 @@ final class MonitorStore {
                 if count >= disconnectDebounceThreshold {
                     event = "device_disconnected"
                     end(session, at: now, reason: "device_disconnected")
+                    sessionEndedThisCycle = true
                     disconnectDebounce.removeValue(forKey: key)
                     result.didMutateStore = true
                     result.didChangeSessions = true
@@ -1181,6 +1221,7 @@ final class MonitorStore {
                     event = "battery_full"
                     activeSession.finalBatteryPercent = battery
                     end(activeSession, at: now, reason: "battery_full")
+                    sessionEndedThisCycle = true
                 } else {
                     // Smart Trickle Charge / Auto-Stop check:
                     // Retrieve up to 150 most recent samples of this session, check if average power is below 1.5W for at least 3 minutes.
@@ -1204,6 +1245,7 @@ final class MonitorStore {
                                     activeSession.finalBatteryPercent = 100
                                     activeSession.hasBatteryData = true
                                     end(activeSession, at: now, reason: "trickle_charge")
+                                    sessionEndedThisCycle = true
                                 }
                             }
                         }
@@ -1219,6 +1261,18 @@ final class MonitorStore {
                         "session": activeSession.id.uuidString
                     ])
                 }
+            }
+
+            // Skip persisting zero-power sample and stats when the session
+            // was just ended this cycle — prevents the cliff-to-zero artifact.
+            if sessionEndedThisCycle {
+                // Clear EMA state so the next session starts fresh
+                emaPowerW.removeValue(forKey: key)
+                emaVoltageV.removeValue(forKey: key)
+                emaCurrentA.removeValue(forKey: key)
+                emaTemperatureScore.removeValue(forKey: key)
+                emaLastConnected.removeValue(forKey: key)
+                continue
             }
 
             let stats = SampleStats(
@@ -1286,8 +1340,41 @@ final class MonitorStore {
         return result
     }
 
+    private func trimTrailingZeroSamples(for session: ChargingSession) {
+        guard let modelContext else { return }
+        let sessionID = session.id
+        let descriptor = FetchDescriptor<PortSample>(
+            predicate: #Predicate { sample in
+                sample.sessionID == sessionID
+            },
+            sortBy: [SortDescriptor(\.timestamp, order: .forward)]
+        )
+        guard let samples = try? modelContext.fetch(descriptor), !samples.isEmpty else { return }
+        
+        var deletedAny = false
+        for sample in samples.reversed() {
+            if sample.powerW < 0.5 {
+                modelContext.delete(sample)
+                deletedAny = true
+            } else {
+                break
+            }
+        }
+        
+        if deletedAny {
+            recomputeStats(for: session)
+            // Also trim the in-memory chart array so the UI updates immediately
+            if selectedSession?.id == sessionID {
+                while let last = selectedSessionSamples.last, last.powerW < 0.5 {
+                    selectedSessionSamples.removeLast()
+                }
+            }
+        }
+    }
+
     private func end(_ session: ChargingSession, at date: Date, reason: String) {
         guard session.endedAt == nil else { return }
+        trimTrailingZeroSamples(for: session)
         session.endedAt = date
         session.endReason = reason
         activeSessions.removeValue(forKey: sessionKey(deviceID: session.deviceID, port: session.portIndex))
