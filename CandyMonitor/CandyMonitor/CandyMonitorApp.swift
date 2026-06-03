@@ -176,6 +176,16 @@ final class CandyMonitorAppDelegate: NSObject, NSApplicationDelegate {
         let iconSize = NSSize(width: 20, height: 12)
         let height: CGFloat = 18
         
+        // 防御性 fallback 图标加载，即使 Asset 图标未加载成功也必定能使用系统 SF Symbol 渲染出闪电图标
+        let iconImage: NSImage
+        if let customIcon = NSImage(named: "CandyMenuBarIconBlack") {
+            iconImage = customIcon
+        } else if #available(macOS 11.0, *), let systemIcon = NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: nil) {
+            iconImage = systemIcon
+        } else {
+            iconImage = NSImage()
+        }
+
         if totalPowerW > 0.0 {
             let powerText: String
             if totalPowerW >= 100 {
@@ -194,14 +204,12 @@ final class CandyMonitorAppDelegate: NSObject, NSApplicationDelegate {
             NSColor.clear.setFill()
             NSRect(origin: .zero, size: image.size).fill()
 
-            if let icon = NSImage(named: "CandyMenuBarIconBlack") {
-                icon.draw(in: NSRect(
-                    x: 0,
-                    y: floor((height - iconSize.height) / 2) + 1,
-                    width: iconSize.width,
-                    height: iconSize.height
-                ))
-            }
+            iconImage.draw(in: NSRect(
+                x: 0,
+                y: floor((height - iconSize.height) / 2) + 1,
+                width: iconSize.width,
+                height: iconSize.height
+            ))
 
             text.draw(at: NSPoint(
                 x: iconSize.width + spacing,
@@ -218,14 +226,12 @@ final class CandyMonitorAppDelegate: NSObject, NSApplicationDelegate {
             NSColor.clear.setFill()
             NSRect(origin: .zero, size: image.size).fill()
 
-            if let icon = NSImage(named: "CandyMenuBarIconBlack") {
-                icon.draw(in: NSRect(
-                    x: 0,
-                    y: floor((height - iconSize.height) / 2) + 1,
-                    width: iconSize.width,
-                    height: iconSize.height
-                ))
-            }
+            iconImage.draw(in: NSRect(
+                x: 0,
+                y: floor((height - iconSize.height) / 2) + 1,
+                width: iconSize.width,
+                height: iconSize.height
+            ))
 
             image.unlockFocus()
             image.isTemplate = true
