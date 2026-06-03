@@ -3389,22 +3389,78 @@ struct MenuBarStatusLabel: View {
     let store: MonitorStore
 
     var body: some View {
-        HStack(spacing: 5) {
-            Image("CandyMenuBarIconBlack")
-                .renderingMode(.template)
-            if store.totalPowerW > 0.0 {
-                Text(powerText)
-                    .font(.system(size: 13, weight: .semibold, design: .monospaced))
-            }
-        }
-        .padding(.horizontal, 2)
+        Image(nsImage: renderedCandyPowerImage)
     }
 
-    private var powerText: String {
-        if store.totalPowerW >= 100 {
-            return "\(Int(store.totalPowerW.rounded()))W"
+    private var renderedCandyPowerImage: NSImage {
+        let power = store.totalPowerW
+        let iconSize = NSSize(width: 20, height: 12)
+        let height: CGFloat = 18
+        
+        let iconImage: NSImage
+        if let customIcon = NSImage(named: "CandyMenuBarIconBlack") {
+            iconImage = customIcon
+        } else if #available(macOS 11.0, *), let systemIcon = NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: nil) {
+            iconImage = systemIcon
+        } else {
+            iconImage = NSImage()
         }
-        return String(format: "%.1fW", store.totalPowerW)
+
+        if power > 0.0 {
+            let font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: font,
+                .foregroundColor: NSColor.black
+            ]
+            let powerText: String
+            if power >= 100 {
+                powerText = "\(Int(power.rounded()))W"
+            } else {
+                powerText = String(format: "%.1fW", power)
+            }
+            let text = powerText as NSString
+            let textSize = text.size(withAttributes: attributes)
+            let spacing: CGFloat = 5
+            let width = ceil(iconSize.width + spacing + textSize.width)
+            
+            let image = NSImage(size: NSSize(width: width, height: height))
+            image.lockFocus()
+            NSColor.clear.setFill()
+            NSRect(origin: .zero, size: image.size).fill()
+            
+            iconImage.draw(in: NSRect(
+                x: 0,
+                y: floor((height - iconSize.height) / 2) + 1,
+                width: iconSize.width,
+                height: iconSize.height
+            ))
+            
+            text.draw(at: NSPoint(
+                x: iconSize.width + spacing,
+                y: floor((height - textSize.height) / 2) + 1
+            ), withAttributes: attributes)
+            
+            image.unlockFocus()
+            image.isTemplate = true
+            return image
+        } else {
+            let width = iconSize.width
+            let image = NSImage(size: NSSize(width: width, height: height))
+            image.lockFocus()
+            NSColor.clear.setFill()
+            NSRect(origin: .zero, size: image.size).fill()
+            
+            iconImage.draw(in: NSRect(
+                x: 0,
+                y: floor((height - iconSize.height) / 2) + 1,
+                width: iconSize.width,
+                height: iconSize.height
+            ))
+            
+            image.unlockFocus()
+            image.isTemplate = true
+            return image
+        }
     }
 }
 
@@ -3449,6 +3505,15 @@ struct CandyMenuBarView: View {
         .tint(CandyTheme.syrup)
         .accentColor(CandyTheme.syrup)
         .background(MenuBarPreviewWindowHost(preview: $hoverPreview, anchorRect: $hoverAnchorRect, isHovering: $isHoveringPreviewWindow))
+        .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("OpenMainWindowNotification"))) { _ in
+            openWindow(id: "main")
+            DispatchQueue.main.async {
+                if let window = NSApp.windows.first(where: { $0.canBecomeMain && $0.styleMask.contains(.titled) }) {
+                    window.makeKeyAndOrderFront(nil)
+                    NSApp.activate(ignoringOtherApps: true)
+                }
+            }
+        }
     }
 
     private var header: some View {

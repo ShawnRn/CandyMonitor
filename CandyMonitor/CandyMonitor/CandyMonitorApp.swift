@@ -15,6 +15,14 @@ struct CandyMonitorApp: App {
     @NSApplicationDelegateAdaptor(CandyMonitorAppDelegate.self) private var appDelegate
 
     var body: some Scene {
+        MenuBarExtra {
+            CandyMenuBarView(store: appDelegate.store)
+        } label: {
+            MenuBarStatusLabel(store: appDelegate.store)
+        }
+        .menuBarExtraStyle(.window)
+        .modelContainer(appDelegate.modelContainer)
+
         Window("CandyMonitor", id: "main") {
             ContentView(store: appDelegate.store)
         }
@@ -26,14 +34,14 @@ struct CandyMonitorApp: App {
 
 final class CandyMonitorAppDelegate: NSObject, NSApplicationDelegate {
     let store = MonitorStore()
-    let modelContainer: ModelContainer
+    let modelContainer: ContainerType
     private let showInDockKey = "showInDock"
     private var lastShowInDock: Bool?
     var updaterController: SPUStandardUpdaterController?
     private var isStartupPhase = true
-    private var statusItem: NSStatusItem?
-    private var popover: NSPopover?
- 
+
+    typealias ContainerType = ModelContainer
+  
     override init() {
         do {
             let container = try ModelContainer(for: MirrorDevice.self, ChargingSession.self, PortSample.self, ControlEvent.self)
@@ -62,8 +70,6 @@ final class CandyMonitorAppDelegate: NSObject, NSApplicationDelegate {
             name: UserDefaults.didChangeNotification,
             object: nil
         )
-        
-        setupMenuBar()
 
         // 如果开启了 Dock 显示，就在启动时确保主窗口打开
         if UserDefaults.standard.bool(forKey: showInDockKey) {
@@ -101,11 +107,11 @@ final class CandyMonitorAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func openMainWindow() {
-        if let window = NSApp.windows.first(where: { $0.title == "CandyMonitor" }) {
+        if let window = NSApp.windows.first(where: { $0.canBecomeMain && $0.styleMask.contains(.titled) }) {
             window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
         } else {
-            // For SwiftUI Window scenes that were closed, use standard NSApp sendAction to reopen
-            NSApp.sendAction(Selector(("showWindow:")), to: nil, from: nil)
+            NotificationCenter.default.post(name: NSNotification.Name("OpenMainWindowNotification"), object: nil)
         }
     }
 
@@ -149,73 +155,5 @@ final class CandyMonitorAppDelegate: NSObject, NSApplicationDelegate {
             window.makeKeyAndOrderFront(nil)
         }
         NSApp.activate(ignoringOtherApps: true)
-    }
-
-    private func setupMenuBar() {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        updateMenuBarItem()
-        
-        if let button = statusItem?.button {
-            button.action = #selector(togglePopover(_:))
-            button.target = self
-        }
-
-        // 定时 1 秒更新菜单栏电量与图标
-        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.updateMenuBarItem()
-        }
-    }
-
-    private func updateMenuBarItem() {
-        guard let button = statusItem?.button else { return }
-        let power = store.totalPowerW
-        
-        // 防御性 fallback 图标加载，即使 Asset 图标未加载成功也必定能使用系统 SF Symbol 渲染出闪电图标
-        let iconImage: NSImage?
-        if let customIcon = NSImage(named: "CandyMenuBarIconBlack") {
-            iconImage = customIcon
-        } else if #available(macOS 11.0, *) {
-            iconImage = NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: nil)
-        } else {
-            iconImage = nil
-        }
-        
-        button.image = iconImage
-        button.image?.isTemplate = true
-        
-        if power > 0.0 {
-            let powerText: String
-            if power >= 100 {
-                powerText = "\(Int(power.rounded()))W"
-            } else {
-                powerText = String(format: "%.1fW", power)
-            }
-            button.title = powerText
-            button.font = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
-            button.imagePosition = .imageLeft
-        } else {
-            button.title = ""
-            button.imagePosition = .imageOnly
-        }
-    }
-
-    @objc private func togglePopover(_ sender: AnyObject?) {
-        guard let button = statusItem?.button else { return }
-        if popover == nil {
-            let view = CandyMenuBarView(store: store)
-                .modelContainer(modelContainer)
-            let popover = NSPopover()
-            popover.contentSize = NSSize(width: 390, height: 500)
-            popover.behavior = .transient
-            popover.contentViewController = NSHostingController(rootView: view)
-            self.popover = popover
-        }
-        
-        if popover?.isShown == true {
-            popover?.performClose(sender)
-        } else {
-            popover?.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            NSApp.activate(ignoringOtherApps: true)
-        }
     }
 }
