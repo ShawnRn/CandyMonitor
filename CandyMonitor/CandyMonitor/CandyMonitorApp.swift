@@ -20,39 +20,39 @@ struct CandyMonitorApp: App {
         }
         .windowResizability(.contentSize)
         .defaultSize(width: 1180, height: 760)
-        .modelContainer(for: [
-            MirrorDevice.self,
-            ChargingSession.self,
-            PortSample.self,
-            ControlEvent.self
-        ])
+        .modelContainer(appDelegate.modelContainer)
     }
 }
 
 final class CandyMonitorAppDelegate: NSObject, NSApplicationDelegate {
     let store = MonitorStore()
+    let modelContainer: ModelContainer
     private let showInDockKey = "showInDock"
     private var lastShowInDock: Bool?
     var updaterController: SPUStandardUpdaterController?
     private var isStartupPhase = true
     private var statusItem: NSStatusItem?
     private var popover: NSPopover?
-
+ 
     override init() {
+        do {
+            let container = try ModelContainer(for: MirrorDevice.self, ChargingSession.self, PortSample.self, ControlEvent.self)
+            self.modelContainer = container
+        } catch {
+            fatalError("Failed to initialize SwiftData ModelContainer: \(error)")
+        }
+        
         super.init()
         self.updaterController = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+        
+        // Configure store immediately using the mainContext of the strongly held container
+        store.configure(modelContext: modelContainer.mainContext)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         ProcessInfo.processInfo.disableSuddenTermination()
         if UserDefaults.standard.object(forKey: showInDockKey) == nil {
             UserDefaults.standard.set(true, forKey: showInDockKey)
-        }
-        
-        // Ensure the SwiftData container is loaded and store is configured at launch
-        let container = try? SwiftData.ModelContainer(for: MirrorDevice.self, ChargingSession.self, PortSample.self, ControlEvent.self)
-        if let container = container {
-            store.configure(modelContext: container.mainContext)
         }
         
         updateDockPolicy(restoringVisibleWindows: false)
@@ -218,9 +218,8 @@ final class CandyMonitorAppDelegate: NSObject, NSApplicationDelegate {
     @objc private func togglePopover(_ sender: AnyObject?) {
         guard let button = statusItem?.button else { return }
         if popover == nil {
-            let container = try? SwiftData.ModelContainer(for: MirrorDevice.self, ChargingSession.self, PortSample.self, ControlEvent.self)
             let view = CandyMenuBarView(store: store)
-                .modelContainer(container!)
+                .modelContainer(modelContainer)
             let popover = NSPopover()
             popover.contentSize = NSSize(width: 390, height: 500)
             popover.behavior = .transient
