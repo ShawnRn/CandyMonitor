@@ -3386,10 +3386,20 @@ struct MenuBarPowerLabel: View {
 }
 
 struct MenuBarStatusLabel: View {
+    @Environment(\.openWindow) private var openWindow
     let store: MonitorStore
 
     var body: some View {
         Image(nsImage: renderedCandyPowerImage)
+            .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("OpenMainWindowNotification"))) { _ in
+                openWindow(id: "main")
+                DispatchQueue.main.async {
+                    if let window = NSApp.windows.first(where: { $0.canBecomeMain && $0.styleMask.contains(.titled) }) {
+                        window.makeKeyAndOrderFront(nil)
+                        NSApp.activate(ignoringOtherApps: true)
+                    }
+                }
+            }
     }
 
     private var renderedCandyPowerImage: NSImage {
@@ -3505,15 +3515,6 @@ struct CandyMenuBarView: View {
         .tint(CandyTheme.syrup)
         .accentColor(CandyTheme.syrup)
         .background(MenuBarPreviewWindowHost(preview: $hoverPreview, anchorRect: $hoverAnchorRect, isHovering: $isHoveringPreviewWindow))
-        .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("OpenMainWindowNotification"))) { _ in
-            openWindow(id: "main")
-            DispatchQueue.main.async {
-                if let window = NSApp.windows.first(where: { $0.canBecomeMain && $0.styleMask.contains(.titled) }) {
-                    window.makeKeyAndOrderFront(nil)
-                    NSApp.activate(ignoringOtherApps: true)
-                }
-            }
-        }
     }
 
     private var header: some View {
