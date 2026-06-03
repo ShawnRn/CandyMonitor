@@ -464,69 +464,72 @@ private struct NativeMonitorView: View {
             }
 
             if store.activeChargingSessions.isEmpty == false {
-                VStack(alignment: .leading, spacing: 10) {
+                let sessionsList = VStack(alignment: .leading, spacing: 6) {
                     ForEach(store.activeChargingSessions) { session in
-                        VStack(alignment: .leading, spacing: 8) {
-                            HStack(alignment: .center, spacing: 6) {
-                                // 端口标识
-                                Text(session.portName)
-                                    .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                    .foregroundStyle(.white)
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 2)
-                                    .background(CandyTheme.syrup, in: RoundedRectangle(cornerRadius: 4, style: .continuous))
+                        HStack(alignment: .center, spacing: 8) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                HStack(spacing: 6) {
+                                    // 端口标识
+                                    Text(session.portName)
+                                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                                        .foregroundStyle(.white)
+                                        .padding(.horizontal, 5)
+                                        .padding(.vertical, 1.5)
+                                        .background(CandyTheme.syrup, in: RoundedRectangle(cornerRadius: 3.5, style: .continuous))
+                                    
+                                    Text(session.displayTitle)
+                                        .font(.system(size: 12, weight: .semibold))
+                                        .lineLimit(1)
+                                }
                                 
-                                Text(session.displayTitle)
-                                    .font(.system(size: 13, weight: .semibold))
-                                    .lineLimit(1)
-                                
-                                Spacer()
-                            }
-                            
-                            // 数据遥测网格 (Telemetry Grid)
-                            HStack(spacing: 12) {
+                                // 数据遥测
                                 HStack(spacing: 4) {
-                                    Image(systemName: "circle.dotted")
-                                        .font(.system(size: 10))
-                                        .foregroundStyle(.secondary)
                                     Text("已采 \(session.sampleCount) 点")
-                                        .font(.system(size: 11, design: .monospaced))
-                                        .foregroundStyle(.secondary)
-                                }
-                                
-                                HStack(spacing: 4) {
-                                    Image(systemName: "clock")
-                                        .font(.system(size: 10))
-                                        .foregroundStyle(.secondary)
+                                    Text("•")
+                                        .foregroundStyle(.tertiary)
                                     Text("已录 \(Int(Date().timeIntervalSince(session.startedAt) / 60)) 分钟")
-                                        .font(.system(size: 11, design: .monospaced))
-                                        .foregroundStyle(.secondary)
                                 }
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.85)
                             }
-                            .padding(.leading, 2)
                             
-                            // 操作按钮
-                            HStack(spacing: 8) {
-                                Spacer()
-                                
+                            Spacer(minLength: 4)
+                            
+                            // 操作按钮 (Icon Only)
+                            HStack(spacing: 5) {
                                 Button {
                                     store.selectSession(session)
                                     store.selectedSection = .sessions
                                 } label: {
-                                    Label("查看曲线", systemImage: "chart.xyaxis.line")
+                                    Image(systemName: "chart.xyaxis.line")
+                                        .font(.system(size: 11, weight: .medium))
                                 }
-                                .buttonStyle(CandyModernMiniButtonStyle())
+                                .buttonStyle(CandyModernMiniButtonStyle(isIconOnly: true))
+                                .help("查看曲线")
                                 
-                                SessionExportMenu(store: store, session: session, compact: true, style: .mini)
+                                SessionExportMenu(store: store, session: session, compact: true, style: .mini, iconOnly: true)
+                                    .help("导出")
                             }
                         }
-                        .padding(10)
-                        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .padding(.vertical, 8)
+                        .padding(.horizontal, 10)
+                        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                         .overlay {
-                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
                                 .stroke(Color.primary.opacity(0.06), lineWidth: 1)
                         }
                     }
+                }
+                
+                if fillsHeight {
+                    ScrollView(.vertical, showsIndicators: true) {
+                        sessionsList
+                            .padding(.trailing, 2)
+                    }
+                } else {
+                    sessionsList
                 }
             } else {
                 VStack(alignment: .leading, spacing: 6) {
@@ -2237,6 +2240,7 @@ private struct SessionExportMenu: View {
     let session: ChargingSession
     var compact = false
     var style: ExportMenuStyle = .prominent
+    var iconOnly = false
 
     var body: some View {
         switch style {
@@ -2245,7 +2249,7 @@ private struct SessionExportMenu: View {
                 .buttonStyle(SoftButtonStyle(prominent: true))
         case .mini:
             menuView
-                .buttonStyle(CandyModernMiniButtonStyle())
+                .buttonStyle(CandyModernMiniButtonStyle(isIconOnly: iconOnly))
         case .plain:
             menuView
         }
@@ -2270,9 +2274,14 @@ private struct SessionExportMenu: View {
                 Label("分享图", systemImage: "photo")
             }
         } label: {
-            Label("导出", systemImage: "square.and.arrow.up")
-                .labelStyle(.titleAndIcon)
-                .frame(minWidth: compact ? 70 : 76)
+            if iconOnly {
+                Image(systemName: "square.and.arrow.up")
+                    .font(.system(size: 11, weight: .medium))
+            } else {
+                Label("导出", systemImage: "square.and.arrow.up")
+                    .labelStyle(.titleAndIcon)
+                    .frame(minWidth: compact ? 70 : 76)
+            }
         }
     }
 }
@@ -3252,12 +3261,13 @@ private struct SoftButtonStyle: ButtonStyle {
 
 private struct CandyModernMiniButtonStyle: ButtonStyle {
     @State private var isHovered = false
+    var isIconOnly = false
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 11, weight: .medium))
-            .padding(.horizontal, 8)
-            .frame(height: 24)
+            .padding(.horizontal, isIconOnly ? 0 : 8)
+            .frame(width: isIconOnly ? 24 : nil, height: 24)
             .foregroundStyle(CandyTheme.syrup)
             .background(
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
