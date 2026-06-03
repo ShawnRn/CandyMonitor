@@ -48,6 +48,13 @@ final class CandyMonitorAppDelegate: NSObject, NSApplicationDelegate {
         if UserDefaults.standard.object(forKey: showInDockKey) == nil {
             UserDefaults.standard.set(true, forKey: showInDockKey)
         }
+        
+        // Ensure the SwiftData container is loaded and store is configured at launch
+        let container = try? SwiftData.ModelContainer(for: MirrorDevice.self, ChargingSession.self, PortSample.self, ControlEvent.self)
+        if let container = container {
+            store.configure(modelContext: container.mainContext)
+        }
+        
         updateDockPolicy(restoringVisibleWindows: false)
         NotificationCenter.default.addObserver(
             self,
@@ -147,8 +154,7 @@ final class CandyMonitorAppDelegate: NSObject, NSApplicationDelegate {
     private func setupMenuBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem?.button {
-            button.image = NSImage(named: "CandyMenuBarIconBlack")
-            button.image?.isTemplate = true
+            button.image = renderedCandyPowerImage(totalPowerW: store.totalPowerW)
             button.action = #selector(togglePopover(_:))
             button.target = self
         }
@@ -156,32 +162,57 @@ final class CandyMonitorAppDelegate: NSObject, NSApplicationDelegate {
         let popover = NSPopover()
         popover.contentSize = NSSize(width: 390, height: 500)
         popover.behavior = .transient
-        // Important: we must pass modelContainer explicitly to NSHostingController if we don't inject it here,
-        // but CandyMenuBarView already uses @Environment(\.modelContext) which requires it.
-        // To fix this cleanly, we can inject modelContainer in NSHostingController if needed, 
-        // but ContentView sets it. We will wrap CandyMenuBarView in a modelContainer setup.
         
-        // Setup power observer
+        // Setup power observer to update the custom rendered image
         Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self = self, let button = self.statusItem?.button else { return }
-            let power = self.store.totalPowerW
-            if power > 0.0 {
-                if power >= 100 {
-                    button.title = "\(Int(power.rounded()))W"
-                } else {
-                    button.title = String(format: "%.1fW", power)
-                }
-                button.font = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
-                button.image = NSImage(named: "CandyMenuBarIconBlack")
-                button.image?.isTemplate = true
-                button.imagePosition = .imageLeft
-            } else {
-                button.title = ""
-                button.image = NSImage(named: "CandyMenuBarIconBlack")
-                button.image?.isTemplate = true
-                button.imagePosition = .imageOnly
-            }
+            button.image = self.renderedCandyPowerImage(totalPowerW: self.store.totalPowerW)
         }
+    }
+
+    private func renderedCandyPowerImage(totalPowerW: Double) -> NSImage {
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
+        // Foreground color is black for the template mask (macOS will tint it automatically)
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: NSColor.black
+        ]
+        
+        let powerText: String
+        if totalPowerW >= 100 {
+            powerText = "\(Int(totalPowerW.rounded()))W"
+        } else {
+            powerText = String(format: "%.1fW", totalPowerW)
+        }
+        
+        let text = powerText as NSString
+        let textSize = text.size(withAttributes: attributes)
+        let iconSize = NSSize(width: 20, height: 12)
+        let spacing: CGFloat = 5
+        let height: CGFloat = 18
+        let width = ceil(iconSize.width + spacing + textSize.width)
+        let image = NSImage(size: NSSize(width: width, height: height))
+
+        image.lockFocus()
+        NSColor.clear.setFill()
+        NSRect(origin: .zero, size: image.size).fill()
+
+        if let icon = NSImage(named: "CandyMenuBarIconBlack") {
+            icon.draw(in: NSRect(
+                x: 0,
+                y: floor((height - iconSize.height) / 2) + 1,
+                width: iconSize.width,
+                height: iconSize.height
+            ))
+        }
+
+        text.draw(at: NSPoint(
+            x: iconSize.width + spacing,
+            y: floor((height - textSize.height) / 2) + 1
+        ), withAttributes: attributes)
+        image.unlockFocus()
+        image.isTemplate = true
+        return image
     }
 
     @objc private func togglePopover(_ sender: AnyObject?) {
