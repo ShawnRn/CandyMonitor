@@ -153,89 +153,49 @@ final class CandyMonitorAppDelegate: NSObject, NSApplicationDelegate {
 
     private func setupMenuBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        updateMenuBarItem()
+        
         if let button = statusItem?.button {
-            button.image = renderedCandyPowerImage(totalPowerW: store.totalPowerW)
             button.action = #selector(togglePopover(_:))
             button.target = self
         }
 
-        // 定时 1 秒更新菜单栏电量渲染图
+        // 定时 1 秒更新菜单栏电量与图标
         Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            guard let self = self, let button = self.statusItem?.button else { return }
-            button.image = self.renderedCandyPowerImage(totalPowerW: self.store.totalPowerW)
+            self?.updateMenuBarItem()
         }
     }
 
-    private func renderedCandyPowerImage(totalPowerW: Double) -> NSImage {
-        let font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .foregroundColor: NSColor.black
-        ]
-        
-        let iconSize = NSSize(width: 20, height: 12)
-        let height: CGFloat = 18
+    private func updateMenuBarItem() {
+        guard let button = statusItem?.button else { return }
+        let power = store.totalPowerW
         
         // 防御性 fallback 图标加载，即使 Asset 图标未加载成功也必定能使用系统 SF Symbol 渲染出闪电图标
-        let iconImage: NSImage
+        let iconImage: NSImage?
         if let customIcon = NSImage(named: "CandyMenuBarIconBlack") {
             iconImage = customIcon
-        } else if #available(macOS 11.0, *), let systemIcon = NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: nil) {
-            iconImage = systemIcon
+        } else if #available(macOS 11.0, *) {
+            iconImage = NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: nil)
         } else {
-            iconImage = NSImage()
+            iconImage = nil
         }
-
-        if totalPowerW > 0.0 {
+        
+        button.image = iconImage
+        button.image?.isTemplate = true
+        
+        if power > 0.0 {
             let powerText: String
-            if totalPowerW >= 100 {
-                powerText = "\(Int(totalPowerW.rounded()))W"
+            if power >= 100 {
+                powerText = "\(Int(power.rounded()))W"
             } else {
-                powerText = String(format: "%.1fW", totalPowerW)
+                powerText = String(format: "%.1fW", power)
             }
-            
-            let text = powerText as NSString
-            let textSize = text.size(withAttributes: attributes)
-            let spacing: CGFloat = 5
-            let width = ceil(iconSize.width + spacing + textSize.width)
-            let image = NSImage(size: NSSize(width: width, height: height))
-
-            image.lockFocus()
-            NSColor.clear.setFill()
-            NSRect(origin: .zero, size: image.size).fill()
-
-            iconImage.draw(in: NSRect(
-                x: 0,
-                y: floor((height - iconSize.height) / 2) + 1,
-                width: iconSize.width,
-                height: iconSize.height
-            ))
-
-            text.draw(at: NSPoint(
-                x: iconSize.width + spacing,
-                y: floor((height - textSize.height) / 2) + 1
-            ), withAttributes: attributes)
-            image.unlockFocus()
-            image.isTemplate = true
-            return image
+            button.title = powerText
+            button.font = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
+            button.imagePosition = .imageLeft
         } else {
-            let width = iconSize.width
-            let image = NSImage(size: NSSize(width: width, height: height))
-
-            image.lockFocus()
-            NSColor.clear.setFill()
-            NSRect(origin: .zero, size: image.size).fill()
-
-            iconImage.draw(in: NSRect(
-                x: 0,
-                y: floor((height - iconSize.height) / 2) + 1,
-                width: iconSize.width,
-                height: iconSize.height
-            ))
-
-            image.unlockFocus()
-            image.isTemplate = true
-            return image
+            button.title = ""
+            button.imagePosition = .imageOnly
         }
     }
 
