@@ -3,13 +3,13 @@
     <channel>
         <title>CandyMonitor</title>
         <item>
-            <title>1.0.14</title>
-            <pubDate>Wed, 03 Jun 2026 23:32:14 +0800</pubDate>
-            <sparkle:version>19</sparkle:version>
-            <sparkle:shortVersionString>1.0.14</sparkle:shortVersionString>
+            <title>1.0.15</title>
+            <pubDate>Tue, 09 Jun 2026 15:29:08 +0800</pubDate>
+            <sparkle:version>20</sparkle:version>
+            <sparkle:shortVersionString>1.0.15</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <enclosure url="https://github.com/ShawnRn/CandyMonitor/releases/download/v1.0.14/CandyMonitor_1.0.14_arm64.dmg" type="application/octet-stream" sparkle:os="macos" sparkle:nativeArchitecture="arm64" sparkle:edSignature="LZ05hRaacxtFZUDYIqF9/0qGSlhmaePuLcwvMm0AyY5mcjo4rmmOjUb9J8Re5hA/6XB032Fgq4fBy4RHyggHDw==" length="5918991"/>
-            <enclosure url="https://github.com/ShawnRn/CandyMonitor/releases/download/v1.0.14/CandyMonitor_1.0.14_x86_64.dmg" type="application/octet-stream" sparkle:os="macos" sparkle:nativeArchitecture="x86_64" sparkle:edSignature="Z6gww8tnyDyebnMjh/Dw34EzPyPoNVZ/xGxm4NSA4vceI661iD2SJzxM8dT82kTYGln0+tPyjXSYCCEzzMajDQ==" length="6002479"/>
+            <enclosure url="https://github.com/ShawnRn/CandyMonitor/releases/download/v1.0.15/CandyMonitor_1.0.15_arm64.dmg" type="application/octet-stream" sparkle:os="macos" sparkle:nativeArchitecture="arm64" sparkle:edSignature="ilzUSxrue+1FRCuSB70kO+J3ekJZ5Sedyl/+ZPLb4DFp6b8i2agRYi94BCRbLaRQBEr781VqcX9sAB4mV+KwAg==" length="5936429"/>
+            <enclosure url="https://github.com/ShawnRn/CandyMonitor/releases/download/v1.0.15/CandyMonitor_1.0.15_x86_64.dmg" type="application/octet-stream" sparkle:os="macos" sparkle:nativeArchitecture="x86_64" sparkle:edSignature="CvdLJeCgcx3NMFTm2fKxKTKevxhYtOKUO9zsf8XXf92wQYwdseqUUP8ytS0tqGi38QoJHeGgxIUhwFn6p1crBA==" length="6019222"/>
         </item>
     </channel>
 </rss>
