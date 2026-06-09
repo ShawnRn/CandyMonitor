@@ -405,7 +405,7 @@ private struct NativeMonitorView: View {
         )
     }
 
-    private var dashboardHeight: CGFloat { 394 }
+    private var dashboardHeight: CGFloat { 408 }
 
     private var chartPanel: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -745,52 +745,69 @@ private struct MirrorPowerTopologyPanel: View {
                     .foregroundStyle(CandyTheme.syrup)
             }
 
-            HStack(spacing: 10) {
-                ForEach(ports) { port in
-                    MirrorPortTile(
-                        port: port,
-                        isSelected: selectedPortIDs.isEmpty || selectedPortIDs.contains(port.port.index)
-                    ) {
-                        selectPort(port)
-                    } toggle: {
-                        togglePort(port.port.index)
-                    }
-                }
-            }
-
-            ZStack(alignment: .bottom) {
-                GeometryReader { proxy in
-                    ForEach(Array(ports.enumerated()), id: \.element.id) { index, port in
-                        MirrorCablePath(index: index, total: max(ports.count, 1))
-                            .stroke(cableStrokeColor(for: port), style: cableStrokeStyle(for: port))
-                            .frame(width: proxy.size.width, height: proxy.size.height)
-                    }
-                }
-                .allowsHitTesting(false)
-
-                HStack(alignment: .bottom) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        MirrorLegend()
-                        HStack(spacing: 8) {
-                            Image(systemName: "hourglass")
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.white)
-                                .frame(width: 20, height: 20)
-                                .background(.secondary.opacity(0.55), in: Circle())
-                            Text(totalPowerW > 0.5 ? "供电中" : "待机中")
-                                .font(.callout.weight(.semibold))
-                        }
+            if ports.isEmpty {
+                Spacer()
+                HStack {
+                    Spacer()
+                    VStack(spacing: 16) {
+                        ProgressView()
+                            .controlSize(.regular)
+                        Text("正在获取端口拓扑...")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
                     }
                     Spacer()
-                    MirrorChargerIllustration(productFamily: productFamily)
-                        .frame(width: MirrorTopologyLayout.chargerWidth, height: MirrorTopologyLayout.chargerHeight)
                 }
-                .padding(.horizontal, 8)
-                .padding(.bottom, MirrorTopologyLayout.chargerBottomPadding)
+                Spacer()
+            } else {
+                HStack(spacing: 10) {
+                    ForEach(ports) { port in
+                        MirrorPortTile(
+                            port: port,
+                            isSelected: selectedPortIDs.isEmpty || selectedPortIDs.contains(port.port.index)
+                        ) {
+                            selectPort(port)
+                        } toggle: {
+                            togglePort(port.port.index)
+                        }
+                    }
+                }
+
+                ZStack(alignment: .bottom) {
+                    GeometryReader { proxy in
+                        ForEach(Array(ports.enumerated()), id: \.element.id) { index, port in
+                            MirrorCablePath(index: index, total: max(ports.count, 1))
+                                .stroke(cableStrokeColor(for: port), style: cableStrokeStyle(for: port))
+                                .frame(width: proxy.size.width, height: proxy.size.height)
+                        }
+                    }
+                    .allowsHitTesting(false)
+
+                    HStack(alignment: .bottom) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            MirrorLegend()
+                            HStack(spacing: 8) {
+                                Image(systemName: "hourglass")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.white)
+                                    .frame(width: 20, height: 20)
+                                    .background(.secondary.opacity(0.55), in: Circle())
+                                Text(totalPowerW > 0.5 ? "供电中" : "待机中")
+                                    .font(.callout.weight(.semibold))
+                            }
+                        }
+                        Spacer()
+                        MirrorChargerIllustration(productFamily: productFamily)
+                            .frame(width: MirrorTopologyLayout.chargerWidth, height: MirrorTopologyLayout.chargerHeight)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, MirrorTopologyLayout.chargerBottomPadding)
+                }
+                .frame(height: 204)
             }
-            .frame(height: 204)
         }
         .padding(14)
+        .frame(maxHeight: .infinity, alignment: .topLeading)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
@@ -3405,7 +3422,7 @@ struct MenuBarStatusLabel: View {
     private var renderedCandyPowerImage: NSImage {
         let power = store.totalPowerW
         let iconSize = NSSize(width: 20, height: 12)
-        let height: CGFloat = 18
+        let height: CGFloat = 22
         
         let iconImage: NSImage
         if let customIcon = NSImage(named: "CandyMenuBarIconBlack") {
@@ -3416,7 +3433,7 @@ struct MenuBarStatusLabel: View {
             iconImage = NSImage()
         }
 
-        if power > 0.0 {
+        if power > 0.5 {
             let font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
             let attributes: [NSAttributedString.Key: Any] = [
                 .font: font,
@@ -3440,14 +3457,14 @@ struct MenuBarStatusLabel: View {
             
             iconImage.draw(in: NSRect(
                 x: 0,
-                y: floor((height - iconSize.height) / 2) + 1,
+                y: floor((height - iconSize.height) / 2),
                 width: iconSize.width,
                 height: iconSize.height
             ))
             
             text.draw(at: NSPoint(
                 x: iconSize.width + spacing,
-                y: floor((height - textSize.height) / 2) + 1
+                y: floor((height - textSize.height) / 2)
             ), withAttributes: attributes)
             
             image.unlockFocus()
@@ -3462,7 +3479,7 @@ struct MenuBarStatusLabel: View {
             
             iconImage.draw(in: NSRect(
                 x: 0,
-                y: floor((height - iconSize.height) / 2) + 1,
+                y: floor((height - iconSize.height) / 2),
                 width: iconSize.width,
                 height: iconSize.height
             ))

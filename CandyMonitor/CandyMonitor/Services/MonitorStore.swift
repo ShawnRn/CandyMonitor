@@ -57,23 +57,12 @@ final class MonitorStore {
     }
 
     var currentPollingInterval: TimeInterval {
-        // 如果有活跃录制 Session，必须保持 1 秒刷新以高频记录充电曲线
-        if !activeChargingSessions.isEmpty {
-            return 1.0
-        }
-        
-        // 如果当前有端口已连接负载，且我们在实时监控页面，也保持 1 秒
-        let hasConnectedLoad = livePorts.contains(where: { $0.connected })
-        if hasConnectedLoad && isRealtimeRefreshEnabled {
-            return 1.0
-        }
-        
-        // 如果没有活跃 session，也没有连接负载，但我们在前台实时监控页面，可以降频到 3.0 秒 (待机时没必要 1 秒)
+        // 如果开启了实时刷新，保持 1.0 秒以快速响应插入设备和状态变化
         if isRealtimeRefreshEnabled {
-            return 3.0
+            return 1.0
         }
         
-        // 否则（比如应用在后台，或者在非 monitor 页面），采用 30 秒轮询
+        // 否则（比如非实时状态），采用 30.0 秒轮询
         return 30.0
     }
 
@@ -247,23 +236,11 @@ final class MonitorStore {
             return
         }
 
-        // If a polling task is actively running, don't kill it.
-        // Only restart if the task is gone/cancelled, or if we're truly stale
-        // (meaning we *had* a refresh but it stopped updating).
-        let taskAlive = pollingTask != nil && pollingTask?.isCancelled == false
-        let isStale: Bool
-        if let lastRefreshedAt {
-            isStale = Date().timeIntervalSince(lastRefreshedAt) > (isRealtimeRefreshEnabled ? 12 : 75)
-        } else {
-            // Never refreshed yet — only restart if the task isn't running
-            isStale = !taskAlive
-        }
-
-        if !taskAlive || isStale {
+        let taskAlive = pollingTask != nil
+        if !taskAlive {
             diagnosticLog.record("polling_watchdog_restart", metadata: [
                 "reason": reason,
-                "stale": "\(isStale)",
-                "task_alive": "\(taskAlive)",
+                "task_alive": "false",
                 "last_refresh": lastRefreshedAt?.ISO8601Format() ?? "-"
             ])
             restartPollingIfNeeded()
@@ -808,6 +785,11 @@ final class MonitorStore {
     }
 
     private func pollingLoop(device: DeviceSnapshot) async {
+        defer {
+            if selectedDeviceID != device.id || pollingTask?.isCancelled == true {
+                pollingTask = nil
+            }
+        }
         connectionState = .connecting
         var backoff = reconnectDelay
 

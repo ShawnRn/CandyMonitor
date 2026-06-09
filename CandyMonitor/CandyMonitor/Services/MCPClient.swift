@@ -188,12 +188,23 @@ actor MCPClient {
         ])
         guard let result = response["result"] as? [String: Any],
               let content = result["content"] as? [[String: Any]],
-              let text = content.first?["text"] as? String,
-              let data = text.data(using: .utf8),
-              let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+              let text = content.first?["text"] as? String else {
             throw MCPError.invalidToolResponse(name)
         }
-        return object
+        
+        guard let data = text.data(using: .utf8) else {
+            throw MCPError.invalidToolResponse(name)
+        }
+        
+        do {
+            guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw MCPError.invalidToolResponse(name)
+            }
+            return object
+        } catch {
+            NSLog("MCPClient JSON parse failed for tool %@. Content text: %@. Error: %@", name, text, error.localizedDescription)
+            throw error
+        }
     }
 
     private static func extractToken(from object: [String: Any]) -> String? {
