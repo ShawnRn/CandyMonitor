@@ -40,7 +40,7 @@ enum ConnectionState: Equatable {
         case .idle: "未连接"
         case .connecting: "连接中"
         case .connected: "已连接"
-        case .failed: "连接失败"
+        case .failed(let msg): msg
         }
     }
 

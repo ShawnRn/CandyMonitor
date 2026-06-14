@@ -5,9 +5,14 @@ enum KeychainStore {
     private static let directoryName = "CandyMonitor"
     private static let storeName = "mcp-vault"
     private static let iotJWTSuffix = ".iot-ws-jwt"
+    private static let lanURLSuffix = ".lan-url"
 
     static func saveMCPURL(_ url: String, account: String) throws {
         try saveSecret(url, account: account)
+    }
+
+    static func saveLANURL(_ url: String, account: String) throws {
+        try saveSecret(url, account: account + lanURLSuffix)
     }
 
     static func saveIOTGatewayJWT(_ jwt: String, account: String) throws {
@@ -22,6 +27,10 @@ enum KeychainStore {
 
     static func loadMCPURL(account: String) throws -> String? {
         try loadSecret(account: account, migrateWith: saveMCPURL)
+    }
+
+    static func loadLANURL(account: String) throws -> String? {
+        try loadSecret(account: account + lanURLSuffix, migrateWith: saveLANURL)
     }
 
     static func loadIOTGatewayJWT(account: String) throws -> String? {
@@ -56,6 +65,12 @@ enum KeychainStore {
 
     static func deleteMCPURL(account: String) {
         for url in candidateFileURLs(for: account) {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    static func deleteLANURL(account: String) {
+        for url in candidateFileURLs(for: account + lanURLSuffix) {
             try? FileManager.default.removeItem(at: url)
         }
     }

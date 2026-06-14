@@ -18,15 +18,16 @@ struct ContentView: View {
             detail
                 .frame(minWidth: 760, minHeight: 540)
                 .background(Color(nsColor: .windowBackgroundColor))
-                .toolbar {
-                    ToolbarItem(placement: .primaryAction) {
-                        Button {
-                            store.isShowingAddDevice = true
-                        } label: {
-                            Label("添加设备", systemImage: "plus")
-                        }
-                    }
+        }
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    store.isShowingAddDevice = true
+                } label: {
+                    Label("添加设备", systemImage: "plus")
                 }
+                .id("add-device-toolbar-btn")
+            }
         }
         .task {
             store.configure(modelContext: modelContext)
@@ -2867,6 +2868,7 @@ private enum PendingControl: Identifiable {
 private enum SettingsField: Hashable {
     case name
     case url
+    case lanURL
     case iotJWT
 }
 
@@ -2876,6 +2878,7 @@ private struct SettingsView: View {
     @State private var launchAtLogin = false
     @State private var editingName = ""
     @State private var editingURL = ""
+    @State private var editingLAN = ""
     @State private var editingIOTJWT = ""
     @State private var isSaving = false
     @FocusState private var focusedField: SettingsField?
@@ -2921,10 +2924,13 @@ private struct SettingsView: View {
                             }
                         }
 
-                        SettingsCard(title: "MCP 与小程序 WS", icon: "network", subtitle: "MCP SSE 负责控制与兜底读取；小程序同源 WS JWT 用来接入实时 PD status。") {
-                            TextField("https://.../sse", text: $editingURL)
+                        SettingsCard(title: "网络连接地址", icon: "network", subtitle: "可分别或同时填写 MCP 与局域网（LAN）地址。同时填写时优先使用局域网数据源。") {
+                            TextField("MCP SSE 地址，例如 https://.../sse（可选）", text: $editingURL)
                                 .textFieldStyle(.roundedBorder)
                                 .focused($focusedField, equals: .url)
+                            TextField("局域网地址，例如 http://192.168.31.200/ 或 IP 地址（可选）", text: $editingLAN)
+                                .textFieldStyle(.roundedBorder)
+                                .focused($focusedField, equals: .lanURL)
                             SecureField("小程序 IOT WS JWT（可选）", text: $editingIOTJWT)
                                 .textFieldStyle(.roundedBorder)
                                 .focused($focusedField, equals: .iotJWT)
@@ -2939,7 +2945,7 @@ private struct SettingsView: View {
                                     Label(isSaving ? "校验中" : "保存并校验", systemImage: "checkmark.shield")
                                 }
                                 .buttonStyle(SoftButtonStyle(prominent: true))
-                                .disabled(isSaving || editingURL.isEmpty)
+                                .disabled(isSaving || (editingURL.isEmpty && editingLAN.isEmpty))
 
                                 Button {
                                     Task { await store.refreshSelectedDeviceNow() }
@@ -3050,6 +3056,7 @@ private struct SettingsView: View {
         guard let device = store.selectedDevice else { return }
         editingName = device.name
         editingURL = store.mcpURL(for: device)
+        editingLAN = store.lanURL(for: device)
         editingIOTJWT = store.iotGatewayJWT(for: device)
         launchAtLogin = (SMAppService.mainApp.status == .enabled)
     }
@@ -3057,7 +3064,7 @@ private struct SettingsView: View {
     private func save(_ device: MirrorDevice) async {
         isSaving = true
         defer { isSaving = false }
-        try? await store.updateDevice(device, name: editingName, sseURLString: editingURL, iotJWTString: editingIOTJWT)
+        try? await store.updateDevice(device, name: editingName, sseURLString: editingURL, lanURLString: editingLAN, iotJWTString: editingIOTJWT)
     }
 
     private func commitName(_ device: MirrorDevice) {
@@ -3071,22 +3078,93 @@ private struct AddDeviceSheet: View {
     let store: MonitorStore
     @State private var name = ""
     @State private var sseURL = ""
+    @State private var lanURL = ""
     @State private var iotJWT = ""
     @State private var errorText: String?
     @State private var isSaving = false
+
+    @State private var localDevices: [IonBridgeSnapshot] = []
+    @State private var isScanning = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 6) {
                 Text("添加小电拼")
                     .font(.title2.weight(.semibold))
-                Text("填写设备昵称和 MCP SSE 地址。CandyMonitor 会先握手校验，成功后再保存。")
+                Text("可分别或同时填写 MCP 与局域网（LAN）地址。保存时会优先通过局域网进行校验。")
                     .foregroundStyle(.secondary)
             }
 
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Label("局域网发现的小电拼", systemImage: "wifi")
+                        .font(.headline)
+                        .foregroundStyle(CandyTheme.syrup)
+                    Spacer()
+                    if isScanning {
+                        ProgressView()
+                            .controlSize(.mini)
+                    } else {
+                        Button {
+                            scanLocalDevices()
+                        } label: {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                        .buttonStyle(.plain)
+                        .help("重新扫描局域网")
+                    }
+                }
+                
+                if isScanning {
+                    Text("正在扫描局域网中的小电拼...")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .padding(.vertical, 8)
+                } else if localDevices.isEmpty {
+                    Text("未发现局域网小电拼，你可以手动填写下方信息。")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .padding(.vertical, 8)
+                } else {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 12) {
+                            ForEach(localDevices, id: \.info.psn) { snapshot in
+                                Button {
+                                    selectLocalDevice(snapshot)
+                                } label: {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text(snapshot.info.deviceName ?? "小电拼 Mirror")
+                                            .font(.subheadline.weight(.medium))
+                                        Text("PSN: \(snapshot.info.psn ?? "未知")")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                        Text(snapshot.baseURL.host ?? "")
+                                            .font(.caption)
+                                            .foregroundStyle(CandyTheme.syrup)
+                                    }
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 8)
+                                    .background(Color.secondary.opacity(0.1))
+                                    .cornerRadius(8)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 8)
+                                            .stroke((lanURL.contains(snapshot.info.psn ?? "###") || lanURL.contains(snapshot.baseURL.host ?? "###")) ? CandyTheme.syrup : Color.clear, lineWidth: 1.5)
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+            }
+            .padding(.bottom, 8)
+
             TextField("设备名称，例如 Shawn’s Mirror", text: $name)
                 .textFieldStyle(.roundedBorder)
-            TextField("https://.../sse", text: $sseURL)
+            TextField("MCP SSE 地址，例如 https://.../sse（可选）", text: $sseURL)
+                .textFieldStyle(.roundedBorder)
+            TextField("局域网地址，例如 http://192.168.31.200/ 或 IP 地址（可选）", text: $lanURL)
                 .textFieldStyle(.roundedBorder)
             SecureField("小程序 IOT WS JWT（可选）", text: $iotJWT)
                 .textFieldStyle(.roundedBorder)
@@ -3107,19 +3185,46 @@ private struct AddDeviceSheet: View {
                 }
                 .keyboardShortcut(.defaultAction)
                 .buttonStyle(.borderedProminent)
-                .disabled(isSaving || sseURL.isEmpty)
+                .disabled(isSaving || (sseURL.isEmpty && lanURL.isEmpty))
             }
         }
         .padding(24)
         .frame(width: 520)
         .background(Color(nsColor: .windowBackgroundColor))
+        .onAppear {
+            scanLocalDevices()
+        }
+    }
+
+    private func scanLocalDevices() {
+        isScanning = true
+        localDevices.removeAll()
+        Task {
+            _ = await store.discoverLocalDevices { snapshot in
+                Task { @MainActor in
+                    if !self.localDevices.contains(where: { $0.info.psn == snapshot.info.psn }) {
+                        self.localDevices.append(snapshot)
+                    }
+                }
+            }
+            await MainActor.run {
+                self.isScanning = false
+            }
+        }
+    }
+
+    private func selectLocalDevice(_ snapshot: IonBridgeSnapshot) {
+        let psn = snapshot.info.psn ?? ""
+        let shortPSN = String(psn.suffix(4))
+        name = "小电拼 cp02 - \(shortPSN)"
+        lanURL = snapshot.baseURL.absoluteString
     }
 
     private func add() async {
         isSaving = true
         errorText = nil
         do {
-            try await store.addDevice(name: name, sseURLString: sseURL, iotJWTString: iotJWT)
+            try await store.addDevice(name: name, sseURLString: sseURL, lanURLString: lanURL, iotJWTString: iotJWT)
             dismiss()
         } catch {
             errorText = error.localizedDescription

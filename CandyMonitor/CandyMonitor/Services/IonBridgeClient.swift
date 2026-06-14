@@ -10,7 +10,16 @@ actor IonBridgeDiscovery {
     private var cache: [UUID: CacheEntry] = [:]
     private let cacheTTL: TimeInterval = 300
 
-    func snapshot(for deviceID: UUID, psn: String?) async -> IonBridgeSnapshot? {
+    static func parseLANURL(_ str: String) -> URL? {
+        let trimmed = str.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.isEmpty == false else { return nil }
+        if trimmed.lowercased().hasPrefix("http://") || trimmed.lowercased().hasPrefix("https://") {
+            return URL(string: trimmed)
+        }
+        return URL(string: "http://\(trimmed)")
+    }
+
+    func snapshot(for deviceID: UUID, psn: String?, lanURLString: String?) async -> IonBridgeSnapshot? {
         let now = Date()
         if let entry = cache[deviceID], entry.expiresAt > now,
            let snapshot = await IonBridgeClient(baseURL: entry.baseURL).snapshot(matchingPSN: psn) {
@@ -18,6 +27,9 @@ actor IonBridgeDiscovery {
         }
 
         var candidates: [URL] = []
+        if let lanURLString, let lanURL = Self.parseLANURL(lanURLString) {
+            candidates.append(lanURL)
+        }
         if let psn, psn.isEmpty == false {
             candidates.append(URL(string: "http://cp02-\(psn).local/")!)
         }
@@ -35,6 +47,57 @@ actor IonBridgeDiscovery {
         }
 
         return nil
+    }
+
+    func discoverAll(onFound: @escaping @Sendable (IonBridgeSnapshot) -> Void) async -> [IonBridgeSnapshot] {
+        let prefixes = Self.localIPv4Prefixes()
+        guard prefixes.isEmpty == false else { return [] }
+
+        return await withTaskGroup(of: IonBridgeSnapshot?.self) { group in
+            var results: [IonBridgeSnapshot] = []
+            var urls: [URL] = []
+            for prefix in prefixes {
+                for host in 1...254 {
+                    guard host != prefix.host else { continue }
+                    if let url = URL(string: "http://\(prefix.network).\(host)/") {
+                        urls.append(url)
+                    }
+                }
+            }
+
+            let maxConcurrentTasks = 80
+            var index = 0
+
+            while index < min(maxConcurrentTasks, urls.count) {
+                let url = urls[index]
+                group.addTask {
+                    await IonBridgeClient(baseURL: url, timeout: 1.5).snapshot(matchingPSN: nil)
+                }
+                index += 1
+            }
+
+            while index < urls.count {
+                if let snapshot = await group.next() {
+                    if let snapshot {
+                        results.append(snapshot)
+                        onFound(snapshot)
+                    }
+                }
+                let url = urls[index]
+                group.addTask {
+                    await IonBridgeClient(baseURL: url, timeout: 1.5).snapshot(matchingPSN: nil)
+                }
+                index += 1
+            }
+
+            while let snapshot = await group.next() {
+                if let snapshot {
+                    results.append(snapshot)
+                    onFound(snapshot)
+                }
+            }
+            return results
+        }
     }
 
     private func scanLAN(matchingPSN psn: String?) async -> IonBridgeSnapshot? {
@@ -62,35 +125,96 @@ actor IonBridgeDiscovery {
         }
     }
 
+    private static func getLocalIPViaUDP() -> String? {
+        let sock = socket(AF_INET, SOCK_DGRAM, 0)
+        guard sock >= 0 else { return nil }
+        defer { close(sock) }
+        
+        var sin = sockaddr_in()
+        sin.sin_family = sa_family_t(AF_INET)
+        sin.sin_addr.s_addr = inet_addr("8.8.8.8")
+        sin.sin_port = 53
+        
+        let size = socklen_t(MemoryLayout<sockaddr_in>.size)
+        var addr = sockaddr()
+        memcpy(&addr, &sin, Int(size))
+        
+        guard connect(sock, &addr, size) == 0 else { return nil }
+        
+        var localAddr = sockaddr_in()
+        var localAddrLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+        
+        guard withUnsafeMutablePointer(to: &localAddr, {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                getsockname(sock, $0, &localAddrLen)
+            }
+        }) == 0 else { return nil }
+        
+        var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+        guard inet_ntop(AF_INET, &localAddr.sin_addr, &buffer, socklen_t(INET_ADDRSTRLEN)) != nil,
+              let ip = String(validatingUTF8: buffer) else {
+            return nil
+        }
+        return ip
+    }
+
     private static func localIPv4Prefixes() -> [(network: String, host: Int)] {
-        var interfaces: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&interfaces) == 0, let first = interfaces else { return [] }
-        defer { freeifaddrs(interfaces) }
-
         var prefixes: [(network: String, host: Int)] = []
-        var cursor: UnsafeMutablePointer<ifaddrs>? = first
-        while let interface = cursor?.pointee {
-            defer { cursor = interface.ifa_next }
-            guard interface.ifa_addr.pointee.sa_family == UInt8(AF_INET),
-                  interface.ifa_flags & UInt32(IFF_LOOPBACK) == 0 else {
-                continue
+        
+        if let udpIP = getLocalIPViaUDP() {
+            let parts = udpIP.split(separator: ".").compactMap { Int($0) }
+            if parts.count == 4 {
+                let isPrivate = (parts[0] == 10) ||
+                                (parts[0] == 172 && parts[1] >= 16 && parts[1] <= 31) ||
+                                (parts[0] == 192 && parts[1] == 168)
+                if isPrivate {
+                    prefixes.append(("\(parts[0]).\(parts[1]).\(parts[2])", parts[3]))
+                }
             }
+        }
+        
+        if prefixes.isEmpty {
+            var interfaces: UnsafeMutablePointer<ifaddrs>?
+            if getifaddrs(&interfaces) == 0, let first = interfaces {
+                defer { freeifaddrs(interfaces) }
+                var cursor: UnsafeMutablePointer<ifaddrs>? = first
+                while let interface = cursor?.pointee {
+                    defer { cursor = interface.ifa_next }
+                    guard let ifa_addr = interface.ifa_addr else { continue }
+                    guard ifa_addr.pointee.sa_family == UInt8(AF_INET),
+                          interface.ifa_flags & UInt32(IFF_LOOPBACK) == 0 else {
+                        continue
+                    }
 
-            var address = interface.ifa_addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr }
-            var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
-            guard inet_ntop(AF_INET, &address, &buffer, socklen_t(INET_ADDRSTRLEN)) != nil,
-                  let ip = String(validatingUTF8: buffer) else {
-                continue
+                    var address = ifa_addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr }
+                    var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                    guard inet_ntop(AF_INET, &address, &buffer, socklen_t(INET_ADDRSTRLEN)) != nil,
+                          let ip = String(validatingUTF8: buffer) else {
+                        continue
+                    }
+                    let parts = ip.split(separator: ".").compactMap { Int($0) }
+                    guard parts.count == 4 else { continue }
+                    
+                    let isPrivate = (parts[0] == 10) ||
+                                    (parts[0] == 172 && parts[1] >= 16 && parts[1] <= 31) ||
+                                    (parts[0] == 192 && parts[1] == 168)
+                    guard isPrivate else { continue }
+                    
+                    prefixes.append(("\(parts[0]).\(parts[1]).\(parts[2])", parts[3]))
+                }
             }
-            let parts = ip.split(separator: ".").compactMap { Int($0) }
-            guard parts.count == 4 else { continue }
-            prefixes.append(("\(parts[0]).\(parts[1]).\(parts[2])", parts[3]))
         }
-        return Array(Set(prefixes.map { "\($0.network).\($0.host)" })).compactMap { value in
-            let parts = value.split(separator: ".").compactMap { Int($0) }
-            guard parts.count == 4 else { return nil }
-            return ("\(parts[0]).\(parts[1]).\(parts[2])", parts[3])
+        var uniquePrefixes: [String: Int] = [:]
+        for p in prefixes {
+            uniquePrefixes[p.network] = p.host
         }
+        
+        var result: [(network: String, host: Int)] = []
+        for (net, host) in uniquePrefixes {
+            result.append((net, host))
+        }
+        NSLog("CandyMonitor localIPv4Prefixes found: \(result)")
+        return result
     }
 }
 
@@ -280,6 +404,7 @@ struct IonBridgeClient: Sendable {
             }
             return data
         } catch {
+            NSLog("IonBridgeClient data fetch failed for URL: \(url.absoluteString). Error: \(error.localizedDescription)")
             return nil
         }
     }

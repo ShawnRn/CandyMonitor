@@ -261,7 +261,7 @@
 				CODE_SIGN_ENTITLEMENTS = CandyMonitor/CandyMonitor.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 20;
+				CURRENT_PROJECT_VERSION = 21;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readwrite;
@@ -269,11 +269,12 @@
 					INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 					INFOPLIST_KEY_NSHumanReadableCopyright = "";
 					INFOPLIST_KEY_SUFeedURL = "https://raw.githubusercontent.com/ShawnRn/CandyMonitor/main/appcast.xml";
+					INFOPLIST_KEY_NSLocalNetworkUsageDescription = "CandyMonitor 需要访问本地网络以发现和连接局域网中的小电拼 Mirror 设备，提供实时监控。";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.0.15;
+				MARKETING_VERSION = 1.0.16;
 				PRODUCT_BUNDLE_IDENTIFIER = com.shawnrain.CandyMonitor;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
@@ -294,7 +295,7 @@
 				CODE_SIGN_ENTITLEMENTS = CandyMonitor/CandyMonitor.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 20;
+				CURRENT_PROJECT_VERSION = 21;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readwrite;
@@ -302,11 +303,12 @@
 					INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 					INFOPLIST_KEY_NSHumanReadableCopyright = "";
 					INFOPLIST_KEY_SUFeedURL = "https://raw.githubusercontent.com/ShawnRn/CandyMonitor/main/appcast.xml";
+					INFOPLIST_KEY_NSLocalNetworkUsageDescription = "CandyMonitor 需要访问本地网络以发现和连接局域网中的小电拼 Mirror 设备，提供实时监控。";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.0.15;
+				MARKETING_VERSION = 1.0.16;
 				PRODUCT_BUNDLE_IDENTIFIER = com.shawnrain.CandyMonitor;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;

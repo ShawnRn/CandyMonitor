@@ -38,7 +38,7 @@ actor MCPClient {
 
         var sseRequest = URLRequest(url: sseURL)
         sseRequest.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-        sseRequest.timeoutInterval = 15
+        sseRequest.timeoutInterval = 86400
 
         let (bytes, response) = try await URLSession.shared.bytes(for: sseRequest)
         guard let httpResponse = response as? HTTPURLResponse,
@@ -192,6 +192,11 @@ actor MCPClient {
             throw MCPError.invalidToolResponse(name)
         }
         
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.contains("device may be offline") || trimmed.contains("unavailable — device may") {
+            throw MCPError.deviceOffline
+        }
+
         guard let data = text.data(using: .utf8) else {
             throw MCPError.invalidToolResponse(name)
         }
@@ -305,8 +310,8 @@ actor MCPClient {
     }
 
     private func handleSSELine(_ line: String) {
-        guard line.hasPrefix("data: ") else { return }
-        let payload = String(line.dropFirst(6)).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard line.hasPrefix("data:") else { return }
+        let payload = String(line.dropFirst(5)).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !payload.isEmpty else { return }
 
         if payload.hasPrefix("/") {
@@ -384,6 +389,7 @@ enum MCPError: LocalizedError {
     case rpc(String)
     case disconnected
     case requestTimeout
+    case deviceOffline
 
     var errorDescription: String? {
         switch self {
@@ -399,6 +405,8 @@ enum MCPError: LocalizedError {
             "MCP 连接已断开"
         case .requestTimeout:
             "MCP 请求超时"
+        case .deviceOffline:
+            "设备已离线"
         }
     }
 }

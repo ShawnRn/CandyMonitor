@@ -10,12 +10,14 @@ private struct DeviceSnapshot: Sendable {
     let name: String
     let keychainAccount: String
     let psn: String?
+    let lanURLString: String?
 
-    init(_ device: MirrorDevice) {
+    init(_ device: MirrorDevice, lanURLString: String?) {
         self.id = device.id
         self.name = device.name
         self.keychainAccount = device.keychainAccount
         self.psn = device.psn
+        self.lanURLString = lanURLString
     }
 }
 
@@ -115,7 +117,9 @@ final class MonitorStore {
     }
 
     private var selectedDeviceSnapshot: DeviceSnapshot? {
-        selectedDevice.map(DeviceSnapshot.init)
+        guard let device = selectedDevice else { return nil }
+        let lan = (try? KeychainStore.loadLANURL(account: device.keychainAccount)) ?? ""
+        return DeviceSnapshot(device, lanURLString: lan.isEmpty ? nil : lan)
     }
 
     var hasDevices: Bool {
@@ -247,18 +251,71 @@ final class MonitorStore {
         }
     }
 
-    func addDevice(name: String, sseURLString: String, iotJWTString: String = "") async throws {
-        guard let url = URL(string: sseURLString), url.scheme?.hasPrefix("http") == true else {
-            throw MonitorError.invalidURL
+    func discoverLocalDevices(onFound: @escaping @Sendable (IonBridgeSnapshot) -> Void) async -> [IonBridgeSnapshot] {
+        await ionBridgeDiscovery.discoverAll(onFound: onFound)
+    }
+
+    func addDevice(name: String, sseURLString: String, lanURLString: String, iotJWTString: String = "") async throws {
+        let trimmedSSE = sseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedLAN = lanURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        if trimmedSSE.isEmpty && trimmedLAN.isEmpty {
+            throw MonitorError.bothAddressesEmpty
         }
 
         connectionState = .connecting
-        let client = MCPClient(sseURL: url)
-        let validation = try await client.validate()
+        
+        var isLocal = false
+        var psn: String? = nil
+        var model: String? = nil
+        var productFamily: String? = nil
+        var maxPowerBudget = 160
+        var ports: [MachinePort] = []
+        
+        if !trimmedLAN.isEmpty {
+            if let lanURL = IonBridgeDiscovery.parseLANURL(trimmedLAN) {
+                if let localSnapshot = await IonBridgeClient(baseURL: lanURL, timeout: 1.5).snapshot(matchingPSN: nil) {
+                    isLocal = true
+                    psn = localSnapshot.info.psn ?? ""
+                    model = localSnapshot.info.deviceModel ?? "cp-02"
+                    productFamily = localSnapshot.info.productFamily
+                    maxPowerBudget = localSnapshot.facts.maxPowerBudget
+                    ports = localSnapshot.facts.ports
+                }
+            }
+        }
+        
+        if !isLocal && !trimmedSSE.isEmpty {
+            guard let url = URL(string: trimmedSSE), url.scheme?.hasPrefix("http") == true else {
+                throw MonitorError.invalidURL
+            }
+            let client = MCPClient(sseURL: url)
+            let validation = try await client.validate()
+            psn = validation.info.psn
+            model = validation.info.model
+            productFamily = validation.facts.productFamily
+            maxPowerBudget = validation.facts.maxPowerBudget
+            ports = validation.facts.ports
+        }
+        
+        if !isLocal && trimmedSSE.isEmpty {
+            throw MonitorError.lanConnectionFailed
+        }
+        
         let account = UUID().uuidString
-        try KeychainStore.saveMCPURL(sseURLString, account: account)
+        if !trimmedSSE.isEmpty {
+            try KeychainStore.saveMCPURL(trimmedSSE, account: account)
+        }
+        if !trimmedLAN.isEmpty {
+            try KeychainStore.saveLANURL(trimmedLAN, account: account)
+        }
+        
         let providedJWT = sanitizedIOTGatewayJWT(iotJWTString)
-        let fetchedJWT = providedJWT == nil ? (try? await client.iotGatewayJWT(psn: validation.info.psn)) : nil
+        var fetchedJWT: String? = nil
+        if !trimmedSSE.isEmpty, let url = URL(string: trimmedSSE) {
+            let client = MCPClient(sseURL: url)
+            fetchedJWT = (providedJWT == nil && !isLocal) ? (try? await client.iotGatewayJWT(psn: psn)) : nil
+        }
         if let jwt = providedJWT ?? fetchedJWT {
             try KeychainStore.saveIOTGatewayJWT(jwt, account: account)
         }
@@ -266,10 +323,10 @@ final class MonitorStore {
         let device = MirrorDevice(
             name: name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "小电拼 Mirror" : name,
             keychainAccount: account,
-            psn: validation.info.psn,
-            model: validation.info.model,
-            productFamily: validation.facts.productFamily,
-            maxPowerBudget: validation.facts.maxPowerBudget,
+            psn: psn,
+            model: model,
+            productFamily: productFamily,
+            maxPowerBudget: maxPowerBudget,
             lastSeenAt: Date()
         )
 
@@ -278,47 +335,116 @@ final class MonitorStore {
         }
         modelContext.insert(device)
         try modelContext.save()
-        clients[device.id] = client
+        
+        if !trimmedSSE.isEmpty, let url = URL(string: trimmedSSE) {
+            clients[device.id] = MCPClient(sseURL: url)
+        }
+        
         loadDevices()
         DeviceRegistry.save(devices)
         selectedDeviceID = device.id
         UserDefaults.standard.set(device.id.uuidString, forKey: selectedDeviceDefaultsKey)
         selectedSection = .monitor
-        livePorts = validation.facts.ports.map {
+        
+        if ports.isEmpty {
+            ports = (1...5).map { index in
+                MachinePort(
+                    index: index,
+                    name: index == 1 ? "A" : "C\(index - 1)",
+                    connectorType: index == 1 ? "USB-A" : "Type-C",
+                    power: index == 1 ? 30 : 140
+                )
+            }
+        }
+        
+        livePorts = ports.map {
             PortViewState(port: $0, detail: nil, pdStatus: nil, charging: false)
         }
         connectionState = .connected
         restartPollingIfNeeded()
     }
 
-    func updateDevice(_ device: MirrorDevice, name: String, sseURLString: String, iotJWTString: String) async throws {
-        guard let url = URL(string: sseURLString), url.scheme?.hasPrefix("http") == true else {
-            throw MonitorError.invalidURL
+    func updateDevice(_ device: MirrorDevice, name: String, sseURLString: String, lanURLString: String, iotJWTString: String) async throws {
+        let trimmedSSE = sseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedLAN = lanURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        if trimmedSSE.isEmpty && trimmedLAN.isEmpty {
+            throw MonitorError.bothAddressesEmpty
         }
-
-        let client = MCPClient(sseURL: url)
-        let validation = try await client.validate()
-        try KeychainStore.saveMCPURL(sseURLString, account: device.keychainAccount)
+        
+        var isLocal = false
+        var psn: String? = nil
+        var model: String? = nil
+        var productFamily: String? = nil
+        var maxPowerBudget = 160
+        
+        if !trimmedLAN.isEmpty {
+            if let lanURL = IonBridgeDiscovery.parseLANURL(trimmedLAN) {
+                if let localSnapshot = await IonBridgeClient(baseURL: lanURL, timeout: 1.5).snapshot(matchingPSN: nil) {
+                    isLocal = true
+                    psn = localSnapshot.info.psn ?? ""
+                    model = localSnapshot.info.deviceModel ?? "cp-02"
+                    productFamily = localSnapshot.info.productFamily
+                    maxPowerBudget = localSnapshot.facts.maxPowerBudget
+                }
+            }
+        }
+        
+        if !isLocal && !trimmedSSE.isEmpty {
+            guard let url = URL(string: trimmedSSE), url.scheme?.hasPrefix("http") == true else {
+                throw MonitorError.invalidURL
+            }
+            let client = MCPClient(sseURL: url)
+            let validation = try await client.validate()
+            psn = validation.info.psn
+            model = validation.info.model
+            productFamily = validation.facts.productFamily
+            maxPowerBudget = validation.facts.maxPowerBudget
+        }
+        
+        if !isLocal && trimmedSSE.isEmpty {
+            throw MonitorError.lanConnectionFailed
+        }
+        
+        if !trimmedSSE.isEmpty {
+            try KeychainStore.saveMCPURL(trimmedSSE, account: device.keychainAccount)
+        } else {
+            KeychainStore.deleteMCPURL(account: device.keychainAccount)
+        }
+        
+        if !trimmedLAN.isEmpty {
+            try KeychainStore.saveLANURL(trimmedLAN, account: device.keychainAccount)
+        } else {
+            KeychainStore.deleteLANURL(account: device.keychainAccount)
+        }
+        
         if let jwt = sanitizedIOTGatewayJWT(iotJWTString) {
             try KeychainStore.saveIOTGatewayJWT(jwt, account: device.keychainAccount)
         } else {
             KeychainStore.deleteIOTGatewayJWT(account: device.keychainAccount)
         }
+        
         if let streamClient = pdStreamClients.removeValue(forKey: device.id) {
             Task { await streamClient.disconnect() }
         }
         iotJWTFetchAttempted.remove(device.id)
 
         device.name = name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? device.name : name
-        device.psn = validation.info.psn
-        device.model = validation.info.model
-        device.productFamily = validation.facts.productFamily
-        device.maxPowerBudget = validation.facts.maxPowerBudget
+        device.psn = psn
+        device.model = model
+        device.productFamily = productFamily
+        device.maxPowerBudget = maxPowerBudget
         device.lastSeenAt = Date()
         UserDefaults.standard.set(device.id.uuidString, forKey: selectedDeviceDefaultsKey)
 
         try modelContext?.save()
-        clients[device.id] = client
+        
+        if !trimmedSSE.isEmpty, let url = URL(string: trimmedSSE) {
+            clients[device.id] = MCPClient(sseURL: url)
+        } else {
+            clients[device.id] = nil
+        }
+        
         loadDevices()
         DeviceRegistry.save(devices)
         restartPollingIfNeeded()
@@ -337,6 +463,10 @@ final class MonitorStore {
         (try? KeychainStore.loadMCPURL(account: device.keychainAccount)) ?? ""
     }
 
+    func lanURL(for device: MirrorDevice) -> String {
+        (try? KeychainStore.loadLANURL(account: device.keychainAccount)) ?? ""
+    }
+
     func iotGatewayJWT(for device: MirrorDevice) -> String {
         (try? KeychainStore.loadIOTGatewayJWT(account: device.keychainAccount)) ?? ""
     }
@@ -345,6 +475,7 @@ final class MonitorStore {
         guard let modelContext, let device = selectedDevice else { return }
         stopPolling()
         KeychainStore.deleteMCPURL(account: device.keychainAccount)
+        KeychainStore.deleteLANURL(account: device.keychainAccount)
         KeychainStore.deleteIOTGatewayJWT(account: device.keychainAccount)
         let client = clients[device.id]
         let streamClient = pdStreamClients[device.id]
@@ -714,7 +845,8 @@ final class MonitorStore {
 
     private func runControl(action: String, detail: String, operation: @escaping (MCPClient) async throws -> Void) async {
         guard let selectedDevice else { return }
-        let device = DeviceSnapshot(selectedDevice)
+        let lan = (try? KeychainStore.loadLANURL(account: selectedDevice.keychainAccount)) ?? ""
+        let device = DeviceSnapshot(selectedDevice, lanURLString: lan.isEmpty ? nil : lan)
         do {
             let client = try await client(for: device)
             try await operation(client)
@@ -815,10 +947,29 @@ final class MonitorStore {
     }
 
     private func refreshWithReconnect(device: DeviceSnapshot, reason: String) async throws {
+        let now = Date()
+        if let local = await ionBridgeDiscovery.snapshot(for: device.id, psn: device.psn, lanURLString: device.lanURLString) {
+            applyRefreshSnapshot(
+                device: device,
+                facts: local.facts,
+                details: local.details,
+                charging: local.chargingStatus,
+                temperature: local.temperatureMode,
+                pd: local.pdStatus,
+                wsPDByPort: [:],
+                at: now,
+                source: "ionbridge"
+            )
+            return
+        }
+
         do {
             let client = try await client(for: device)
             try await refreshOnce(device: device, client: client)
         } catch {
+            if let mcpErr = error as? MCPError, case .deviceOffline = mcpErr {
+                throw error
+            }
             diagnosticLog.record("refresh_attempt_failed_reconnecting", metadata: [
                 "device": device.id.uuidString,
                 "reason": reason,
@@ -836,21 +987,6 @@ final class MonitorStore {
 
     private func refreshOnce(device: DeviceSnapshot, client: MCPClient) async throws {
         let now = Date()
-        if let local = await ionBridgeDiscovery.snapshot(for: device.id, psn: device.psn) {
-            applyRefreshSnapshot(
-                device: device,
-                facts: local.facts,
-                details: local.details,
-                charging: local.chargingStatus,
-                temperature: local.temperatureMode,
-                pd: local.pdStatus,
-                wsPDByPort: [:],
-                at: now,
-                source: "ionbridge"
-            )
-            return
-        }
-
         let facts = try await machineFacts(for: device, client: client, at: now)
         
         // 1. Port details are always queried every second
@@ -1751,6 +1887,8 @@ enum MonitorError: LocalizedError {
     case invalidURL
     case storeUnavailable
     case missingMCPURL
+    case bothAddressesEmpty
+    case lanConnectionFailed
 
     var errorDescription: String? {
         switch self {
@@ -1760,6 +1898,10 @@ enum MonitorError: LocalizedError {
             "本地数据库还没有准备好"
         case .missingMCPURL:
             "找不到这台设备的 MCP 地址"
+        case .bothAddressesEmpty:
+            "MCP 和局域网地址不能同时为空"
+        case .lanConnectionFailed:
+            "无法连接到局域网设备，请检查 IP 和网络"
         }
     }
 }

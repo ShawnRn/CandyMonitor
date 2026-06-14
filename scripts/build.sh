@@ -112,14 +112,13 @@ for TARGET_ARCH in arm64 x86_64; do
   mkdir -p "$TEMP_DMG_ROOT"
   ditto --noextattr --noqtn "$ARCH_APP_BUNDLE" "$TEMP_DMG_ROOT/$APP_NAME"
   verify_sandbox_entitlement "$TEMP_DMG_ROOT/$APP_NAME"
-
-  echo "==> Creating DMG: $DMG_FINAL_PATH"
-  hdiutil create \
-    -volname "$PROJECT_NAME" \
-    -srcfolder "$TEMP_DMG_ROOT" \
-    -format UDZO \
-    -ov \
-    "$DMG_FINAL_PATH"
+  echo "==> Creating DMG using create-dmg: $DMG_FINAL_PATH"
+  rm -f "$DMG_FINAL_PATH"
+  rm -f "$RELEASE_DIR/CandyMonitor ${MARKETING_VERSION}.dmg"
+  
+  /opt/homebrew/bin/create-dmg "$TEMP_DMG_ROOT/$APP_NAME" "$RELEASE_DIR" --overwrite --no-code-sign
+  mv "$RELEASE_DIR/CandyMonitor ${MARKETING_VERSION}.dmg" "$DMG_FINAL_PATH"
+  
   codesign --force --sign "-" "$DMG_FINAL_PATH"
 
   rm -rf "$TEMP_DMG_ROOT"
