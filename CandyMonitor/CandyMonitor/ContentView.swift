@@ -3538,7 +3538,7 @@ struct MenuBarStatusLabel: View {
             iconImage = NSImage()
         }
 
-        if power > 0.5 {
+        if store.showMenuBarPower {
             let font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
             let attributes: [NSAttributedString.Key: Any] = [
                 .font: font,

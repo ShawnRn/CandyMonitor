@@ -41,7 +41,17 @@ final class MonitorStore {
     var selectedSection: AppSection = .monitor
     var connectionState: ConnectionState = .idle
     var lastError: String?
-    var livePorts: [PortViewState] = []
+    var livePorts: [PortViewState] = [] {
+        didSet {
+            let power = totalPowerW
+            if power > 0.8 {
+                showMenuBarPower = true
+            } else if power < 0.3 {
+                showMenuBarPower = false
+            }
+        }
+    }
+    var showMenuBarPower: Bool = false
     var recentSamples: [ChartSamplePoint] = []
     var sessions: [ChargingSession] = []
     var selectedSession: ChargingSession?
@@ -1243,6 +1253,12 @@ final class MonitorStore {
 
             let isAttached = port.connected
             let hasOutputPower = detail.powerW >= recordingPowerThresholdW
+            
+            // 如果物理连接还在，且被标记为 trickle stopped，但当前功率回升到 >= 2.5W，说明设备重新开始充电或大功耗，重置涓流停止状态
+            if isAttached && trickleStoppedKeys.contains(key) && detail.powerW >= 2.5 {
+                trickleStoppedKeys.remove(key)
+            }
+            
             let isTrickleStopped = trickleStoppedKeys.contains(key)
             let shouldPersistSample = activeSessions[key] != nil || (hasOutputPower && !isTrickleStopped)
             guard shouldPersistSample else { continue }
@@ -1342,7 +1358,9 @@ final class MonitorStore {
                     sessionEndedThisCycle = true
                 } else {
                     // Smart Trickle Charge / Auto-Stop check:
-                    // Retrieve up to 150 most recent samples of this session, check if average power is below 1.5W for at least 3 minutes.
+                    // Retrieve up to 150 most recent samples of this session, check if average power is below threshold for at least 3 minutes.
+                    // If peak power of activeSession >= 5.0W, consider it a phone/tablet (large device), threshold is 1.0W.
+                    // If peak power of activeSession < 5.0W, consider it a band/earbuds (low-power device), threshold is 0.3W.
                     let sessionID = activeSession.id
                     var descriptor = FetchDescriptor<PortSample>(
                         predicate: #Predicate { sample in
@@ -1357,7 +1375,8 @@ final class MonitorStore {
                             let timeSpan = newest.timestamp.timeIntervalSince(oldest.timestamp)
                             if timeSpan >= 180 { // 3 minutes
                                 let avgPower = recentSamples.map { $0.powerW }.reduce(0, +) / Double(recentSamples.count)
-                                if avgPower < 1.5 {
+                                let threshold = activeSession.peakPowerW >= 5.0 ? 1.0 : 0.3
+                                if avgPower < threshold {
                                     shouldStopForTrickle = true
                                     event = "battery_full"
                                     activeSession.finalBatteryPercent = 100
