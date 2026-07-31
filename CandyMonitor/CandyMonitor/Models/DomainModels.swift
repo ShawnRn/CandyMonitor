@@ -134,9 +134,17 @@ final class MirrorDevice {
     var psn: String?
     var model: String?
     var productFamily: String?
+    var overrideProductFamily: String?
     var maxPowerBudget: Int
     var createdAt: Date
     var lastSeenAt: Date?
+
+    var effectiveProductFamily: String? {
+        if let overrideProductFamily, !overrideProductFamily.isEmpty, overrideProductFamily != "auto" {
+            return overrideProductFamily
+        }
+        return productFamily
+    }
 
     init(
         id: UUID = UUID(),
@@ -145,6 +153,7 @@ final class MirrorDevice {
         psn: String? = nil,
         model: String? = nil,
         productFamily: String? = nil,
+        overrideProductFamily: String? = nil,
         maxPowerBudget: Int = 0,
         createdAt: Date = Date(),
         lastSeenAt: Date? = nil
@@ -155,6 +164,7 @@ final class MirrorDevice {
         self.psn = psn
         self.model = model
         self.productFamily = productFamily
+        self.overrideProductFamily = overrideProductFamily
         self.maxPowerBudget = maxPowerBudget
         self.createdAt = createdAt
         self.lastSeenAt = lastSeenAt

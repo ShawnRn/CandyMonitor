@@ -96,6 +96,7 @@ final class MonitorStore {
     @ObservationIgnored private var emaPowerW: [String: Double] = [:]
     @ObservationIgnored private var emaVoltageV: [String: Double] = [:]
     @ObservationIgnored private var emaCurrentA: [String: Double] = [:]
+    @ObservationIgnored private var lastRecordedSample: [String: (timestamp: Date, powerW: Double, voltageMV: Int, currentMA: Int, protocolName: String, batteryPercent: Double?)] = [:]
     @ObservationIgnored private var emaTemperatureScore: [String: Double] = [:]
     @ObservationIgnored private var emaLastConnected: [String: Bool] = [:]
     
@@ -241,6 +242,10 @@ final class MonitorStore {
         lowPowerSessionPrompt = nil
         connectionState = .idle
         restartPollingIfNeeded()
+    }
+
+    func persistDevices() {
+        DeviceRegistry.save(devices)
     }
 
     func ensureMonitoringActive(reason: String) {
@@ -532,6 +537,7 @@ final class MonitorStore {
                 psn: record.psn,
                 model: record.model,
                 productFamily: record.productFamily,
+                overrideProductFamily: record.overrideProductFamily,
                 maxPowerBudget: record.maxPowerBudget,
                 createdAt: record.createdAt,
                 lastSeenAt: record.lastSeenAt
@@ -1409,6 +1415,7 @@ final class MonitorStore {
                 emaCurrentA.removeValue(forKey: key)
                 emaTemperatureScore.removeValue(forKey: key)
                 emaLastConnected.removeValue(forKey: key)
+                lastRecordedSample.removeValue(forKey: key)
                 continue
             }
 
@@ -1422,31 +1429,67 @@ final class MonitorStore {
                 updateStats(session: session, with: stats)
             }
 
-            let sample = PortSample(
-                sessionID: session?.id,
-                deviceID: deviceID,
-                deviceName: deviceName,
-                timestamp: now,
-                portIndex: port.port.index,
-                portName: port.port.name,
-                connected: isAttached,
-                protocolName: detail.fcProtocol,
-                voltageMV: detail.voutMV,
-                currentMA: detail.ioutMA,
-                powerW: detail.powerW,
-                temperature: detail.dieTemperature,
-                sessionChargeMWh: detail.sessionChargeMWh,
-                batteryPercent: port.batteryPercent,
-                event: event
-            )
-            modelContext.insert(sample)
-            if sample.sessionID == selectedSession?.id {
-                selectedSessionSamples.append(sample)
-                if selectedSessionSamples.count > selectedSessionChartSampleLimit * 3 {
-                    selectedSessionSamples = downsampleSessionSamples(selectedSessionSamples)
+            let shouldRecordSample: Bool = {
+                guard let last = lastRecordedSample[key] else { return true }
+                if event != nil { return true }
+                let elapsed = now.timeIntervalSince(last.timestamp)
+                let minInterval: TimeInterval
+                if let session {
+                    let duration = now.timeIntervalSince(session.startedAt)
+                    if duration < 1800 {
+                        minInterval = 1.0
+                    } else if duration < 10800 {
+                        minInterval = 3.0
+                    } else {
+                        minInterval = 5.0
+                    }
+                } else {
+                    minInterval = 5.0
                 }
+                if elapsed >= minInterval { return true }
+                if abs(detail.powerW - last.powerW) >= 0.2 { return true }
+                if abs(Double(detail.voutMV - last.voltageMV)) >= 100 { return true }
+                if abs(Double(detail.ioutMA - last.currentMA)) >= 50 { return true }
+                if detail.fcProtocol != last.protocolName { return true }
+                if port.batteryPercent != last.batteryPercent { return true }
+                return false
+            }()
+
+            if shouldRecordSample {
+                lastRecordedSample[key] = (
+                    timestamp: now,
+                    powerW: detail.powerW,
+                    voltageMV: detail.voutMV,
+                    currentMA: detail.ioutMA,
+                    protocolName: detail.fcProtocol,
+                    batteryPercent: port.batteryPercent
+                )
+                let sample = PortSample(
+                    sessionID: session?.id,
+                    deviceID: deviceID,
+                    deviceName: deviceName,
+                    timestamp: now,
+                    portIndex: port.port.index,
+                    portName: port.port.name,
+                    connected: isAttached,
+                    protocolName: detail.fcProtocol,
+                    voltageMV: detail.voutMV,
+                    currentMA: detail.ioutMA,
+                    powerW: detail.powerW,
+                    temperature: detail.dieTemperature,
+                    sessionChargeMWh: detail.sessionChargeMWh,
+                    batteryPercent: port.batteryPercent,
+                    event: event
+                )
+                modelContext.insert(sample)
+                if sample.sessionID == selectedSession?.id {
+                    selectedSessionSamples.append(sample)
+                    if selectedSessionSamples.count > selectedSessionChartSampleLimit * 3 {
+                        selectedSessionSamples = downsampleSessionSamples(selectedSessionSamples)
+                    }
+                }
+                result.didMutateStore = true
             }
-            result.didMutateStore = true
         }
 
         for (key, sessionID) in Array(activeSessions) where observedKeys.contains(key) && attachedKeys.contains(key) == false {
@@ -1597,7 +1640,7 @@ final class MonitorStore {
                 sample.sessionID == sessionID
             }
         )
-        return ((try? modelContext.fetch(descriptor)) ?? []).count
+        return (try? modelContext.fetchCount(descriptor)) ?? 0
     }
 
     private func lastSampleDate(for session: ChargingSession) -> Date? {
@@ -1885,6 +1928,7 @@ private struct DeviceRegistryRecord: Codable {
     let psn: String?
     let model: String?
     let productFamily: String?
+    let overrideProductFamily: String?
     let maxPowerBudget: Int
     let createdAt: Date
     let lastSeenAt: Date?
@@ -1896,6 +1940,7 @@ private struct DeviceRegistryRecord: Codable {
         self.psn = device.psn
         self.model = device.model
         self.productFamily = device.productFamily
+        self.overrideProductFamily = device.overrideProductFamily
         self.maxPowerBudget = device.maxPowerBudget
         self.createdAt = device.createdAt
         self.lastSeenAt = device.lastSeenAt

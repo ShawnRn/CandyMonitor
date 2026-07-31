@@ -134,7 +134,7 @@ private struct CandySidebar: View {
                     ForEach(store.devices, id: \.id) { device in
                         SidebarRow(
                             title: device.name,
-                            subtitle: device.psn ?? device.productFamily ?? "Mirror",
+                            subtitle: device.psn ?? device.effectiveProductFamily ?? "Mirror",
                             icon: "powerplug.portrait",
                             isSelected: store.selectedDeviceID == device.id,
                             isHovered: hoveredDevice == device.id,
@@ -316,7 +316,7 @@ private struct NativeMonitorView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HeaderBar(title: "我的设备", subtitle: store.selectedDevice?.productFamily ?? "CoCan Mirror") {
+            HeaderBar(title: "我的设备", subtitle: store.selectedDevice?.effectiveProductFamily ?? "CoCan Mirror") {
                 Button {
                     store.selectedSection = .control
                 } label: {
@@ -328,7 +328,7 @@ private struct NativeMonitorView: View {
                 VStack(alignment: .leading, spacing: 12) {
                     MirrorDeviceHero(
                         deviceName: store.selectedDevice?.name ?? "AI 小电拼",
-                        productFamily: store.selectedDevice?.productFamily,
+                        productFamily: store.selectedDevice?.effectiveProductFamily,
                         connectionState: store.connectionState,
                         lastRefreshedAt: store.lastRefreshedAt,
                         temperatureMode: LocalizedTelemetry.temperatureModeLabel(store.temperatureModeLabel),
@@ -401,7 +401,7 @@ private struct NativeMonitorView: View {
             selectedPortIDs: selectedPortIDs,
             selectPort: { detailPort = $0 },
             togglePort: selectPortFilter,
-            productFamily: store.selectedDevice?.productFamily,
+            productFamily: store.selectedDevice?.effectiveProductFamily,
             maxPowerBudget: store.selectedDevice?.maxPowerBudget ?? 0
         )
     }
@@ -2873,6 +2873,7 @@ private enum SettingsField: Hashable {
 }
 
 private struct SettingsView: View {
+    @Environment(\.modelContext) private var modelContext
     let store: MonitorStore
     @AppStorage("showInDock") private var showInDock = true
     @State private var launchAtLogin = false
@@ -2918,9 +2919,18 @@ private struct SettingsView: View {
                                 Text(device.psn ?? "尚未读取")
                                     .foregroundStyle(.secondary)
                             }
-                            LabeledContent("机型") {
+                            LabeledContent("识别机型") {
                                 Text(device.model ?? device.productFamily ?? "Mirror")
                                     .foregroundStyle(.secondary)
+                            }
+                            LabeledContent("设备图示型号") {
+                                Picker("", selection: illustrationBinding(for: device)) {
+                                    Text("自动识别 (\(device.productFamily ?? "未知"))").tag("auto")
+                                    Text("CoCan Mirror").tag("Mirror")
+                                    Text("CoCan 02S").tag("02S")
+                                    Text("CoCan 02 Ultra").tag("Ultra")
+                                }
+                                .pickerStyle(.menu)
                             }
                         }
 
@@ -3070,6 +3080,21 @@ private struct SettingsView: View {
     private func commitName(_ device: MirrorDevice) {
         store.renameDevice(device, name: editingName)
         editingName = store.selectedDevice?.name ?? editingName
+    }
+
+    private func illustrationBinding(for device: MirrorDevice) -> Binding<String> {
+        Binding(
+            get: {
+                let val = device.overrideProductFamily
+                if val == "4C1A" { return "Mirror" }
+                return val ?? "auto"
+            },
+            set: { newValue in
+                device.overrideProductFamily = newValue == "auto" ? nil : newValue
+                try? modelContext.save()
+                store.persistDevices()
+            }
+        )
     }
 }
 
@@ -3655,7 +3680,7 @@ struct CandyMenuBarView: View {
                 Text(store.selectedDevice?.name ?? "CandyMonitor")
                     .font(.headline)
                     .lineLimit(1)
-                Text(store.selectedDevice?.productFamily ?? "CoCan Mirror")
+                Text(store.selectedDevice?.effectiveProductFamily ?? "CoCan Mirror")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -3700,6 +3725,10 @@ struct CandyMenuBarView: View {
         }
     }
 
+    private var connectedLivePorts: [PortViewState] {
+        store.livePorts.filter(\.connected)
+    }
+
     private var portsSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
@@ -3714,9 +3743,16 @@ struct CandyMenuBarView: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, minHeight: 72)
+            } else if connectedLivePorts.isEmpty {
+                Text("暂无已接入端口")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(CandyTheme.menuRowBackground, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
             } else {
                 VStack(spacing: 8) {
-                    ForEach(store.livePorts) { port in
+                    ForEach(connectedLivePorts) { port in
                         MenuBarPortRow(port: port)
                             .background(HoverFrameReader { isHovering, rect in
                                 let key = "port-\(port.id)"
@@ -4083,16 +4119,26 @@ private struct MenuBarPreviewWindowHost: NSViewRepresentable {
             let screen = NSScreen.screens.first { $0.frame.contains(location) } ?? NSScreen.main
             let visible = screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? .zero
             let size = panel.contentView?.fittingSize ?? NSSize(width: 278, height: 160)
-            let gap: CGFloat = 14
+            let gap: CGFloat = 4
             let anchor = sourceWindow?.frame ?? NSRect(origin: location, size: .zero)
             let rowAnchor = anchorRect ?? anchor
-            let rightSpace = visible.maxX - anchor.maxX
-            let leftSpace = anchor.minX - visible.minX
-            let x = rightSpace >= size.width + gap || rightSpace >= leftSpace
-                ? min(anchor.maxX + gap, visible.maxX - size.width - 8)
-                : max(anchor.minX - size.width - gap, visible.minX + 8)
+
+            let spaceRight = visible.maxX - anchor.maxX
+            let spaceLeft = anchor.minX - visible.minX
+
+            let x: CGFloat
+            if spaceRight >= size.width + gap {
+                x = anchor.maxX + gap
+            } else if spaceLeft >= size.width + gap {
+                x = anchor.minX - size.width - gap
+            } else if spaceLeft >= spaceRight {
+                x = max(visible.minX + 4, anchor.minX - size.width - gap)
+            } else {
+                x = min(visible.maxX - size.width - 4, anchor.maxX + gap)
+            }
+
             let preferredY = rowAnchor.midY - size.height / 2
-            let y = min(max(preferredY, visible.minY + 8), visible.maxY - size.height - 8)
+            let y = min(max(preferredY, visible.minY + 4), visible.maxY - size.height - 4)
             panel.setFrame(NSRect(origin: CGPoint(x: x, y: y), size: size), display: true)
         }
 
