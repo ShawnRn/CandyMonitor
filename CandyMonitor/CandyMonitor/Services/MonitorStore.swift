@@ -4,6 +4,7 @@ import Observation
 import os
 import SwiftData
 import UniformTypeIdentifiers
+import UserNotifications
 
 private struct DeviceSnapshot: Sendable {
     let id: UUID
@@ -57,6 +58,13 @@ final class MonitorStore {
     var selectedSession: ChargingSession?
     var selectedSessionSamples: [PortSample] = []
     var portStatsByPort: [Int: [String: String]] = [:]
+    var sessionSettings: ChargingSessionSettings {
+        get { ChargingSessionSettings.load() }
+        set { newValue.save() }
+    }
+    var sessionTimeoutPrompts: [SessionTimeoutPrompt] = []
+    
+    // Low-power completion prompt (kept for backward compatibility UI)
     var lowPowerSessionPrompt: ChargingSession?
     var temperatureModeLabel = "-"
     var lastRefreshedAt: Date?
@@ -557,7 +565,16 @@ final class MonitorStore {
 
     private func restoreActiveSessions() {
         activeSessions.removeAll()
-        let activeByKey = Dictionary(grouping: sessions.filter { $0.endedAt == nil }) {
+        let now = Date()
+        let activeCandidates = sessions.filter { session in session.endedAt == nil }
+        for session in activeCandidates {
+            let lastActivity = session.startedAt
+            if now.timeIntervalSince(lastActivity) > 1800 {
+                session.endedAt = lastActivity
+                session.endReason = "stale_orphan_cleanup"
+            }
+        }
+        let activeByKey = Dictionary(grouping: sessions.filter { session in session.endedAt == nil }) {
             sessionKey(deviceID: $0.deviceID, port: $0.portIndex)
         }
         for (key, activeGroup) in activeByKey {
@@ -1115,7 +1132,7 @@ final class MonitorStore {
             ])
         }
         if didUpdateDevice || recordingResult.didMutateStore {
-            saveStoreIfNeeded(force: didUpdateDevice || recordingResult.didChangeSessions, at: now)
+            saveStoreIfNeeded(force: recordingResult.didChangeSessions, at: now)
         }
     }
 
@@ -1194,6 +1211,12 @@ final class MonitorStore {
     private func recordSamples(deviceID: UUID, deviceName: String, ports: [PortViewState], at now: Date) -> RecordingResult {
         guard let modelContext else { return RecordingResult() }
         var result = RecordingResult()
+
+        if checkTimeoutPrompts(at: now) {
+            result.didMutateStore = true
+            result.didChangeSessions = true
+        }
+
         var observedKeys = Set<String>()
         var attachedKeys = Set<String>()
 
@@ -1352,47 +1375,64 @@ final class MonitorStore {
                 }
             }
 
-            // Check if full/charged (Either via direct battery percentage OR low-power trickle detection)
+            // Check timeouts and trickle status for active sessions
             if let activeSession = session, activeSession.endedAt == nil {
+                let settings = sessionSettings
+                let sessionDurationMinutes = now.timeIntervalSince(activeSession.startedAt) / 60.0
                 var shouldStopForTrickle = false
                 
-                if let battery = port.batteryPercent, battery >= 99 {
+                // 1. Long Recording Timeout Check
+                if settings.enableMaxSessionDuration && sessionDurationMinutes >= Double(settings.maxSessionDurationMinutes) {
+                    if settings.countdownSeconds > 0 && !hasActiveTimeoutPrompt(for: activeSession.id, type: .maxDuration) {
+                        triggerTimeoutPrompt(for: activeSession, portIndex: port.port.index, type: .maxDuration, countdown: settings.countdownSeconds, at: now)
+                    } else if settings.countdownSeconds == 0 {
+                        end(activeSession, at: now, reason: "max_duration_exceeded")
+                        sessionEndedThisCycle = true
+                        sendLocalNotification(
+                            title: "充电记录已自动结束",
+                            body: "\(activeSession.portName) 记录时长已达到预设上限（\(settings.maxSessionDurationMinutes) 分钟）。"
+                        )
+                    }
+                }
+                
+                // 2. Long Trickle Charge Timeout Check
+                if activeSession.endedAt == nil, settings.enableTrickleTimeout {
+                    let matchingSamples = selectedSessionSamples.filter { sample in sample.sessionID == activeSession.id }
+                    if matchingSamples.count >= 30 {
+                        let recentSamples = Array(matchingSamples.suffix(100).reversed())
+                        if let newest = recentSamples.first, let oldest = recentSamples.last {
+                            let timeSpan = newest.timestamp.timeIntervalSince(oldest.timestamp)
+                            let trickleDurationThreshold: TimeInterval = Double(settings.trickleTimeoutMinutes) * 60.0
+                            if timeSpan >= min(trickleDurationThreshold, 180.0) {
+                                let avgPower = recentSamples.map { $0.powerW }.reduce(0, +) / Double(recentSamples.count)
+                                let threshold = settings.tricklePowerThresholdW
+                                if avgPower < threshold {
+                                    if settings.countdownSeconds > 0 && !hasActiveTimeoutPrompt(for: activeSession.id, type: .trickleTimeout) {
+                                        triggerTimeoutPrompt(for: activeSession, portIndex: port.port.index, type: .trickleTimeout, countdown: settings.countdownSeconds, at: now)
+                                    } else if settings.countdownSeconds == 0 {
+                                        shouldStopForTrickle = true
+                                        event = "battery_full"
+                                        activeSession.finalBatteryPercent = 100
+                                        activeSession.hasBatteryData = true
+                                        end(activeSession, at: now, reason: "trickle_charge")
+                                        sessionEndedThisCycle = true
+                                        sendLocalNotification(
+                                            title: "涓流充电记录已自动结束",
+                                            body: "\(activeSession.portName) 持续低功率涓流充电已达 \(settings.trickleTimeoutMinutes) 分钟，已自动完成记录。"
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let battery = port.batteryPercent, battery >= 99, activeSession.endedAt == nil {
                     shouldStopForTrickle = true
                     event = "battery_full"
                     activeSession.finalBatteryPercent = battery
                     end(activeSession, at: now, reason: "battery_full")
                     sessionEndedThisCycle = true
-                } else {
-                    // Smart Trickle Charge / Auto-Stop check:
-                    // Retrieve up to 150 most recent samples of this session, check if average power is below threshold for at least 3 minutes.
-                    // If peak power of activeSession >= 5.0W, consider it a phone/tablet (large device), threshold is 1.0W.
-                    // If peak power of activeSession < 5.0W, consider it a band/earbuds (low-power device), threshold is 0.3W.
-                    let sessionID = activeSession.id
-                    var descriptor = FetchDescriptor<PortSample>(
-                        predicate: #Predicate { sample in
-                            sample.sessionID == sessionID
-                        },
-                        sortBy: [SortDescriptor(\.timestamp, order: .reverse)]
-                    )
-                    descriptor.fetchLimit = 150
-                    
-                    if let recentSamples = try? modelContext.fetch(descriptor), recentSamples.count >= 80 {
-                        if let newest = recentSamples.first, let oldest = recentSamples.last {
-                            let timeSpan = newest.timestamp.timeIntervalSince(oldest.timestamp)
-                            if timeSpan >= 180 { // 3 minutes
-                                let avgPower = recentSamples.map { $0.powerW }.reduce(0, +) / Double(recentSamples.count)
-                                let threshold = activeSession.peakPowerW >= 5.0 ? 1.0 : 0.3
-                                if avgPower < threshold {
-                                    shouldStopForTrickle = true
-                                    event = "battery_full"
-                                    activeSession.finalBatteryPercent = 100
-                                    activeSession.hasBatteryData = true
-                                    end(activeSession, at: now, reason: "trickle_charge")
-                                    sessionEndedThisCycle = true
-                                }
-                            }
-                        }
-                    }
                 }
                 
                 if shouldStopForTrickle {
@@ -1518,6 +1558,93 @@ final class MonitorStore {
         let cutoff = Date().addingTimeInterval(-recentSampleWindow)
         recentSamples.removeAll { $0.timestamp < cutoff }
         return result
+    }
+
+    // MARK: - Timeout & Local Notification Helpers
+
+    private func hasActiveTimeoutPrompt(for sessionID: UUID, type: SessionTimeoutType) -> Bool {
+        sessionTimeoutPrompts.contains { $0.sessionID == sessionID && $0.type == type }
+    }
+
+    private func triggerTimeoutPrompt(for session: ChargingSession, portIndex: Int, type: SessionTimeoutType, countdown: Int, at now: Date) {
+        let deadline = now.addingTimeInterval(Double(countdown))
+        let prompt = SessionTimeoutPrompt(
+            sessionID: session.id,
+            portName: session.portName,
+            type: type,
+            deadline: deadline
+        )
+        sessionTimeoutPrompts.append(prompt)
+        
+        let title = type == .maxDuration ? "充电时长达到上限" : "涓流充电长时间运行"
+        let desc = type == .maxDuration ? "已持续记录 \(sessionSettings.maxSessionDurationMinutes) 分钟" : "已长时间处于低功率涓流状态"
+        
+        sendLocalNotification(
+            title: "\(session.portName) \(title)",
+            body: "\(desc)，将在 \(countdown) 秒后自动结束记录。点击可在应用内取消。"
+        )
+    }
+
+    private func checkTimeoutPrompts(at now: Date) -> Bool {
+        guard !sessionTimeoutPrompts.isEmpty else { return false }
+        var didMutate = false
+        var remainingPrompts: [SessionTimeoutPrompt] = []
+
+        for prompt in sessionTimeoutPrompts {
+            let remaining = prompt.countdownRemaining
+            if remaining <= 0 {
+                // Countdown expired -> auto finish session
+                if let session = fetchSession(id: prompt.sessionID), session.endedAt == nil {
+                    let reason = prompt.type == .maxDuration ? "max_duration_exceeded" : "trickle_timeout_exceeded"
+                    end(session, at: now, reason: reason)
+                    didMutate = true
+                    sendLocalNotification(
+                        title: "充电记录已自动结束",
+                        body: "\(prompt.portName) 倒计时结束，会话已自动完成。"
+                    )
+                }
+            } else {
+                remainingPrompts.append(prompt)
+            }
+        }
+
+        if sessionTimeoutPrompts != remainingPrompts {
+            sessionTimeoutPrompts = remainingPrompts
+            didMutate = true
+        }
+        return didMutate
+    }
+
+    public func extendSessionTimeoutPrompt(_ prompt: SessionTimeoutPrompt) {
+        sessionTimeoutPrompts.removeAll { $0.id == prompt.id }
+        diagnosticLog.record("session_timeout_extended", metadata: ["session": prompt.sessionID.uuidString])
+    }
+
+    public func stopSessionFromPrompt(_ prompt: SessionTimeoutPrompt) {
+        sessionTimeoutPrompts.removeAll { $0.id == prompt.id }
+        if let session = fetchSession(id: prompt.sessionID), session.endedAt == nil {
+            let reason = prompt.type == .maxDuration ? "max_duration_user_stopped" : "trickle_user_stopped"
+            end(session, at: Date(), reason: reason)
+        }
+    }
+
+    private func sendLocalNotification(title: String, body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        
+        let request = UNNotificationRequest(
+            identifier: UUID().uuidString,
+            content: content,
+            trigger: nil // immediate deliver
+        )
+        
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error {
+                self.logger.error("Failed to post local notification: \(error.localizedDescription)")
+            }
+        }
     }
 
     private func trimTrailingZeroSamples(for session: ChargingSession) {

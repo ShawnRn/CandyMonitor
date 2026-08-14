@@ -2,6 +2,67 @@ import Foundation
 import SwiftData
 import SwiftUI
 
+// MARK: - Session Limits & Timeout Prompt
+
+public struct ChargingSessionSettings: Codable, Equatable {
+    public var enableMaxSessionDuration: Bool
+    public var maxSessionDurationMinutes: Int
+    public var enableTrickleTimeout: Bool
+    public var tricklePowerThresholdW: Double
+    public var trickleTimeoutMinutes: Int
+    public var countdownSeconds: Int
+
+    public static let `default` = ChargingSessionSettings(
+        enableMaxSessionDuration: false,
+        maxSessionDurationMinutes: 180,
+        enableTrickleTimeout: true,
+        tricklePowerThresholdW: 1.5,
+        trickleTimeoutMinutes: 30,
+        countdownSeconds: 60
+    )
+
+    private static let storageKey = "charging_session_settings_v1"
+
+    public static func load() -> ChargingSessionSettings {
+        guard let data = UserDefaults.standard.data(forKey: storageKey),
+              let decoded = try? JSONDecoder().decode(ChargingSessionSettings.self, from: data) else {
+            return .default
+        }
+        return decoded
+    }
+
+    public func save() {
+        if let data = try? JSONEncoder().encode(self) {
+            UserDefaults.standard.set(data, forKey: ChargingSessionSettings.storageKey)
+        }
+    }
+}
+
+public enum SessionTimeoutType: String, Codable, Equatable {
+    case maxDuration
+    case trickleTimeout
+}
+
+public struct SessionTimeoutPrompt: Identifiable, Equatable {
+    public let id: UUID
+    public let sessionID: UUID
+    public let portName: String
+    public let type: SessionTimeoutType
+    public let deadline: Date
+
+    public init(id: UUID = UUID(), sessionID: UUID, portName: String, type: SessionTimeoutType, deadline: Date) {
+        self.id = id
+        self.sessionID = sessionID
+        self.portName = portName
+        self.type = type
+        self.deadline = deadline
+    }
+
+    public var countdownRemaining: Int {
+        max(0, Int(ceil(deadline.timeIntervalSinceNow)))
+    }
+}
+
 enum AppSection: String, CaseIterable, Identifiable {
     case monitor
     case sessions

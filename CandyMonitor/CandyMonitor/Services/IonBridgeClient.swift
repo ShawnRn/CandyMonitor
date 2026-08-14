@@ -105,14 +105,36 @@ actor IonBridgeDiscovery {
         guard prefixes.isEmpty == false else { return nil }
 
         return await withTaskGroup(of: IonBridgeSnapshot?.self) { group in
+            var urls: [URL] = []
             for prefix in prefixes {
                 for host in 1...254 {
                     guard host != prefix.host else { continue }
-                    let url = URL(string: "http://\(prefix.network).\(host)/")!
-                    group.addTask {
-                        await IonBridgeClient(baseURL: url, timeout: 0.45).snapshot(matchingPSN: psn)
+                    if let url = URL(string: "http://\(prefix.network).\(host)/") {
+                        urls.append(url)
                     }
                 }
+            }
+            let maxConcurrentTasks = 40
+            var index = 0
+            while index < min(maxConcurrentTasks, urls.count) {
+                let url = urls[index]
+                group.addTask {
+                    await IonBridgeClient(baseURL: url, timeout: 0.45).snapshot(matchingPSN: psn)
+                }
+                index += 1
+            }
+            while index < urls.count {
+                if let snapshot = await group.next() {
+                    if let snapshot {
+                        group.cancelAll()
+                        return snapshot
+                    }
+                }
+                let url = urls[index]
+                group.addTask {
+                    await IonBridgeClient(baseURL: url, timeout: 0.45).snapshot(matchingPSN: psn)
+                }
+                index += 1
             }
 
             for await snapshot in group {
@@ -392,13 +414,20 @@ struct IonBridgeClient: Sendable {
         return try? JSONDecoder().decode(IonBridgeMetrics.self, from: data)
     }
 
+    private static let session: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 2.0
+        config.timeoutIntervalForResource = 3.0
+        config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        return URLSession(configuration: config)
+    }()
+
     private func data(path: String) async -> Data? {
         guard let url = URL(string: path, relativeTo: baseURL) else { return nil }
         var request = URLRequest(url: url)
         request.timeoutInterval = timeout
-        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await Self.session.data(for: request)
             guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
                 return nil
             }

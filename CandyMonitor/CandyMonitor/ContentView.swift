@@ -62,6 +62,14 @@ struct ContentView: View {
         } message: {
             Text("这一路已经进入低功率尾段，但设备没有返回电量。可以继续等，也可以手动结束并保留完整曲线。")
         }
+        .sheet(isPresented: Binding(
+            get: { !store.sessionTimeoutPrompts.isEmpty },
+            set: { if !$0 { store.sessionTimeoutPrompts.removeAll() } }
+        )) {
+            if let prompt = store.sessionTimeoutPrompts.first {
+                SessionTimeoutPromptSheet(store: store, prompt: prompt)
+            }
+        }
         .tint(CandyTheme.syrup)
         .accentColor(CandyTheme.syrup)
     }
@@ -2966,7 +2974,7 @@ private struct SettingsView: View {
                             }
                         }
 
-                        SettingsCard(title: "记录行为", icon: "record.circle", subtitle: "接入负载并开始输出功率时自动生成会话；拔掉、满电或手动停止后关闭会话。") {
+                        SettingsCard(title: "记录行为", icon: "record.circle", subtitle: "接入负载并开始输出功率时自动生成会话；支持长时间超时告警与涓流自动结束。") {
                             LabeledContent("实时采样") {
                                 Text("前台 1 秒")
                                     .foregroundStyle(.secondary)
@@ -2978,6 +2986,57 @@ private struct SettingsView: View {
                             LabeledContent("当前记录") {
                                 Text("\(store.activeChargingSessions.count) 条")
                                     .foregroundStyle(.secondary)
+                            }
+                            
+                            Divider()
+                            
+                            Toggle("开启最长记录时长限制", isOn: Binding(
+                                get: { store.sessionSettings.enableMaxSessionDuration },
+                                set: { store.sessionSettings.enableMaxSessionDuration = $0 }
+                            ))
+                            
+                            if store.sessionSettings.enableMaxSessionDuration {
+                                LabeledContent("单次最高时长") {
+                                    HStack {
+                                        Stepper("\(store.sessionSettings.maxSessionDurationMinutes) 分钟", value: Binding(
+                                            get: { store.sessionSettings.maxSessionDurationMinutes },
+                                            set: { store.sessionSettings.maxSessionDurationMinutes = max(5, $0) }
+                                        ), step: 30)
+                                    }
+                                }
+                            }
+                            
+                            Toggle("开启涓流充电自动超时", isOn: Binding(
+                                get: { store.sessionSettings.enableTrickleTimeout },
+                                set: { store.sessionSettings.enableTrickleTimeout = $0 }
+                            ))
+                            
+                            if store.sessionSettings.enableTrickleTimeout {
+                                LabeledContent("涓流判断阀值") {
+                                    HStack {
+                                        Stepper("\(String(format: "%.1f", store.sessionSettings.tricklePowerThresholdW)) W", value: Binding(
+                                            get: { store.sessionSettings.tricklePowerThresholdW },
+                                            set: { store.sessionSettings.tricklePowerThresholdW = max(0.5, $0) }
+                                        ), step: 0.5)
+                                    }
+                                }
+                                LabeledContent("涓流持续多长时间后超时") {
+                                    HStack {
+                                        Stepper("\(store.sessionSettings.trickleTimeoutMinutes) 分钟", value: Binding(
+                                            get: { store.sessionSettings.trickleTimeoutMinutes },
+                                            set: { store.sessionSettings.trickleTimeoutMinutes = max(1, $0) }
+                                        ), step: 5)
+                                    }
+                                }
+                            }
+
+                            LabeledContent("倒计时缓冲时间") {
+                                HStack {
+                                    Stepper("\(store.sessionSettings.countdownSeconds) 秒", value: Binding(
+                                        get: { store.sessionSettings.countdownSeconds },
+                                        set: { store.sessionSettings.countdownSeconds = max(10, $0) }
+                                    ), step: 10)
+                                }
                             }
                         }
 
@@ -4306,6 +4365,53 @@ private struct MenuBarMiniPowerChart: View {
         return samples.min {
             abs($0.timestamp.timeIntervalSince(date)) < abs($1.timestamp.timeIntervalSince(date))
         }
+    }
+}
+
+private struct SessionTimeoutPromptSheet: View {
+    let store: MonitorStore
+    let prompt: SessionTimeoutPrompt
+
+    var body: some View {
+        VStack(spacing: 20) {
+            HStack(spacing: 12) {
+                Image(systemName: prompt.type == .maxDuration ? "clock.badge.exclamationmark" : "leaf.arrow.triangle.circlepath")
+                    .font(.system(size: 28))
+                    .foregroundStyle(CandyTheme.syrup)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("\(prompt.portName) - \(prompt.type == .maxDuration ? "达到最大记录时长" : "低功率涓流超时")")
+                        .font(.headline)
+                    Text(prompt.type == .maxDuration ? "该端口的充电记录已持续较长时间。" : "设备长期处于涓流充满阶段，推荐结束会话以保存完整数据。")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            VStack(spacing: 8) {
+                Text("\(prompt.countdownRemaining)")
+                    .font(.system(size: 42, weight: .bold, design: .rounded))
+                    .foregroundStyle(CandyTheme.syrup)
+                    .monospacedDigit()
+                Text("秒后将自动结束会话并保存曲线")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.vertical, 10)
+
+            HStack(spacing: 12) {
+                Button("延长记录") {
+                    store.extendSessionTimeoutPrompt(prompt)
+                }
+                .buttonStyle(SoftButtonStyle())
+
+                Button("立即结束记录") {
+                    store.stopSessionFromPrompt(prompt)
+                }
+                .buttonStyle(SoftButtonStyle(prominent: true))
+            }
+        }
+        .padding(24)
+        .frame(width: 420)
     }
 }
 

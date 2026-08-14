@@ -9,6 +9,7 @@ import SwiftUI
 import SwiftData
 import AppKit
 import Sparkle
+import UserNotifications
 
 @main
 struct CandyMonitorApp: App {
@@ -32,7 +33,7 @@ struct CandyMonitorApp: App {
     }
 }
 
-final class CandyMonitorAppDelegate: NSObject, NSApplicationDelegate {
+final class CandyMonitorAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     let store = MonitorStore()
     let modelContainer: ContainerType
     private let showInDockKey = "showInDock"
@@ -59,6 +60,7 @@ final class CandyMonitorAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         ProcessInfo.processInfo.disableSuddenTermination()
+        setupNotificationCenter()
         if UserDefaults.standard.object(forKey: showInDockKey) == nil {
             UserDefaults.standard.set(true, forKey: showInDockKey)
         }
@@ -82,6 +84,21 @@ final class CandyMonitorAppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             self?.isStartupPhase = false
         }
+    }
+
+    private func setupNotificationCenter() {
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        center.requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
+            if let error = error {
+                print("Notification authorization error: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    // Deliver notifications even when app is in foreground
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound, .badge])
     }
 
     func applicationWillTerminate(_ notification: Notification) {
