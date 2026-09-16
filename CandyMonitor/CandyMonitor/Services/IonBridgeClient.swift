@@ -298,7 +298,184 @@ struct IonBridgeSnapshot: Sendable {
     }
 
     var pdStatus: PDStatusEnvelope? {
-        nil
+        let portStatuses = metrics.ports.compactMap { port -> PDPortStatus? in
+            guard let rawPD = port.pdStatus else { return nil }
+            let status = rawPD.toPDPortStatus(appPort: port.id + 1)
+            guard status.hasUsefulPayload else { return nil }
+            return status
+        }
+        return portStatuses.isEmpty ? nil : PDStatusEnvelope(ports: portStatuses)
+    }
+}
+
+struct IonBridgePDStatus: Decodable, Sendable {
+    let pdRevision: Int?
+    let operatingVoltage: Int?
+    let operatingCurrent: Int?
+    let manufacturerVid: Int?
+    let manufacturerPid: Int?
+    let hasEmarker: Bool?
+    let ppsChargingSupported: Bool?
+    let hasBattery: Bool?
+    let dualRolePower: Bool?
+    let sinkMinimumPdp: Int?
+    let sinkOperationalPdp: Int?
+    let sinkMaximumPdp: Int?
+    let sinkCapPdoCount: Int?
+    let requestPdoId: Int?
+    let requestUsbCommunicationsCapable: Bool?
+    let requestCapabilityMismatch: Bool?
+    let requestEprModeCapable: Bool?
+
+    // Battery fields
+    let batteryVid: Int?
+    let batteryPid: Int?
+    let batteryDesignCapacity: Double?
+    let batteryLastFullChargeCapacity: Double?
+    let batteryPresentCapacity: Double?
+    let batteryPresent: Bool?
+    let batteryStatus: Int?
+    let batteryInvalid: Bool?
+    let batteryPercent: Double?
+    let capacityPercent: Double?
+
+    // Cable fields
+    let cableVid: Int?
+    let cablePid: Int?
+    let cableXid: Int?
+    let cableIsActive: Bool?
+    let cableEprModeCapable: Bool?
+    let cableMaxVbusVoltage: Int?
+    let cableMaxVbusCurrent: Int?
+    let cableUsbHighestSpeed: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case pdRevision = "pd_revision"
+        case operatingVoltage = "operating_voltage"
+        case operatingCurrent = "operating_current"
+        case manufacturerVid = "manufacturer_vid"
+        case manufacturerPid = "manufacturer_pid"
+        case hasEmarker = "has_emarker"
+        case ppsChargingSupported = "pps_charging_supported"
+        case hasBattery = "has_battery"
+        case dualRolePower = "dual_role_power"
+        case sinkMinimumPdp = "sink_minimum_pdp"
+        case sinkOperationalPdp = "sink_operational_pdp"
+        case sinkMaximumPdp = "sink_maximum_pdp"
+        case sinkCapPdoCount = "sink_cap_pdo_count"
+        case requestPdoId = "request_pdo_id"
+        case requestUsbCommunicationsCapable = "request_usb_communications_capable"
+        case requestCapabilityMismatch = "request_capability_mismatch"
+        case requestEprModeCapable = "request_epr_mode_capable"
+
+        case batteryVid = "battery_vid"
+        case batteryPid = "battery_pid"
+        case batteryDesignCapacity = "battery_design_capacity"
+        case batteryLastFullChargeCapacity = "battery_last_full_charge_capacity"
+        case batteryPresentCapacity = "battery_present_capacity"
+        case batteryPresent = "battery_present"
+        case batteryStatus = "battery_status"
+        case batteryInvalid = "battery_invalid"
+        case batteryPercent = "battery_percent"
+        case capacityPercent = "capacity_percent"
+
+        case cableVid = "cable_vid"
+        case cablePid = "cable_pid"
+        case cableXid = "cable_xid"
+        case cableIsActive = "cable_is_active"
+        case cableEprModeCapable = "cable_epr_mode_capable"
+        case cableMaxVbusVoltage = "cable_max_vbus_voltage"
+        case cableMaxVbusCurrent = "cable_max_vbus_current"
+        case cableUsbHighestSpeed = "cable_usb_highest_speed"
+    }
+
+    func toPDPortStatus(appPort: Int) -> PDPortStatus {
+        // 1. Calculate battery percentage from direct fields or (present / full) * 100%
+        let calculatedPercent: Double? = {
+            if let direct = batteryPercent ?? capacityPercent, direct > 0 {
+                return min(100.0, max(0.0, direct <= 1.0 ? direct * 100.0 : direct))
+            }
+            guard let present = batteryPresentCapacity, present > 0 else { return nil }
+            if let full = batteryLastFullChargeCapacity, full > 0 {
+                return min(100.0, max(0.0, (present / full) * 100.0))
+            }
+            if let design = batteryDesignCapacity, design > 0 {
+                return min(100.0, max(0.0, (present / design) * 100.0))
+            }
+            return nil
+        }()
+
+        // 2. Identify manufacturer (Apple 0x05AC)
+        let manufacturer: String? = {
+            let vid = batteryVid ?? manufacturerVid
+            if vid == 0x05AC {
+                return "Apple"
+            }
+            if let vid {
+                return String(format: "0x%04X", vid)
+            }
+            return nil
+        }()
+
+        // 3. Model name
+        let modelName: String? = {
+            if manufacturer == "Apple" {
+                if let pid = batteryPid ?? manufacturerPid {
+                    return String(format: "Apple (0x%04X)", pid)
+                }
+                return "Apple 设备"
+            }
+            if let pid = batteryPid ?? manufacturerPid {
+                return String(format: "PID 0x%04X", pid)
+            }
+            return nil
+        }()
+
+        // 4. Battery Health
+        let health: Double? = {
+            if let full = batteryLastFullChargeCapacity, let design = batteryDesignCapacity, design > 0, full > 0 {
+                return min(100.0, max(0.0, (full / design) * 100.0))
+            }
+            return nil
+        }()
+
+        // 5. Remaining charge time estimation
+        let remainingMinutes: Double? = {
+            guard batteryStatus == 0, // Charging
+                  let v = operatingVoltage, v > 0,
+                  let c = operatingCurrent, c > 0 else { return nil }
+            let powerMW = Double(v) * Double(c) / 1000.0 // mW
+            guard powerMW > 500 else { return nil }
+            let fullCap = batteryLastFullChargeCapacity ?? batteryDesignCapacity
+            guard let full = fullCap, let pres = batteryPresentCapacity, full > pres else { return nil }
+            let remMWh = full - pres
+            let hours = remMWh / powerMW
+            return min(600.0, max(1.0, hours * 60.0))
+        }()
+
+        let remainingText: String? = {
+            guard let mins = remainingMinutes else { return nil }
+            let intMins = Int(round(mins))
+            if intMins >= 60 {
+                return "\(intMins / 60)小时\(intMins % 60)分钟"
+            }
+            return "\(intMins)分钟"
+        }()
+
+        return PDPortStatus(
+            port: appPort,
+            batteryPercent: calculatedPercent,
+            manufacturer: manufacturer,
+            modelName: modelName,
+            serialNumber: nil,
+            batteryCapacityMWh: batteryDesignCapacity,
+            batteryLastFullChargeCapacityMWh: batteryLastFullChargeCapacity,
+            batteryPresentCapacityMWh: batteryPresentCapacity,
+            batteryHealthPercent: health,
+            estimatedFullMinutes: remainingMinutes,
+            remainingTimeText: remainingText,
+            cycleCount: nil
+        )
     }
 }
 
@@ -348,6 +525,7 @@ struct IonBridgePort: Decodable, Sendable {
     let sessionID: Int?
     let sessionCharge: Int
     let powerBudget: Int
+    let pdStatus: IonBridgePDStatus?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -363,6 +541,7 @@ struct IonBridgePort: Decodable, Sendable {
         case sessionID = "session_id"
         case sessionCharge = "session_charge"
         case powerBudget = "power_budget"
+        case pdStatus = "pd_status"
     }
 }
 

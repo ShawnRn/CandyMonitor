@@ -27,6 +27,7 @@ private struct SampleStats {
     let voltageMV: Int
     let protocolName: String
     let batteryPercent: Double?
+    var batteryTempC: Double? = nil
 }
 
 private struct RecordingResult {
@@ -67,6 +68,7 @@ final class MonitorStore {
     // Low-power completion prompt (kept for backward compatibility UI)
     var lowPowerSessionPrompt: ChargingSession?
     var temperatureModeLabel = "-"
+    var adbService: ADBService = ADBService.shared
     var lastRefreshedAt: Date?
     var isRefreshingNow = false
     var isShowingAddDevice = false
@@ -92,6 +94,7 @@ final class MonitorStore {
     @ObservationIgnored private var iotJWTFetchAttempted: Set<UUID> = []
     @ObservationIgnored private var pollingTask: Task<Void, Never>?
     @ObservationIgnored private var activeSessions: [String: UUID] = [:]
+    @ObservationIgnored private var lastStandaloneRecordTime: [String: Date] = [:]
     @ObservationIgnored private var trickleStoppedKeys = Set<String>()
     @ObservationIgnored private var disconnectDebounce: [String: Int] = [:]
     @ObservationIgnored private var knownProtocols: [UUID: Set<String>] = [:]
@@ -161,6 +164,11 @@ final class MonitorStore {
             diagnosticLog.record("store_configured", metadata: ["log": diagnosticLog.path])
             loadDevices()
             loadSessions()
+
+            // 监听 Android ADB 设备刷新，实时驱动独立电池曲线记录（解耦小电拼端口）
+            adbService.onDevicesRefreshed = { [weak self] devices in
+                self?.recordStandaloneADBSamples(devices: devices)
+            }
             
             Task {
                 while !Task.isCancelled {
@@ -569,7 +577,7 @@ final class MonitorStore {
         let activeCandidates = sessions.filter { session in session.endedAt == nil }
         for session in activeCandidates {
             let lastActivity = session.startedAt
-            if now.timeIntervalSince(lastActivity) > 1800 {
+            if now.timeIntervalSince(lastActivity) > 86400 {
                 session.endedAt = lastActivity
                 session.endReason = "stale_orphan_cleanup"
             }
@@ -619,7 +627,9 @@ final class MonitorStore {
                 powerW: sample.powerW,
                 voltageV: Double(sample.voltageMV) / 1000,
                 currentA: Double(sample.currentMA) / 1000,
-                temperatureScore: temperatureScore(sample.temperature ?? "")
+                temperatureScore: temperatureScore(sample.temperature ?? ""),
+                batteryPercent: sample.batteryPercent,
+                batteryTempC: sample.batteryTempC
             )
         }
     }
@@ -641,7 +651,35 @@ final class MonitorStore {
             },
             sortBy: [SortDescriptor(\.timestamp, order: .forward)]
         )
-        selectedSessionSamples = downsampleSessionSamples((try? modelContext.fetch(descriptor)) ?? [])
+        let samples = (try? modelContext.fetch(descriptor)) ?? []
+        selectedSessionSamples = downsampleSessionSamples(samples)
+
+        // 历史会话自愈与补齐：如果样本中包含手机电池数据，同步补齐 session 的最高温度与关联设备信息
+        let batteryTemps = samples.compactMap(\.batteryTempC)
+        let hasBatteryData = samples.contains { $0.batteryPercent != nil }
+        var sessionChanged = false
+
+        if let maxT = batteryTemps.max(), selectedSession.maxBatteryTempC != maxT {
+            selectedSession.maxBatteryTempC = maxT
+            sessionChanged = true
+        }
+
+        if selectedSession.isAppleSession {
+            if selectedSession.boundAndroidSerial != nil {
+                selectedSession.boundAndroidSerial = nil
+                sessionChanged = true
+            }
+        } else if hasBatteryData && (selectedSession.boundAndroidSerial == nil || selectedSession.boundAndroidSerial?.isEmpty == true) {
+            let serial = adbService.devices.first(where: { $0.isOnline })?.serial ?? adbService.recentConnections.first?.host
+            if let serial {
+                selectedSession.boundAndroidSerial = serial
+                sessionChanged = true
+            }
+        }
+
+        if sessionChanged {
+            try? modelContext.save()
+        }
     }
 
     func stopSession(_ session: ChargingSession, reason: String = "manual") {
@@ -650,6 +688,156 @@ final class MonitorStore {
         lowPowerSessionPrompt = nil
         try? modelContext?.save()
         loadSessions()
+    }
+
+    // MARK: - Standalone ADB Battery Recording (Decoupled from Ports)
+
+    func isRecordingStandaloneBattery(serial: String) -> Bool {
+        let devID = ADBDevice.virtualDeviceID(for: serial)
+        let key = sessionKey(deviceID: devID, port: 0)
+        return activeSessions[key] != nil
+    }
+
+    func activeStandaloneSession(for serial: String) -> ChargingSession? {
+        let devID = ADBDevice.virtualDeviceID(for: serial)
+        let key = sessionKey(deviceID: devID, port: 0)
+        guard let sessionID = activeSessions[key] else { return nil }
+        return sessions.first { $0.id == sessionID }
+    }
+
+    func startStandaloneBatteryRecording(device: ADBDevice, customTitle: String? = nil) {
+        guard let modelContext else { return }
+        let serial = device.serial
+        let devID = device.virtualDeviceID
+        let key = sessionKey(deviceID: devID, port: 0)
+
+        // 避免重复开启
+        if let existingID = activeSessions[key], let existing = sessions.first(where: { $0.id == existingID }), existing.endedAt == nil {
+            if let customTitle = customTitle?.trimmingCharacters(in: .whitespacesAndNewlines), !customTitle.isEmpty {
+                existing.customTitle = customTitle
+                try? modelContext.save()
+            }
+            return
+        }
+
+        let now = Date()
+        let newSession = ChargingSession(
+            deviceID: devID,
+            deviceName: "Android 电池监视",
+            portIndex: 0,
+            portName: "电池监视",
+            connectedDeviceName: device.displayName,
+            startedAt: now,
+            boundAndroidSerial: serial
+        )
+        newSession.hasBatteryData = true
+        newSession.finalBatteryPercent = device.batteryPercent
+        if let temp = device.batteryTempC {
+            newSession.maxBatteryTempC = temp
+        }
+        if let customTitle = customTitle?.trimmingCharacters(in: .whitespacesAndNewlines), !customTitle.isEmpty {
+            newSession.customTitle = customTitle
+        }
+
+        modelContext.insert(newSession)
+        activeSessions[key] = newSession.id
+        sessions.insert(newSession, at: 0)
+
+        // 立即写入第一条初始样本
+        if let battery = device.batteryPercent {
+            let initialSample = PortSample(
+                sessionID: newSession.id,
+                deviceID: devID,
+                deviceName: device.displayName,
+                timestamp: now,
+                portIndex: 0,
+                portName: "电池监视",
+                connected: true,
+                protocolName: device.batteryStatus ?? (device.isCharging ? "充电中" : "电池供电"),
+                voltageMV: device.batteryVoltageMV ?? 0,
+                currentMA: 0,
+                powerW: 0,
+                batteryPercent: battery,
+                batteryVoltageMV: device.batteryVoltageMV,
+                batteryTempC: device.batteryTempC,
+                event: "session_started"
+            )
+            modelContext.insert(initialSample)
+            newSession.sampleCount = 1
+        }
+
+        try? modelContext.save()
+        loadSessions()
+    }
+
+    func stopStandaloneBatteryRecording(serial: String) {
+        guard let modelContext else { return }
+        let devID = ADBDevice.virtualDeviceID(for: serial)
+        let key = sessionKey(deviceID: devID, port: 0)
+        guard let sessionID = activeSessions[key], let session = sessions.first(where: { $0.id == sessionID }) else { return }
+
+        end(session, at: Date(), reason: "manual_stopped")
+        activeSessions.removeValue(forKey: key)
+        lastStandaloneRecordTime.removeValue(forKey: key)
+        try? modelContext.save()
+        loadSessions()
+    }
+
+    func recordStandaloneADBSamples(devices: [ADBDevice]) {
+        guard let modelContext else { return }
+        let now = Date()
+        var didInsert = false
+
+        for device in devices where device.isOnline {
+            let devID = device.virtualDeviceID
+            let key = sessionKey(deviceID: devID, port: 0)
+            guard let sessionID = activeSessions[key],
+                  let session = sessions.first(where: { $0.id == sessionID && $0.endedAt == nil }) else {
+                continue
+            }
+
+            guard let battery = device.batteryPercent else { continue }
+
+            // 限制采样频率不超过 1Hz
+            if let lastTime = lastStandaloneRecordTime[key], now.timeIntervalSince(lastTime) < 0.8 {
+                continue
+            }
+            lastStandaloneRecordTime[key] = now
+
+            let sample = PortSample(
+                sessionID: session.id,
+                deviceID: devID,
+                deviceName: device.displayName,
+                timestamp: now,
+                portIndex: 0,
+                portName: "电池监视",
+                connected: true,
+                protocolName: device.batteryStatus ?? (device.isCharging ? "充电中" : "电池供电"),
+                voltageMV: device.batteryVoltageMV ?? 0,
+                currentMA: 0,
+                powerW: 0,
+                batteryPercent: battery,
+                batteryVoltageMV: device.batteryVoltageMV,
+                batteryTempC: device.batteryTempC
+            )
+            modelContext.insert(sample)
+
+            session.sampleCount += 1
+            session.finalBatteryPercent = battery
+            if let temp = device.batteryTempC {
+                session.maxBatteryTempC = max(session.maxBatteryTempC ?? temp, temp)
+            }
+            didInsert = true
+
+            // 如果当前在详情页查看该独立会话，实时追加样本
+            if selectedSession?.id == session.id {
+                selectedSessionSamples.append(sample)
+            }
+        }
+
+        if didInsert {
+            saveStoreIfNeeded(at: now)
+        }
     }
 
     func deleteSession(_ session: ChargingSession) {
@@ -774,6 +962,11 @@ final class MonitorStore {
         if panel.runModal() == .OK, let url = panel.url {
             try? png.write(to: url, options: .atomic)
         }
+    }
+
+    func sessionAnalytics(for session: ChargingSession) -> ChargingSessionAnalytics {
+        let sessionSamples = samples(for: session)
+        return ChargingSessionAnalytics.analyze(session: session, samples: sessionSamples)
     }
 
     func previewSamples(for session: ChargingSession, limit: Int = 180) -> [PortSample] {
@@ -982,14 +1175,35 @@ final class MonitorStore {
     private func refreshWithReconnect(device: DeviceSnapshot, reason: String) async throws {
         let now = Date()
         if let local = await ionBridgeDiscovery.snapshot(for: device.id, psn: device.psn, lanURLString: device.lanURLString) {
+            var pd: PDStatusEnvelope? = local.pdStatus
+            if pd == nil {
+                if let cached = cachedPDStatus[device.id],
+                   let refreshedAt = lastPDRefreshedAt[device.id],
+                   now.timeIntervalSince(refreshedAt) < 5 {
+                    pd = cached
+                } else if let client = try? await client(for: device) {
+                    if let freshPD = try? await client.pdStatus() {
+                        cachedPDStatus[device.id] = freshPD
+                        lastPDRefreshedAt[device.id] = now
+                        pd = freshPD
+                    } else {
+                        pd = cachedPDStatus[device.id]
+                    }
+                } else {
+                    pd = cachedPDStatus[device.id]
+                }
+            }
+
+            let mcpClient = try? await client(for: device)
+            let wsPDByPort = await pdStatusFromIOTStream(device: device, client: mcpClient)
             applyRefreshSnapshot(
                 device: device,
                 facts: local.facts,
                 details: local.details,
                 charging: local.chargingStatus,
                 temperature: local.temperatureMode,
-                pd: local.pdStatus,
-                wsPDByPort: [:],
+                pd: pd,
+                wsPDByPort: wsPDByPort,
                 at: now,
                 source: "ionbridge"
             )
@@ -1107,15 +1321,86 @@ final class MonitorStore {
 
         let mcpPDByPort = Dictionary(uniqueKeysWithValues: (pd?.ports ?? []).map { ($0.port, $0) })
         let detailsByPort = Dictionary(uniqueKeysWithValues: details.ports.map { ($0.port, $0) })
-        livePorts = facts.ports.map { port in
+
+        // 1. 构建各端口的实时识别数据
+        let portStates: [(port: MachinePort, detail: PortDetail?, pdStatus: PDPortStatus?, isApple: Bool, powerW: Double, isCharging: Bool, isConnected: Bool)] = facts.ports.map { port in
             let detail = detailsByPort[port.index]
-            let fallbackPD = mcpPDByPort[port.index]
-            let pdStatus = wsPDByPort[port.index]?.merged(withFallback: fallbackPD) ?? fallbackPD
+            let directPD = mcpPDByPort[port.index]
+            let wsPD = wsPDByPort[port.index]
+            let pdStatus = directPD?.merged(withFallback: wsPD) ?? wsPD
+            let powerW = detail?.powerW ?? 0
+            let isCharging = (charging.statusBitmask & (1 << (port.index - 1))) != 0 || powerW >= 1.0
+            let isConnected = isCharging || detail?.connected == true
+
+            var isApple = false
+            if let model = pdStatus?.modelName?.lowercased() {
+                if model.contains("iphone") || model.contains("ipad") || model.contains("macbook") || model.contains("apple") || model.contains("ios") {
+                    isApple = true
+                }
+            }
+            if let name = detail?.deviceNameZH?.lowercased() ?? detail?.deviceNameEN?.lowercased() {
+                if name.contains("iphone") || name.contains("ipad") || name.contains("macbook") || name.contains("apple") || name.contains("ios") {
+                    isApple = true
+                }
+            }
+            return (port, detail, pdStatus, isApple, powerW, isCharging, isConnected)
+        }
+
+        // 2. Apple 设备隔离与空闲端口自动解绑：
+        // A. 如果端口已接入 Apple/iPhone 设备，立即强制解除任何 ADB 设备绑定
+        for state in portStates where state.isApple {
+            if adbService.boundDevice(for: state.port.index) != nil {
+                adbService.bindPort(state.port.index, to: nil)
+            }
+        }
+        // B. 如果端口已完全断开，且绑定的 ADB 设备已未在充电或离线，自动释放该端口绑定
+        for state in portStates where !state.isConnected && state.powerW < 0.2 {
+            if let bound = adbService.boundDevice(for: state.port.index) {
+                if !bound.isOnline || !bound.isCharging {
+                    adbService.bindPort(state.port.index, to: nil)
+                }
+            }
+        }
+
+        // 3. 智能自动匹配与绑定引擎（ADB Auto-binding Engine）：
+        let onlineDevices = adbService.devices.filter { $0.isOnline }
+        let unboundDevices = onlineDevices.filter { adbService.boundPort(for: $0.serial) == nil }
+        let unboundActiveNonApplePorts = portStates.filter { state in
+            !state.isApple && state.isCharging && adbService.boundDevice(for: state.port.index) == nil
+        }
+
+        // 场景 A：单设备单端口精准直连绑定（最常见场景：测试机插入任意空闲充电口）
+        if unboundDevices.count == 1, unboundActiveNonApplePorts.count == 1,
+           let targetDevice = unboundDevices.first,
+           let targetPort = unboundActiveNonApplePorts.first {
+            adbService.bindPort(targetPort.port.index, to: targetDevice.serial)
+        } else if !unboundDevices.isEmpty && !unboundActiveNonApplePorts.isEmpty {
+            // 场景 B：多设备联动匹配（基于快充协议特征或优先匹配正在充电中的设备）
+            for portState in unboundActiveNonApplePorts {
+                let proto = portState.detail?.fcProtocol ?? ""
+                if proto.contains("MI_PPS") || proto == "21" {
+                    if let miDevice = unboundDevices.first(where: {
+                        let name = "\($0.brand) \($0.model)".lowercased()
+                        return name.contains("xiaomi") || name.contains("redmi") || name.contains("poco")
+                    }) {
+                        adbService.bindPort(portState.port.index, to: miDevice.serial)
+                        continue
+                    }
+                }
+                if let chargingDevice = unboundDevices.first(where: { $0.isCharging && adbService.boundPort(for: $0.serial) == nil }) {
+                    adbService.bindPort(portState.port.index, to: chargingDevice.serial)
+                }
+            }
+        }
+
+        livePorts = portStates.map { state in
+            let boundADB = state.isApple ? nil : adbService.boundDevice(for: state.port.index)
             return PortViewState(
-                port: port,
-                detail: detail,
-                pdStatus: pdStatus,
-                charging: charging.statusBitmask & (1 << (port.index - 1)) != 0
+                port: state.port,
+                detail: state.detail,
+                pdStatus: state.pdStatus,
+                charging: state.isCharging,
+                boundADBDevice: boundADB
             )
         }
 
@@ -1151,9 +1436,9 @@ final class MonitorStore {
         return facts
     }
 
-    private func pdStatusFromIOTStream(device: DeviceSnapshot, client: MCPClient) async -> [Int: PDPortStatus] {
+    private func pdStatusFromIOTStream(device: DeviceSnapshot, client: MCPClient? = nil) async -> [Int: PDPortStatus] {
         var jwt = sanitizedIOTGatewayJWT((try? KeychainStore.loadIOTGatewayJWT(account: device.keychainAccount)) ?? "")
-        if jwt == nil, iotJWTFetchAttempted.contains(device.id) == false {
+        if jwt == nil, let client, iotJWTFetchAttempted.contains(device.id) == false {
             iotJWTFetchAttempted.insert(device.id)
             if let fetchedJWT = try? await client.iotGatewayJWT(psn: device.psn),
                let sanitized = sanitizedIOTGatewayJWT(fetchedJWT) {
@@ -1277,7 +1562,9 @@ final class MonitorStore {
                 powerW: smoothedPower,
                 voltageV: smoothedVoltage,
                 currentA: smoothedCurrent,
-                temperatureScore: smoothedTemp
+                temperatureScore: smoothedTemp,
+                batteryPercent: port.batteryPercent,
+                batteryTempC: port.batteryTempC
             ))
 
             let isAttached = port.connected
@@ -1310,15 +1597,55 @@ final class MonitorStore {
                 session = canonical
             }
 
+            // 活跃会话智能回填：如果已在充电中且尚未记录绑定设备，当端口关联 ADB 或 PD 识别到型号时自动同步绑定
+            if let activeSession = session, activeSession.endedAt == nil {
+                if port.isAppleDevice {
+                    if activeSession.boundAndroidSerial != nil {
+                        activeSession.boundAndroidSerial = nil
+                        result.didChangeSessions = true
+                    }
+                    if let pdModel = port.pdStatus?.modelName, !pdModel.isEmpty {
+                        activeSession.connectedDeviceName = pdModel
+                        result.didChangeSessions = true
+                    }
+                } else {
+                    if activeSession.boundAndroidSerial == nil, let bound = adbService.boundDevice(for: port.port.index) {
+                        activeSession.boundAndroidSerial = bound.serial
+                        if activeSession.connectedDeviceName == nil || activeSession.connectedDeviceName == "未知设备型号" {
+                            activeSession.connectedDeviceName = bound.displayName
+                        }
+                        result.didChangeSessions = true
+                    }
+                    if activeSession.connectedDeviceName == nil || activeSession.connectedDeviceName == "未知设备型号" {
+                        if let pdModel = port.pdStatus?.modelName, !pdModel.isEmpty {
+                            activeSession.connectedDeviceName = pdModel
+                            result.didChangeSessions = true
+                        }
+                    }
+                }
+            }
+
             var justCreated = false
             if session == nil, hasOutputPower, !isTrickleStopped {
+                let boundADB = port.isAppleDevice ? nil : adbService.boundDevice(for: port.port.index)
+                let connectedName: String?
+                if port.isAppleDevice {
+                    connectedName = port.pdStatus?.modelName ?? "iPhone"
+                } else if let boundADB, !boundADB.displayName.isEmpty {
+                    connectedName = boundADB.displayName
+                } else if let pdModel = port.pdStatus?.modelName, !pdModel.isEmpty {
+                    connectedName = pdModel
+                } else {
+                    connectedName = detail.deviceNameZH ?? detail.deviceNameEN
+                }
                 let newSession = ChargingSession(
                     deviceID: deviceID,
                     deviceName: deviceName,
                     portIndex: port.port.index,
                     portName: port.port.name,
-                    connectedDeviceName: detail.deviceNameZH ?? detail.deviceNameEN,
-                    startedAt: now
+                    connectedDeviceName: connectedName,
+                    startedAt: now,
+                    boundAndroidSerial: port.isAppleDevice ? nil : boundADB?.serial
                 )
                 modelContext.insert(newSession)
                 activeSessions[key] = newSession.id
@@ -1427,13 +1754,6 @@ final class MonitorStore {
                     }
                 }
 
-                if let battery = port.batteryPercent, battery >= 99, activeSession.endedAt == nil {
-                    shouldStopForTrickle = true
-                    event = "battery_full"
-                    activeSession.finalBatteryPercent = battery
-                    end(activeSession, at: now, reason: "battery_full")
-                    sessionEndedThisCycle = true
-                }
                 
                 if shouldStopForTrickle {
                     trickleStoppedKeys.insert(key)
@@ -1463,7 +1783,8 @@ final class MonitorStore {
                 powerW: detail.powerW,
                 voltageMV: detail.voutMV,
                 protocolName: detail.fcProtocol,
-                batteryPercent: port.batteryPercent
+                batteryPercent: port.batteryPercent,
+                batteryTempC: port.batteryTempC
             )
             if let session {
                 updateStats(session: session, with: stats)
@@ -1519,6 +1840,8 @@ final class MonitorStore {
                     temperature: detail.dieTemperature,
                     sessionChargeMWh: detail.sessionChargeMWh,
                     batteryPercent: port.batteryPercent,
+                    batteryVoltageMV: port.batteryVoltageMV,
+                    batteryTempC: port.batteryTempC,
                     event: event
                 )
                 modelContext.insert(sample)
@@ -1533,8 +1856,7 @@ final class MonitorStore {
         }
 
         for (key, sessionID) in Array(activeSessions) where observedKeys.contains(key) && attachedKeys.contains(key) == false {
-            guard let session = fetchSession(id: sessionID), session.deviceID == deviceID else {
-                activeSessions.removeValue(forKey: key)
+            guard let session = fetchSession(id: sessionID), session.deviceID == deviceID, session.portIndex != 0 else {
                 continue
             }
             let count = (disconnectDebounce[key] ?? 0) + 1
@@ -1648,6 +1970,8 @@ final class MonitorStore {
     }
 
     private func trimTrailingZeroSamples(for session: ChargingSession) {
+        // 独立电池监视模式或 0 号端口绝不执行尾部 0W 裁剪
+        guard !session.isStandaloneBatterySession, session.portIndex != 0 else { return }
         guard let modelContext else { return }
         let sessionID = session.id
         let descriptor = FetchDescriptor<PortSample>(
@@ -1660,7 +1984,8 @@ final class MonitorStore {
         
         var deletedAny = false
         for sample in samples.reversed() {
-            if sample.powerW < 0.5 {
+            // 只有纯 0W 且无任何手机电池数据的末端样本才执行裁剪
+            if sample.powerW < 0.5 && sample.batteryPercent == nil && sample.batteryTempC == nil {
                 modelContext.delete(sample)
                 deletedAny = true
             } else {
@@ -1823,7 +2148,8 @@ final class MonitorStore {
                     powerW: sample.powerW,
                     voltageMV: sample.voltageMV,
                     protocolName: sample.protocolName,
-                    batteryPercent: sample.batteryPercent
+                    batteryPercent: sample.batteryPercent,
+                    batteryTempC: sample.batteryTempC
                 )
             )
         }
@@ -1885,6 +2211,9 @@ final class MonitorStore {
         if let battery = sample.batteryPercent {
             session.hasBatteryData = true
             session.finalBatteryPercent = battery
+        }
+        if let temp = sample.batteryTempC {
+            session.maxBatteryTempC = max(session.maxBatteryTempC ?? temp, temp)
         }
     }
 

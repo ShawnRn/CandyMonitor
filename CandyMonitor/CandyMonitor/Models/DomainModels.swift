@@ -1,6 +1,7 @@
 import Foundation
 import SwiftData
 import SwiftUI
+import CryptoKit
 
 // MARK: - Session Limits & Timeout Prompt
 
@@ -66,6 +67,7 @@ public struct SessionTimeoutPrompt: Identifiable, Equatable {
 enum AppSection: String, CaseIterable, Identifiable {
     case monitor
     case sessions
+    case wirelessADB
     case control
     case settings
 
@@ -75,6 +77,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         switch self {
         case .monitor: "实时监控"
         case .sessions: "充电记录"
+        case .wirelessADB: "无线调试"
         case .control: "控制台"
         case .settings: "设置"
         }
@@ -84,6 +87,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         switch self {
         case .monitor: "bolt.horizontal.circle"
         case .sessions: "chart.xyaxis.line"
+        case .wirelessADB: "antenna.radiowaves.left.and.right"
         case .control: "slider.horizontal.3"
         case .settings: "gearshape"
         }
@@ -252,6 +256,8 @@ final class ChargingSession {
     var protocolSummary: String
     var hasBatteryData: Bool
     var finalBatteryPercent: Double?
+    var boundAndroidSerial: String?
+    var maxBatteryTempC: Double?
 
     init(
         id: UUID = UUID(),
@@ -260,7 +266,8 @@ final class ChargingSession {
         portIndex: Int,
         portName: String,
         connectedDeviceName: String? = nil,
-        startedAt: Date = Date()
+        startedAt: Date = Date(),
+        boundAndroidSerial: String? = nil
     ) {
         self.id = id
         self.deviceID = deviceID
@@ -280,11 +287,34 @@ final class ChargingSession {
         self.protocolSummary = ""
         self.hasBatteryData = false
         self.finalBatteryPercent = nil
+        self.boundAndroidSerial = boundAndroidSerial
+        self.maxBatteryTempC = nil
+    }
+
+    var isStandaloneBatterySession: Bool {
+        portIndex == 0 || (boundAndroidSerial != nil && peakPowerW == 0 && hasBatteryData)
+    }
+
+    var isAppleSession: Bool {
+        let text = "\(displayTitle) \(connectedDeviceName ?? "") \(deviceName)".lowercased()
+        return text.contains("iphone") || text.contains("ipad") || text.contains("apple") || text.contains("macbook") || text.contains("ios")
     }
 
     var displayTitle: String {
         let title = customTitle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return title.isEmpty ? "\(deviceName) · \(portName)" : title
+        if !title.isEmpty {
+            return title
+        }
+        if isStandaloneBatterySession {
+            if let dev = connectedDeviceName?.trimmingCharacters(in: .whitespacesAndNewlines), !dev.isEmpty {
+                return "\(dev) · 电池监视"
+            }
+            return "Android 电池监视"
+        }
+        if let dev = connectedDeviceName?.trimmingCharacters(in: .whitespacesAndNewlines), !dev.isEmpty {
+            return "\(dev) · \(portName)"
+        }
+        return "\(deviceName) · \(portName)"
     }
 }
 
@@ -305,6 +335,8 @@ final class PortSample {
     var temperature: String?
     var sessionChargeMWh: Int?
     var batteryPercent: Double?
+    var batteryVoltageMV: Int?
+    var batteryTempC: Double?
     var event: String?
 
     init(
@@ -323,6 +355,8 @@ final class PortSample {
         temperature: String? = nil,
         sessionChargeMWh: Int? = nil,
         batteryPercent: Double? = nil,
+        batteryVoltageMV: Int? = nil,
+        batteryTempC: Double? = nil,
         event: String? = nil
     ) {
         self.id = id
@@ -340,6 +374,8 @@ final class PortSample {
         self.temperature = temperature
         self.sessionChargeMWh = sessionChargeMWh
         self.batteryPercent = batteryPercent
+        self.batteryVoltageMV = batteryVoltageMV
+        self.batteryTempC = batteryTempC
         self.event = event
     }
 }
@@ -540,7 +576,7 @@ struct PDPortStatus: Codable, Hashable, Sendable {
             .compactMap { try? container.nestedContainer(keyedBy: DynamicCodingKey.self, forKey: .init($0)) }
         let containers = [container] + nestedContainers
         port = (try? container.decode(Int.self, forKey: .init("port"))) ?? 0
-        batteryPercent = Self.normalizedPercent(Self.decodeFirstDouble(in: containers, keys: [
+        var decodedPercent = Self.normalizedPercent(Self.decodeFirstDouble(in: containers, keys: [
             "battery_percent",
             "batteryPercent",
             "battery_level",
@@ -551,43 +587,108 @@ struct PDPortStatus: Codable, Hashable, Sendable {
             "relative_state_of_charge",
             "capacityPercent"
         ]))
-        manufacturer = Self.decodeFirstString(in: containers, keys: [
-            "manufacturer", "vendor", "brand", "device_manufacturer", "device_vendor", "oem"
+        var decodedMfr = Self.decodeFirstString(in: containers, keys: [
+            "device_brand_zh", "device_brand_en", "device_brand", "brand",
+            "manufacturer", "vendor", "device_manufacturer", "device_vendor", "oem"
         ])
+        if decodedMfr == nil {
+            let vid = Self.decodeFirstInt(in: containers, keys: ["batteryVid", "battery_vid", "manufacturerVid", "manufacturer_vid"])
+            if vid == 0x05AC || vid == 1452 {
+                decodedMfr = "Apple"
+            } else if let vid {
+                decodedMfr = String(format: "0x%04X", vid)
+            }
+        }
+        manufacturer = decodedMfr
         modelName = Self.decodeFirstString(in: containers, keys: [
+            "device_name_zh", "device_name_en", "device_name",
             "model", "model_name", "device_model", "product_name", "name", "product"
         ])
         serialNumber = Self.decodeFirstString(in: containers, keys: [
             "serial", "serial_number", "device_serial", "sn"
         ])
-        batteryCapacityMWh = Self.decodeFirstDouble(in: containers, keys: [
+        let rawDesignCapacity = Self.decodeFirstDouble(in: containers, keys: [
             "battery_capacity_mwh", "batteryCapacityMWh", "capacity_mwh", "design_capacity_mwh",
             "batteryDesignCapacity", "designCapacity", "battery_design_capacity",
             "nominal_capacity_mwh"
         ])
-        batteryLastFullChargeCapacityMWh = Self.decodeFirstDouble(in: containers, keys: [
+        let rawLastFullCapacity = Self.decodeFirstDouble(in: containers, keys: [
             "batteryLastFullChargeCapacity", "lastFullChargeCapacity", "current_max_capacity_mwh",
-            "full_charge_capacity_mwh", "battery_full_charge_capacity_mwh"
+            "full_charge_capacity_mwh", "battery_full_charge_capacity_mwh", "battery_last_full_charge_capacity"
         ])
-        batteryPresentCapacityMWh = Self.decodeFirstDouble(in: containers, keys: [
+        let rawPresentCapacity = Self.decodeFirstDouble(in: containers, keys: [
             "batteryPresentCapacity", "presentCapacity", "current_capacity_mwh",
-            "battery_present_capacity_mwh"
+            "battery_present_capacity_mwh", "battery_present_capacity"
         ])
-        batteryHealthPercent = Self.normalizedPercent(Self.decodeFirstDouble(in: containers, keys: [
+
+        batteryCapacityMWh = Self.normalizeCapacityMWh(rawDesignCapacity)
+        batteryLastFullChargeCapacityMWh = Self.normalizeCapacityMWh(rawLastFullCapacity)
+        batteryPresentCapacityMWh = Self.normalizeCapacityMWh(rawPresentCapacity)
+
+        if decodedPercent == nil, let present = rawPresentCapacity, present > 0 {
+            if let full = rawLastFullCapacity, full > 0 {
+                decodedPercent = min(100.0, max(0.0, (present / full) * 100.0))
+            } else if let design = rawDesignCapacity, design > 0 {
+                decodedPercent = min(100.0, max(0.0, (present / design) * 100.0))
+            }
+        }
+        batteryPercent = decodedPercent
+
+        var decodedHealth = Self.normalizedPercent(Self.decodeFirstDouble(in: containers, keys: [
             "battery_health", "battery_health_percent", "health", "health_percent", "soh",
             "batteryHealth",
             "state_of_health"
         ]))
-        estimatedFullMinutes = Self.decodeFirstDouble(in: containers, keys: [
+        if decodedHealth == nil, let full = rawLastFullCapacity, let design = rawDesignCapacity, design > 0, full > 0 {
+            decodedHealth = min(100.0, max(0.0, (full / design) * 100.0))
+        }
+        batteryHealthPercent = decodedHealth
+
+        var decodedFullMins = Self.decodeFirstDouble(in: containers, keys: [
             "estimated_full_minutes", "estimate_full_minutes", "time_to_full_minutes",
             "minutes_to_full", "time_to_full_min", "remaining_charge_minutes"
         ])
-        remainingTimeText = Self.decodeFirstString(in: containers, keys: [
+        var decodedRemainingTime = Self.decodeFirstString(in: containers, keys: [
             "remainingTimeStr", "remaining_time_str", "remainingTime", "timeToFullText"
         ])
+
+        let batteryStatus = Self.decodeFirstInt(in: containers, keys: ["battery_status", "batteryStatus"])
+        if decodedFullMins == nil, (batteryStatus == nil || batteryStatus == 0) {
+            let v = Self.decodeFirstDouble(in: containers, keys: ["operating_voltage", "voltage", "operatingVoltage"])
+            let c = Self.decodeFirstDouble(in: containers, keys: ["operating_current", "current", "operatingCurrent"])
+            if let v, let c, v > 0, c > 0,
+               let full = batteryLastFullChargeCapacityMWh ?? batteryCapacityMWh,
+               let pres = batteryPresentCapacityMWh, full > pres {
+                let volts = v > 1000 ? v / 1000.0 : (v > 100 ? v / 100.0 : v)
+                let amps = c > 1000 ? c / 1000.0 : (c > 100 ? c / 100.0 : c)
+                let powerW = max(1.0, volts * amps)
+                let remWh = (full - pres) / 1000.0
+                let hours = remWh / powerW
+                decodedFullMins = min(600.0, max(1.0, hours * 60.0))
+            }
+        }
+        if decodedRemainingTime == nil, let mins = decodedFullMins {
+            let intMins = Int(round(mins))
+            if intMins >= 60 {
+                decodedRemainingTime = "\(intMins / 60)小时\(intMins % 60)分钟"
+            } else {
+                decodedRemainingTime = "\(intMins) 分钟"
+            }
+        }
+        estimatedFullMinutes = decodedFullMins
+        remainingTimeText = decodedRemainingTime
+
         cycleCount = Self.decodeFirstInt(in: containers, keys: [
             "cycle_count", "battery_cycle_count", "cycles"
         ])
+    }
+
+    private static func normalizeCapacityMWh(_ val: Double?) -> Double? {
+        guard let val, val > 0 else { return nil }
+        if val <= 1000 {
+            return val * 100.0
+        }
+        return val
     }
 
     func encode(to encoder: Encoder) throws {
@@ -706,11 +807,43 @@ struct PortViewState: Identifiable, Hashable {
     var detail: PortDetail?
     var pdStatus: PDPortStatus?
     var charging: Bool
+    var boundADBDevice: ADBDevice? = nil
 
     var id: Int { port.index }
 
+    var isAppleDevice: Bool {
+        if let model = pdStatus?.modelName?.lowercased() {
+            if model.contains("iphone") || model.contains("ipad") || model.contains("macbook") || model.contains("apple") || model.contains("ios") {
+                return true
+            }
+        }
+        if let name = detail?.deviceNameZH?.lowercased() ?? detail?.deviceNameEN?.lowercased() {
+            if name.contains("iphone") || name.contains("ipad") || name.contains("macbook") || name.contains("apple") || name.contains("ios") {
+                return true
+            }
+        }
+        return false
+    }
+
     var powerW: Double { detail?.powerW ?? 0 }
-    var batteryPercent: Double? { pdStatus?.batteryPercent }
+    
+    // 如果是 Apple/iPhone 设备，绝对与 ADB 解耦，仅读取小电拼原生 PD 报文中的电池数据
+    var batteryPercent: Double? {
+        if isAppleDevice {
+            return pdStatus?.batteryPercent
+        }
+        return boundADBDevice?.batteryPercent ?? pdStatus?.batteryPercent
+    }
+    
+    var batteryTempC: Double? {
+        if isAppleDevice { return nil }
+        return boundADBDevice?.batteryTempC
+    }
+    
+    var batteryVoltageMV: Int? {
+        if isAppleDevice { return nil }
+        return boundADBDevice?.batteryVoltageMV
+    }
     var voltageText: String { "\(detail?.voutMV ?? 0) mV" }
     var currentText: String { "\(detail?.ioutMA ?? 0) mA" }
     var protocolName: String { detail?.fcProtocol ?? "Unknown" }
@@ -735,6 +868,8 @@ struct ChartSamplePoint: Identifiable, Hashable {
     let voltageV: Double
     let currentA: Double
     let temperatureScore: Double
+    let batteryPercent: Double?
+    let batteryTempC: Double?
 
     init(
         timestamp: Date,
@@ -744,7 +879,9 @@ struct ChartSamplePoint: Identifiable, Hashable {
         powerW: Double,
         voltageV: Double,
         currentA: Double,
-        temperatureScore: Double
+        temperatureScore: Double,
+        batteryPercent: Double? = nil,
+        batteryTempC: Double? = nil
     ) {
         self.timestamp = timestamp
         self.portIndex = portIndex
@@ -754,6 +891,8 @@ struct ChartSamplePoint: Identifiable, Hashable {
         self.voltageV = voltageV
         self.currentA = currentA
         self.temperatureScore = temperatureScore
+        self.batteryPercent = batteryPercent
+        self.batteryTempC = batteryTempC
 
         var bytes = [UInt8](repeating: 0, count: 16)
         
@@ -955,3 +1094,278 @@ enum LocalizedTelemetry {
         }
     }
 }
+
+// MARK: - Wireless ADB Models
+
+struct ADBDevice: Identifiable, Hashable, Sendable {
+    let serial: String
+    var brand: String
+    var model: String
+    var isOnline: Bool
+    var isWireless: Bool
+    var ip: String?
+    var port: Int?
+    var batteryPercent: Double?
+    var batteryVoltageMV: Int?
+    var batteryTempC: Double?
+    var batteryStatus: String?
+    var isCharging: Bool
+    var lastSeenAt: Date
+
+    var id: String { serial }
+
+    var virtualDeviceID: UUID {
+        Self.virtualDeviceID(for: serial)
+    }
+
+    static func virtualDeviceID(for serial: String) -> UUID {
+        let clean = serial.trimmingCharacters(in: .whitespacesAndNewlines)
+        let digest = Insecure.MD5.hash(data: Data("ADBDevice:\(clean)".utf8))
+        var bytes = [UInt8](digest)
+        bytes[6] = (bytes[6] & 0x0F) | 0x50 // version 5
+        bytes[8] = (bytes[8] & 0x3F) | 0x80 // variant
+        return UUID(uuid: (
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[8], bytes[9], bytes[10], bytes[11],
+            bytes[12], bytes[13], bytes[14], bytes[15]
+        ))
+    }
+
+    init(
+        serial: String,
+        brand: String = "",
+        model: String = "",
+        isOnline: Bool = true,
+        isWireless: Bool = false,
+        ip: String? = nil,
+        port: Int? = nil,
+        batteryPercent: Double? = nil,
+        batteryVoltageMV: Int? = nil,
+        batteryTempC: Double? = nil,
+        batteryStatus: String? = nil,
+        isCharging: Bool = false,
+        lastSeenAt: Date = Date()
+    ) {
+        self.serial = serial
+        self.brand = brand
+        self.model = model
+        self.isOnline = isOnline
+        self.isWireless = isWireless
+        self.ip = ip
+        self.port = port
+        self.batteryPercent = batteryPercent
+        self.batteryVoltageMV = batteryVoltageMV
+        self.batteryTempC = batteryTempC
+        self.batteryStatus = batteryStatus
+        self.isCharging = isCharging
+        self.lastSeenAt = lastSeenAt
+    }
+
+    var displayName: String {
+        let cleanModel = model.replacingOccurrences(of: "_", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanBrand = brand.replacingOccurrences(of: "_", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cleanModel.isEmpty {
+            if !cleanBrand.isEmpty && !cleanModel.lowercased().contains(cleanBrand.lowercased()) {
+                return "\(cleanBrand) \(cleanModel)"
+            }
+            return cleanModel
+        }
+        return serial
+    }
+
+    var shortAddress: String {
+        if isWireless, let ip, let port {
+            return "\(ip):\(port)"
+        }
+        return serial
+    }
+}
+
+struct ADBConnectionHistory: Codable, Identifiable, Hashable, Sendable {
+    var id: String { "\(host):\(port)" }
+    let host: String
+    let port: Int
+    var displayName: String?
+    var lastConnectedAt: Date
+
+    init(host: String, port: Int, displayName: String? = nil, lastConnectedAt: Date = Date()) {
+        self.host = host
+        self.port = port
+        self.displayName = displayName
+        self.lastConnectedAt = lastConnectedAt
+    }
+}
+
+// MARK: - Charging Session Analytics (ChargerLAB Style)
+
+struct ChargingSessionAnalytics: Sendable, Equatable {
+    let peakPowerW: Double
+    let averagePowerW: Double
+    let peakDurationS: Double
+    let maxBatteryTempC: Double?
+    let minBatteryTempC: Double?
+    let initialBatteryPercent: Double?
+    let finalBatteryPercent: Double?
+    let timeTo50PercentS: Double?
+    let timeTo80PercentS: Double?
+    let timeTo100PercentS: Double?
+    let timeToFullChargeS: Double?
+    let isTrickleCharging: Bool
+    let powerAt30PercentW: Double?
+    let powerAt50PercentW: Double?
+    let powerAt80PercentW: Double?
+    let estimatedEnergyWh: Double
+    let sampleCount: Int
+
+    var tempRiseC: Double? {
+        guard let max = maxBatteryTempC, let min = minBatteryTempC else { return nil }
+        return max - min
+    }
+
+    static func analyze(session: ChargingSession, samples: [PortSample]) -> ChargingSessionAnalytics {
+        let sortedSamples = samples.sorted(by: { $0.timestamp < $1.timestamp })
+        let powerValues = sortedSamples.map(\.powerW)
+        let peakPower = powerValues.max() ?? session.peakPowerW
+        let avgPower = powerValues.isEmpty ? session.averagePowerW : powerValues.reduce(0, +) / Double(powerValues.count)
+
+        // Peak duration: total time where power >= 90% of peak (and peak > 1.0W)
+        var peakDuration: Double = 0
+        if peakPower > 1.0 && sortedSamples.count > 1 {
+            let threshold = peakPower * 0.90
+            for i in 0..<(sortedSamples.count - 1) {
+                let s1 = sortedSamples[i]
+                let s2 = sortedSamples[i + 1]
+                if s1.powerW >= threshold {
+                    let dt = min(max(0, s2.timestamp.timeIntervalSince(s1.timestamp)), 10.0)
+                    peakDuration += dt
+                }
+            }
+        }
+
+        let batteryTemps = sortedSamples.compactMap(\.batteryTempC)
+        let maxTemp = batteryTemps.max()
+        let minTemp = batteryTemps.min()
+
+        let batterySamples = sortedSamples.filter { $0.batteryPercent != nil }
+        let initialBat = batterySamples.first?.batteryPercent
+        let finalBat = batterySamples.last?.batteryPercent ?? session.finalBatteryPercent
+
+        // Time to 50%, 80%, 100% (UI)
+        var t50: Double?
+        var t80: Double?
+        var t100: Double?
+        var sample100: PortSample?
+
+        if let initB = initialBat {
+            if initB < 50, let s50 = batterySamples.first(where: { ($0.batteryPercent ?? 0) >= 50 }) {
+                t50 = s50.timestamp.timeIntervalSince(session.startedAt)
+            }
+            if initB < 80, let s80 = batterySamples.first(where: { ($0.batteryPercent ?? 0) >= 80 }) {
+                t80 = s80.timestamp.timeIntervalSince(session.startedAt)
+            }
+            if initB < 99.5, let s100 = batterySamples.first(where: { ($0.batteryPercent ?? 0) >= 99.5 }) {
+                t100 = s100.timestamp.timeIntervalSince(session.startedAt)
+                sample100 = s100
+            }
+        }
+
+        // Time to Actual Full Charge (Trickle Finished)
+        var tFull: Double?
+        var isTrickle = false
+
+        let reachedFullBattery = (sample100 != nil) || (initialBat != nil && initialBat! >= 99.5) || (finalBat != nil && finalBat! >= 99.5)
+        let isTrickleEndedReason = session.endReason == "trickle_charge" || session.endReason == "battery_full"
+
+        if reachedFullBattery || isTrickleEndedReason {
+            let baselineTime = sample100?.timestamp ?? session.startedAt
+            let samplesAfter100 = sortedSamples.filter { $0.timestamp >= baselineTime }
+
+            // 1. 优先检查显式充满事件
+            if let fullEventSample = samplesAfter100.first(where: {
+                $0.event == "battery_full" || $0.protocolName == "已充满" || $0.protocolName.contains("充满")
+            }) {
+                tFull = max(fullEventSample.timestamp.timeIntervalSince(session.startedAt), t100 ?? 0)
+            } else {
+                // 2. 检查功率截止（Trickle Cut-off）：功率降至 <= 0.8W 且后续保持低功率
+                let cutoffThresholdW = 0.8
+                var cutoffSample: PortSample?
+
+                for (idx, sample) in samplesAfter100.enumerated() {
+                    if sample.powerW <= cutoffThresholdW {
+                        let subsequent = samplesAfter100[idx...]
+                        let maxSubsequentPower = subsequent.map(\.powerW).max() ?? 0
+                        if maxSubsequentPower <= 2.0 {
+                            cutoffSample = sample
+                            break
+                        }
+                    }
+                }
+
+                if let cutoff = cutoffSample {
+                    tFull = max(cutoff.timestamp.timeIntervalSince(session.startedAt), t100 ?? 0)
+                } else if let endedAt = session.endedAt {
+                    if isTrickleEndedReason {
+                        tFull = max(endedAt.timeIntervalSince(session.startedAt), t100 ?? 0)
+                    } else if let lastSample = sortedSamples.last, lastSample.powerW <= 2.0 {
+                        tFull = max(lastSample.timestamp.timeIntervalSince(session.startedAt), t100 ?? 0)
+                    }
+                } else if reachedFullBattery {
+                    isTrickle = true
+                }
+            }
+        }
+
+        // Power at 30%, 50%, 80%
+        func nearestPower(targetPercent: Double) -> Double? {
+            guard !batterySamples.isEmpty else { return nil }
+            if let initB = initialBat, initB > targetPercent + 1.0 {
+                return nil
+            }
+            let nearest = batterySamples.min(by: {
+                abs(($0.batteryPercent ?? 0) - targetPercent) < abs(($1.batteryPercent ?? 0) - targetPercent)
+            })
+            if let nearest, abs((nearest.batteryPercent ?? 0) - targetPercent) <= 5.0 {
+                return nearest.powerW
+            }
+            return nil
+        }
+
+        let p30 = nearestPower(targetPercent: 30)
+        let p50 = nearestPower(targetPercent: 50)
+        let p80 = nearestPower(targetPercent: 80)
+
+        // Estimated Energy
+        var energyWh = 0.0
+        if sortedSamples.count > 1 {
+            for i in 0..<(sortedSamples.count - 1) {
+                let s1 = sortedSamples[i]
+                let s2 = sortedSamples[i + 1]
+                let dt = min(max(0, s2.timestamp.timeIntervalSince(s1.timestamp)), 10.0)
+                energyWh += ((s1.powerW + s2.powerW) / 2.0) * dt
+            }
+            energyWh /= 3600.0
+        }
+
+        return ChargingSessionAnalytics(
+            peakPowerW: peakPower,
+            averagePowerW: avgPower,
+            peakDurationS: peakDuration,
+            maxBatteryTempC: maxTemp,
+            minBatteryTempC: minTemp,
+            initialBatteryPercent: initialBat,
+            finalBatteryPercent: finalBat,
+            timeTo50PercentS: t50,
+            timeTo80PercentS: t80,
+            timeTo100PercentS: t100,
+            timeToFullChargeS: tFull,
+            isTrickleCharging: isTrickle,
+            powerAt30PercentW: p30,
+            powerAt50PercentW: p50,
+            powerAt80PercentW: p80,
+            estimatedEnergyWh: energyWh,
+            sampleCount: sortedSamples.count
+        )
+    }
+}
+

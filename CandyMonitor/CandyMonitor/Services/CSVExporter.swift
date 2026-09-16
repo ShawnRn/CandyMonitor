@@ -5,13 +5,17 @@ enum CSVExporter {
         var lines = [csvRow([
             "timestamp_utc",
             "elapsed_s",
+            "power_w",
+            "voltage_v",
+            "current_a",
+            "battery_percent",
+            "battery_voltage_mv",
+            "battery_temp_c",
             "voltage_mv",
             "current_ma",
-            "power_w",
             "temperature_state",
             "protocol",
             "connected",
-            "battery_percent",
             "event"
         ])]
 
@@ -19,13 +23,17 @@ enum CSVExporter {
             lines.append(csvRow([
                 iso8601.string(from: sample.timestamp),
                 number(sample.timestamp.timeIntervalSince(session.startedAt)),
+                number(sample.powerW),
+                String(format: "%.3f", Double(sample.voltageMV) / 1000.0),
+                String(format: "%.3f", Double(sample.currentMA) / 1000.0),
+                sample.batteryPercent.map { number($0) } ?? "",
+                sample.batteryVoltageMV.map { "\($0)" } ?? "",
+                sample.batteryTempC.map { String(format: "%.1f", $0) } ?? "",
                 "\(sample.voltageMV)",
                 "\(sample.currentMA)",
-                number(sample.powerW),
                 sample.temperature ?? "",
                 sample.protocolName,
                 sample.connected == true ? "true" : "false",
-                sample.batteryPercent.map { number($0) } ?? "",
                 sample.event ?? ""
             ]))
         }
@@ -49,55 +57,86 @@ enum CSVExporter {
 
     static func makeMetadataJSON(session: ChargingSession, samples: [PortSample]) throws -> Data {
         let duration = (session.endedAt ?? samples.last?.timestamp ?? Date()).timeIntervalSince(session.startedAt)
+        let analytics = ChargingSessionAnalytics.analyze(session: session, samples: samples)
         let metadata: [String: Any] = [
-            "schema_version": 1,
+            "schema_version": 2,
             "device_name": session.deviceName,
             "port_name": session.portName,
             "connected_device_name": session.connectedDeviceName ?? NSNull(),
+            "bound_android_serial": session.boundAndroidSerial ?? NSNull(),
             "started_at": iso8601.string(from: session.startedAt),
             "ended_at": session.endedAt.map { iso8601.string(from: $0) } ?? NSNull(),
             "duration_s": Int(duration.rounded()),
             "end_reason": session.endReason ?? NSNull(),
             "sample_count": samples.count,
-            "peak_power_w": session.peakPowerW,
-            "average_power_w": session.averagePowerW,
+            "peak_power_w": analytics.peakPowerW,
+            "average_power_w": analytics.averagePowerW,
+            "peak_duration_s": analytics.peakDurationS,
             "min_voltage_mv": session.minVoltageMV,
             "max_voltage_mv": session.maxVoltageMV,
             "protocol_summary": session.protocolSummary,
-            "final_battery_percent": session.finalBatteryPercent ?? NSNull(),
-            "estimated_energy_wh": estimatedEnergyWh(samples: samples)
+            "initial_battery_percent": analytics.initialBatteryPercent ?? NSNull(),
+            "final_battery_percent": analytics.finalBatteryPercent ?? NSNull(),
+            "max_battery_temp_c": analytics.maxBatteryTempC ?? NSNull(),
+            "time_to_50_percent_s": analytics.timeTo50PercentS ?? NSNull(),
+            "time_to_80_percent_s": analytics.timeTo80PercentS ?? NSNull(),
+            "time_to_100_percent_s": analytics.timeTo100PercentS ?? NSNull(),
+            "time_to_full_charge_s": analytics.timeToFullChargeS ?? NSNull(),
+            "power_at_30_percent_w": analytics.powerAt30PercentW ?? NSNull(),
+            "power_at_50_percent_w": analytics.powerAt50PercentW ?? NSNull(),
+            "power_at_80_percent_w": analytics.powerAt80PercentW ?? NSNull(),
+            "estimated_energy_wh": analytics.estimatedEnergyWh
         ]
         return try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys])
     }
 
     static func makeAISummaryJSON(session: ChargingSession, samples: [PortSample]) throws -> Data {
-        let powerValues = samples.map(\.powerW)
-        let peakPower = powerValues.max() ?? 0
+        let analytics = ChargingSessionAnalytics.analyze(session: session, samples: samples)
+        let powerDict: [String: Any] = [
+            "peak_w": analytics.peakPowerW,
+            "average_w": analytics.averagePowerW,
+            "peak_duration_s": analytics.peakDurationS,
+            "final_w": samples.last?.powerW ?? 0
+        ]
+        let batteryDict: [String: Any] = [
+            "initial_percent": analytics.initialBatteryPercent ?? NSNull(),
+            "final_percent": analytics.finalBatteryPercent ?? NSNull(),
+            "max_temperature_c": analytics.maxBatteryTempC ?? NSNull(),
+            "time_to_50_pct_s": analytics.timeTo50PercentS ?? NSNull(),
+            "time_to_80_pct_s": analytics.timeTo80PercentS ?? NSNull(),
+            "time_to_100_pct_s": analytics.timeTo100PercentS ?? NSNull(),
+            "time_to_full_charge_s": analytics.timeToFullChargeS ?? NSNull(),
+            "power_at_30_pct_w": analytics.powerAt30PercentW ?? NSNull(),
+            "power_at_50_pct_w": analytics.powerAt50PercentW ?? NSNull(),
+            "power_at_80_pct_w": analytics.powerAt80PercentW ?? NSNull()
+        ]
+        let voltageDict: [String: Any] = [
+            "min": samples.map(\.voltageMV).min() ?? 0,
+            "max": samples.map(\.voltageMV).max() ?? 0
+        ]
+        var eventsList: [[String: Any]] = []
+        for sample in samples {
+            if let event = sample.event, !event.isEmpty {
+                eventsList.append([
+                    "timestamp_utc": iso8601.string(from: sample.timestamp),
+                    "elapsed_s": sample.timestamp.timeIntervalSince(session.startedAt),
+                    "event": event
+                ])
+            }
+        }
         let summary: [String: Any] = [
             "title": session.displayTitle,
             "device": session.deviceName,
             "port": session.portName,
+            "connected_device": session.connectedDeviceName ?? "Unknown",
             "started_at": iso8601.string(from: session.startedAt),
             "ended_at": session.endedAt.map { iso8601.string(from: $0) } ?? NSNull(),
             "sample_count": samples.count,
-            "power": [
-                "peak_w": peakPower,
-                "average_w": samples.isEmpty ? 0 : powerValues.reduce(0, +) / Double(samples.count),
-                "final_w": samples.last?.powerW ?? 0
-            ],
-            "voltage_mv": [
-                "min": samples.map(\.voltageMV).min() ?? 0,
-                "max": samples.map(\.voltageMV).max() ?? 0
-            ],
-            "estimated_energy_wh": estimatedEnergyWh(samples: samples),
-            "events": samples.compactMap { sample -> [String: Any]? in
-                guard let event = sample.event, event.isEmpty == false else { return nil }
-                return [
-                    "timestamp_utc": iso8601.string(from: sample.timestamp),
-                    "elapsed_s": sample.timestamp.timeIntervalSince(session.startedAt),
-                    "event": event
-                ]
-            }
+            "power": powerDict,
+            "battery": batteryDict,
+            "voltage_mv": voltageDict,
+            "estimated_energy_wh": analytics.estimatedEnergyWh,
+            "events": eventsList
         ]
         return try JSONSerialization.data(withJSONObject: summary, options: [.prettyPrinted, .sortedKeys])
     }
@@ -109,11 +148,12 @@ enum CSVExporter {
         Session: \(session.displayTitle)
         Device: \(session.deviceName)
         Port: \(session.portName)
+        Connected Device: \(session.connectedDeviceName ?? "Unknown")
 
         Files:
-        - samples.csv: pure sample table, first row is the header.
+        - samples.csv: unified telemetry table including port power, voltage, current and Android battery/temperature.
         - events.csv: notable session events when available.
-        - metadata.json: device, time range, summary statistics, and estimated energy.
+        - metadata.json: device, time range, ChargerLAB summary statistics, and estimated energy.
         - ai_summary.json: compact structured summary for LLM analysis.
         - schema.json: field names and units for samples.csv.
         """
@@ -124,13 +164,17 @@ enum CSVExporter {
             "samples_csv": [
                 "timestamp_utc": "ISO-8601 UTC timestamp",
                 "elapsed_s": "seconds since session start",
-                "voltage_mv": "millivolts",
-                "current_ma": "milliamps",
-                "power_w": "watts",
-                "temperature_state": "device temperature state string",
-                "protocol": "raw fast-charge protocol",
-                "connected": "true when load is detected",
-                "battery_percent": "0-100 when available",
+                "power_w": "charging power in watts",
+                "voltage_v": "port voltage in volts",
+                "current_a": "port current in amperes",
+                "battery_percent": "battery level (0-100)",
+                "battery_voltage_mv": "battery cell voltage in millivolts",
+                "battery_temp_c": "battery temperature in Celsius",
+                "voltage_mv": "port voltage in millivolts",
+                "current_ma": "port current in milliamps",
+                "temperature_state": "port die temperature state",
+                "protocol": "fast-charge protocol",
+                "connected": "load connection status",
                 "event": "optional event label"
             ]
         ]

@@ -76,7 +76,7 @@ struct ContentView: View {
 
     @ViewBuilder
     private var detail: some View {
-        if store.hasDevices == false {
+        if store.hasDevices == false && store.selectedSection != .wirelessADB && store.selectedSection != .settings {
             EmptyDeviceView {
                 store.isShowingAddDevice = true
             }
@@ -86,6 +86,8 @@ struct ContentView: View {
                 NativeMonitorView(store: store)
             case .sessions:
                 SessionsView(store: store)
+            case .wirelessADB:
+                WirelessADBConsoleView(store: store)
             case .control:
                 ControlConsoleView(store: store)
             case .settings:
@@ -344,6 +346,8 @@ private struct NativeMonitorView: View {
                         totalPowerW: store.totalPowerW
                     )
 
+                    WirelessADBBar(store: store)
+
                     ViewThatFits(in: .horizontal) {
                         HStack(alignment: .top, spacing: 12) {
                             topologyPanel
@@ -433,7 +437,7 @@ private struct NativeMonitorView: View {
                     }
                 }
                 .pickerStyle(.segmented)
-                .frame(width: 320)
+                .frame(minWidth: 400)
             }
             .frame(maxWidth: .infinity, alignment: .trailing)
 
@@ -1147,6 +1151,8 @@ private enum ChartMetric: String, CaseIterable, Identifiable {
     case voltage
     case current
     case temperature
+    case batteryPercent
+    case batteryTemp
 
     var id: String { rawValue }
 
@@ -1155,7 +1161,9 @@ private enum ChartMetric: String, CaseIterable, Identifiable {
         case .power: "功率"
         case .voltage: "电压"
         case .current: "电流"
-        case .temperature: "温度"
+        case .temperature: "板温"
+        case .batteryPercent: "手机电量"
+        case .batteryTemp: "电池温度"
         }
     }
 
@@ -1164,7 +1172,9 @@ private enum ChartMetric: String, CaseIterable, Identifiable {
         case .power: "W"
         case .voltage: "V"
         case .current: "A"
-        case .temperature: "温度等级"
+        case .temperature: "等级"
+        case .batteryPercent: "%"
+        case .batteryTemp: "℃"
         }
     }
 
@@ -1177,6 +1187,8 @@ private enum ChartMetric: String, CaseIterable, Identifiable {
         case .current:
             sample.currentA < Self.idleCurrentDeadband ? 0 : sample.currentA
         case .temperature: sample.temperatureScore
+        case .batteryPercent: sample.batteryPercent ?? 0
+        case .batteryTemp: sample.batteryTempC ?? 0
         }
     }
 
@@ -1190,6 +1202,10 @@ private enum ChartMetric: String, CaseIterable, Identifiable {
             return String(format: "%.2f A", displayValue(sample))
         case .temperature:
             return String(format: "%.0f", sample.temperatureScore)
+        case .batteryPercent:
+            return sample.batteryPercent.map { String(format: "%.0f%%", $0) } ?? "--"
+        case .batteryTemp:
+            return sample.batteryTempC.map { String(format: "%.1f ℃", $0) } ?? "--"
         }
     }
 
@@ -1204,6 +1220,10 @@ private enum ChartMetric: String, CaseIterable, Identifiable {
             return 0...(max(5, ceil(maxValue * 1.1)))
         case .temperature:
             return 0...(max(5, ceil(maxValue * 1.1)))
+        case .batteryPercent:
+            return 0...100
+        case .batteryTemp:
+            return 20...(max(45, ceil(maxValue * 1.1)))
         }
     }
 
@@ -1313,25 +1333,322 @@ private func nearestSamplesByPort(to date: Date, in samples: [ChartSamplePoint])
     }
 }
 
+struct SessionChartPoint: Identifiable, Sendable, Equatable {
+    let id: UUID
+    let timestamp: Date
+    let powerW: Double
+    let batteryPercent: Double?
+    let batteryTempC: Double?
+}
+
+struct SessionChartData: Equatable {
+    let points: [SessionChartPoint]
+    let isStandaloneBattery: Bool
+    let maxPower: Double
+    let hasBatteryData: Bool
+    let hasTempData: Bool
+}
+
+enum SessionChartProcessor {
+    static func process(samples: [PortSample], maxPoints: Int = 260) -> SessionChartData {
+        guard !samples.isEmpty else {
+            return SessionChartData(points: [], isStandaloneBattery: false, maxPower: 30.0, hasBatteryData: false, hasTempData: false)
+        }
+
+        let hasBattery = samples.contains { $0.batteryPercent != nil }
+        let hasTemp = samples.contains { $0.batteryTempC != nil }
+        let isStandalone = samples.allSatisfy { $0.powerW == 0 } && hasBattery
+        let maxSamplePower = samples.map(\.powerW).max() ?? 30.0
+        let maxPower = max(30.0, ceil(maxSamplePower * 1.15 / 10.0) * 10.0)
+
+        // 1. 提取基础时序点
+        var rawPoints: [(id: UUID, timestamp: Date, powerW: Double, rawBattery: Double?, tempC: Double?)] = []
+        rawPoints.reserveCapacity(samples.count)
+        for s in samples {
+            rawPoints.append((s.id, s.timestamp, s.powerW, s.batteryPercent, s.batteryTempC))
+        }
+
+        // 2. 双向 EMA 滤波（平滑阶梯状整数电量，消除 1Hz 采样台阶）
+        var smoothedBatteries: [Double?] = Array(repeating: nil, count: rawPoints.count)
+        if hasBattery {
+            let validIndices = rawPoints.indices.filter { rawPoints[$0].rawBattery != nil }
+            if validIndices.count >= 2 {
+                let firstVal = rawPoints[validIndices.first!].rawBattery!
+                let lastVal = rawPoints[validIndices.last!].rawBattery!
+                let isCharging = lastVal >= firstVal
+                
+                let alpha = 0.08
+                var fwd = Array(repeating: 0.0, count: validIndices.count)
+                var currentFwd = firstVal
+                for i in 0..<validIndices.count {
+                    let val = rawPoints[validIndices[i]].rawBattery!
+                    currentFwd = alpha * val + (1.0 - alpha) * currentFwd
+                    fwd[i] = currentFwd
+                }
+                
+                var bwd = Array(repeating: 0.0, count: validIndices.count)
+                var currentBwd = lastVal
+                for i in (0..<validIndices.count).reversed() {
+                    currentBwd = alpha * fwd[i] + (1.0 - alpha) * currentBwd
+                    bwd[i] = currentBwd
+                }
+                
+                // 锚定起点与终点，并严格保障充放电单调性
+                bwd[0] = firstVal
+                bwd[validIndices.count - 1] = lastVal
+                if isCharging {
+                    for i in 1..<validIndices.count {
+                        bwd[i] = max(bwd[i - 1], bwd[i])
+                    }
+                } else {
+                    for i in 1..<validIndices.count {
+                        bwd[i] = min(bwd[i - 1], bwd[i])
+                    }
+                }
+                
+                for (k, origIdx) in validIndices.enumerated() {
+                    smoothedBatteries[origIdx] = bwd[k]
+                }
+            } else if let only = validIndices.first {
+                smoothedBatteries[only] = rawPoints[only].rawBattery
+            }
+        }
+
+        // 3. 构建平滑序列
+        var processedPoints: [SessionChartPoint] = []
+        processedPoints.reserveCapacity(rawPoints.count)
+        for i in 0..<rawPoints.count {
+            let r = rawPoints[i]
+            processedPoints.append(
+                SessionChartPoint(
+                    id: r.id,
+                    timestamp: r.timestamp,
+                    powerW: r.powerW,
+                    batteryPercent: smoothedBatteries[i] ?? r.rawBattery,
+                    batteryTempC: r.tempC
+                )
+            )
+        }
+
+        // 4. 智能桶降采样至 maxPoints (<= 260 点)
+        let finalPoints: [SessionChartPoint]
+        if processedPoints.count <= maxPoints {
+            finalPoints = processedPoints
+        } else {
+            let bucketCount = maxPoints
+            let bucketSize = Double(processedPoints.count) / Double(bucketCount)
+            var reduced: [SessionChartPoint] = []
+            reduced.reserveCapacity(bucketCount + 2)
+
+            reduced.append(processedPoints.first!) // 严格保留首点
+
+            for b in 0..<bucketCount {
+                let startIdx = Int(Double(b) * bucketSize)
+                let endIdx = min(Int(Double(b + 1) * bucketSize), processedPoints.count)
+                guard startIdx < endIdx else { continue }
+                let slice = processedPoints[startIdx..<endIdx]
+
+                if isStandalone {
+                    let midIdx = startIdx + slice.count / 2
+                    let candidate = processedPoints[midIdx]
+                    if candidate.id != reduced.last?.id {
+                        reduced.append(candidate)
+                    }
+                } else {
+                    var peakSample = slice.first!
+                    for s in slice where s.powerW > peakSample.powerW {
+                        peakSample = s
+                    }
+                    if peakSample.id != reduced.last?.id {
+                        reduced.append(peakSample)
+                    }
+                }
+            }
+
+            let lastPoint = processedPoints.last!
+            if reduced.last?.id != lastPoint.id {
+                reduced.append(lastPoint) // 严格保留末点
+            }
+            finalPoints = reduced
+        }
+
+        return SessionChartData(
+            points: finalPoints,
+            isStandaloneBattery: isStandalone,
+            maxPower: maxPower,
+            hasBatteryData: hasBattery,
+            hasTempData: hasTemp
+        )
+    }
+}
+
 private struct StaticSessionChart: View, Equatable {
     let plottedSamples: [PortSample]
+    var showPower: Bool = true
+    var showBattery: Bool = true
+    var showTemp: Bool = false
 
     static func == (lhs: StaticSessionChart, rhs: StaticSessionChart) -> Bool {
         lhs.plottedSamples.count == rhs.plottedSamples.count &&
-        lhs.plottedSamples.last?.id == rhs.plottedSamples.last?.id
+        lhs.plottedSamples.last?.id == rhs.plottedSamples.last?.id &&
+        lhs.showPower == rhs.showPower &&
+        lhs.showBattery == rhs.showBattery &&
+        lhs.showTemp == rhs.showTemp
     }
 
     var body: some View {
-        Chart(plottedSamples) { sample in
-            LineMark(
-                x: .value("时间", sample.timestamp),
-                y: .value("功率", sample.powerW)
-            )
-            .foregroundStyle(CandyTheme.syrup)
-            .lineStyle(StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
-            .interpolationMethod(.linear)
+        let data = SessionChartProcessor.process(samples: plottedSamples)
+        StaticSessionChartCanvas(
+            data: data,
+            showPower: showPower,
+            showBattery: showBattery,
+            showTemp: showTemp
+        )
+        .equatable()
+    }
+}
+
+private struct StaticSessionChartCanvas: View, Equatable {
+    let data: SessionChartData
+    let showPower: Bool
+    let showBattery: Bool
+    let showTemp: Bool
+
+    static func == (lhs: StaticSessionChartCanvas, rhs: StaticSessionChartCanvas) -> Bool {
+        lhs.data == rhs.data &&
+        lhs.showPower == rhs.showPower &&
+        lhs.showBattery == rhs.showBattery &&
+        lhs.showTemp == rhs.showTemp
+    }
+
+    var body: some View {
+        let peak = data.isStandaloneBattery ? 100.0 : data.maxPower
+        Chart {
+            // 1. 功率曲线 (仅在非纯电池独立模式下绘制左轴功率)
+            if showPower && !data.isStandaloneBattery {
+                ForEach(data.points) { point in
+                    LineMark(
+                        x: .value("时间", point.timestamp),
+                        y: .value("功率 (W)", point.powerW),
+                        series: .value("指标", "功率")
+                    )
+                    .foregroundStyle(CandyTheme.syrup)
+                    .lineStyle(StrokeStyle(lineWidth: 2.8, lineCap: .round, lineJoin: .round))
+                    .interpolationMethod(.monotone)
+                }
+            }
+
+            // 2. 手机电量曲线 (单调平滑，消除锯齿阶梯)
+            if data.hasBatteryData && showBattery {
+                ForEach(data.points) { point in
+                    if let pct = point.batteryPercent {
+                        let yVal = data.isStandaloneBattery ? pct : ((pct / 100.0) * peak)
+                        LineMark(
+                            x: .value("时间", point.timestamp),
+                            y: .value("电量 (%)", yVal),
+                            series: .value("指标", "电量")
+                        )
+                        .foregroundStyle(CandyTheme.mint)
+                        .lineStyle(StrokeStyle(lineWidth: 2.5, lineCap: .round, lineJoin: .round))
+                        .interpolationMethod(.monotone)
+
+                        AreaMark(
+                            x: .value("时间", point.timestamp),
+                            y: .value("电量 (%)", yVal),
+                            series: .value("指标", "电量")
+                        )
+                        .foregroundStyle(
+                            LinearGradient(
+                                colors: [CandyTheme.mint.opacity(0.12), CandyTheme.mint.opacity(0.01)],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                        )
+                        .interpolationMethod(.monotone)
+                    }
+                }
+            }
+
+            // 3. 电池温度曲线 (按 20~50℃ 范围归一化映射)
+            if data.hasTempData && showTemp {
+                ForEach(data.points) { point in
+                    if let temp = point.batteryTempC {
+                        let clampedTemp = min(max(temp, 20.0), 50.0)
+                        let normY = ((clampedTemp - 20.0) / 30.0) * peak
+                        LineMark(
+                            x: .value("时间", point.timestamp),
+                            y: .value("温度 (℃)", normY),
+                            series: .value("指标", "温度")
+                        )
+                        .foregroundStyle(Color.blue)
+                        .lineStyle(StrokeStyle(lineWidth: 1.8, lineCap: .round, lineJoin: .round, dash: [4, 4]))
+                        .interpolationMethod(.monotone)
+                    }
+                }
+            }
         }
-        .chartYAxisLabel("W")
+        .chartYScale(domain: 0...peak)
+        .chartYAxis {
+            if data.isStandaloneBattery {
+                // 纯电池模式左侧坐标轴：手机电量百分比 (0% ~ 100%)
+                AxisMarks(position: .leading, values: [0, 20, 40, 60, 80, 100]) { value in
+                    AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5, dash: [3, 3]))
+                        .foregroundStyle(Color.primary.opacity(0.08))
+                    AxisTick()
+                    if let v = value.as(Double.self) {
+                        AxisValueLabel {
+                            Text(String(format: "%.0f%%", v))
+                                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                .foregroundStyle(CandyTheme.mint)
+                        }
+                    }
+                }
+
+                // 纯电池模式右侧坐标轴：电池温度 (20℃ ~ 50℃)
+                if data.hasTempData && showTemp {
+                    AxisMarks(position: .trailing, values: [0, 33.3, 66.7, 100]) { value in
+                        AxisTick()
+                        if let v = value.as(Double.self) {
+                            let tempVal = 20.0 + (v / 100.0) * 30.0
+                            AxisValueLabel {
+                                Text(String(format: "%.0f℃", tempVal))
+                                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                                    .foregroundStyle(Color.blue)
+                            }
+                        }
+                    }
+                }
+            } else {
+                // 普通小电拼模式左侧坐标轴：输出功率 (W)
+                AxisMarks(position: .leading) { value in
+                    AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5, dash: [3, 3]))
+                        .foregroundStyle(Color.primary.opacity(0.08))
+                    AxisTick()
+                    if let v = value.as(Double.self) {
+                        AxisValueLabel {
+                            Text(String(format: "%.0f W", v))
+                                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                                .foregroundStyle(CandyTheme.syrup)
+                        }
+                    }
+                }
+
+                // 普通小电拼模式右侧坐标轴：手机电量百分比 (%)
+                if data.hasBatteryData && showBattery {
+                    AxisMarks(position: .trailing, values: [0, 0.25 * peak, 0.5 * peak, 0.75 * peak, peak]) { value in
+                        AxisTick()
+                        if let v = value.as(Double.self) {
+                            let pct = Int(round((v / peak) * 100))
+                            AxisValueLabel {
+                                Text("\(pct)%")
+                                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                    .foregroundStyle(CandyTheme.mint)
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1524,7 +1841,7 @@ private struct ChartReadout: View {
     }
 }
 
-private enum CandyTheme {
+enum CandyTheme {
     static let ink = Color.primary
     static let cream = adaptive(
         light: NSColor(calibratedRed: 0.97, green: 0.96, blue: 0.94, alpha: 1),
@@ -1699,6 +2016,129 @@ private struct PortDetailSheet: View {
                         Text("仅支持 PD 协议，且部分设备厂商信息不准，仅供参考")
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                    }
+
+                    if port.isAppleDevice {
+                        sectionHeader("\(portTitle) Apple 设备连接")
+
+                        detailCard {
+                            HStack(spacing: 12) {
+                                Image(systemName: "apple.logo")
+                                    .font(.system(size: 20))
+                                    .foregroundStyle(.primary)
+                                    .frame(width: 32, height: 32)
+                                    .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(port.pdStatus?.modelName ?? "iPhone / Apple 设备")
+                                        .font(.headline)
+                                    Text("已通过小电拼原生 PD 报文读取电池状态，与 Android ADB 调试完全解耦")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+
+                                Spacer()
+
+                                if let bat = port.pdStatus?.batteryPercent {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "bolt.fill")
+                                            .font(.caption)
+                                            .foregroundStyle(CandyTheme.mint)
+                                        Text(String(format: "%.0f%%", bat))
+                                            .font(.headline.weight(.bold).monospacedDigit())
+                                            .foregroundStyle(CandyTheme.mint)
+                                    }
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 5)
+                                    .background(CandyTheme.mint.opacity(0.12), in: Capsule())
+                                }
+                            }
+                        }
+                    } else {
+                        sectionHeader("\(portTitle) Android 调试联动")
+
+                        detailCard {
+                            HStack(spacing: 12) {
+                                Image(systemName: "antenna.radiowaves.left.and.right")
+                                    .font(.system(size: 18, weight: .medium))
+                                    .foregroundStyle(CandyTheme.caramel)
+                                    .frame(width: 32, height: 32)
+                                    .background(CandyTheme.caramel.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                                VStack(alignment: .leading, spacing: 2) {
+                                    HStack(spacing: 6) {
+                                        Text("无线调试设备绑定")
+                                            .font(.headline)
+                                        if store.adbService.boundDevice(for: port.port.index) != nil {
+                                            Text("已自动绑定")
+                                                .font(.system(size: 10, weight: .bold))
+                                                .padding(.horizontal, 6)
+                                                .padding(.vertical, 2)
+                                                .background(CandyTheme.mint.opacity(0.15), in: Capsule())
+                                                .foregroundStyle(CandyTheme.mint)
+                                        }
+                                    }
+                                    Text("支持智能自动识别绑定；同步记录手机电池电量、电压与温度")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+
+                                Spacer()
+
+                                Menu {
+                                    Button("解除绑定") {
+                                        store.adbService.bindPort(port.port.index, to: nil)
+                                    }
+                                    Divider()
+                                    ForEach(store.adbService.devices) { dev in
+                                        Button {
+                                            store.adbService.bindPort(port.port.index, to: dev.serial)
+                                        } label: {
+                                            HStack {
+                                                Text("\(dev.displayName) (\(dev.serial))")
+                                                if store.adbService.boundPort(for: dev.serial) == port.port.index {
+                                                    Image(systemName: "checkmark")
+                                                }
+                                            }
+                                        }
+                                    }
+                                } label: {
+                                    HStack(spacing: 6) {
+                                        let boundDevice = store.adbService.boundDevice(for: port.port.index)
+                                        Text(boundDevice?.displayName ?? "选择 Android 设备")
+                                            .font(.callout.weight(.medium))
+                                        Image(systemName: "chevron.up.chevron.down")
+                                            .font(.caption2)
+                                    }
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 5)
+                                    .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                                }
+                                .menuStyle(.borderlessButton)
+                                .fixedSize()
+                            }
+
+                            if let boundDev = store.adbService.boundDevice(for: port.port.index) {
+                                Divider()
+
+                                if let batPercent = boundDev.batteryPercent {
+                                    LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 4), spacing: 14) {
+                                        PortDetailMetric(title: "电池电量", value: String(format: "%.0f%%", batPercent))
+                                        PortDetailMetric(title: "电池电压", value: boundDev.batteryVoltageMV.map { String(format: "%.3f V", Double($0) / 1000.0) } ?? "--")
+                                        PortDetailMetric(title: "电池温度", value: boundDev.batteryTempC.map { String(format: "%.1f ℃", $0) } ?? "--")
+                                        PortDetailMetric(title: "电池状态", value: boundDev.batteryStatus ?? (boundDev.isCharging ? "充电中" : "未充电"))
+                                    }
+                                } else {
+                                    HStack(spacing: 6) {
+                                        ProgressView()
+                                            .controlSize(.small)
+                                        Text("已关联 \(boundDev.displayName)，正在通过 dumpsys battery 采集电池状态...")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     sectionHeader("\(portTitle) 充电口")
@@ -2137,9 +2577,10 @@ private struct SessionsView: View {
                                         selectSession(session)
                                     } label: {
                                         SessionRow(
-                                            session: session,
+                                            data: SessionRowData(session: session),
                                             isSelected: selectedSessionIDs.contains(session.id)
                                         )
+                                        .equatable()
                                     }
                                     .buttonStyle(.plain)
                                 }
@@ -2164,8 +2605,9 @@ private struct SessionsView: View {
                 selectSingle(store.selectedSession ?? store.sessions.first)
             }
         }
-        .onChange(of: store.sessions.map(\.id)) { _, ids in
-            selectedSessionIDs = selectedSessionIDs.intersection(Set(ids))
+        .onChange(of: store.sessions.count) { _, _ in
+            let validIDs = Set(store.sessions.map(\.id))
+            selectedSessionIDs = selectedSessionIDs.intersection(validIDs)
             if selectedSessionIDs.isEmpty {
                 selectSingle(store.selectedSession ?? store.sessions.first)
             }
@@ -2223,29 +2665,81 @@ private struct SessionsView: View {
     }
 }
 
-private struct SessionRow: View {
-    let session: ChargingSession
+struct SessionRowData: Identifiable, Equatable {
+    let id: UUID
+    let displayTitle: String
+    let startedAt: Date
+    let isEnded: Bool
+    let isStandaloneBattery: Bool
+    let finalBatteryPercent: Double?
+    let maxBatteryTempC: Double?
+    let sampleCount: Int
+    let peakPowerW: Double
+    let averagePowerW: Double
+
+    init(session: ChargingSession) {
+        self.id = session.id
+        self.displayTitle = session.displayTitle
+        self.startedAt = session.startedAt
+        self.isEnded = session.endedAt != nil
+        self.isStandaloneBattery = session.isStandaloneBatterySession
+        self.finalBatteryPercent = session.finalBatteryPercent
+        self.maxBatteryTempC = session.maxBatteryTempC
+        self.sampleCount = session.sampleCount
+        self.peakPowerW = session.peakPowerW
+        self.averagePowerW = session.averagePowerW
+    }
+}
+
+private struct SessionRow: View, Equatable {
+    let data: SessionRowData
     let isSelected: Bool
+
+    static func == (lhs: SessionRow, rhs: SessionRow) -> Bool {
+        lhs.data == rhs.data && lhs.isSelected == rhs.isSelected
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
-            HStack {
-                Text(session.displayTitle)
+            HStack(spacing: 6) {
+                if data.isStandaloneBattery {
+                    Image(systemName: "bolt.batteryblock.fill")
+                        .font(.caption)
+                        .foregroundStyle(CandyTheme.mint)
+                }
+                Text(data.displayTitle)
                     .font(.subheadline.weight(.semibold))
                     .lineLimit(1)
                 Spacer()
-                if session.endedAt == nil {
+                if !data.isEnded {
                     Text("记录中")
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(.green)
                 }
             }
-            Text(session.startedAt, format: .dateTime.month().day().hour().minute())
+            Text(data.startedAt, format: .dateTime.month().day().hour().minute())
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Text(String(format: "峰值 %.1f W · 平均 %.1f W", session.peakPowerW, session.averagePowerW))
+
+            if data.isStandaloneBattery {
+                HStack(spacing: 6) {
+                    if let finalBat = data.finalBatteryPercent {
+                        Text(String(format: "当前 %.0f%%", finalBat))
+                    } else {
+                        Text("电池监视")
+                    }
+                    if let maxTemp = data.maxBatteryTempC {
+                        Text(String(format: "· 最高 %.1f℃", maxTemp))
+                    }
+                    Text("· \(data.sampleCount)点")
+                }
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            } else {
+                Text(String(format: "峰值 %.1f W · 平均 %.1f W", data.peakPowerW, data.averagePowerW))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
@@ -2341,14 +2835,48 @@ private struct SessionDetailView: View {
 
                 ScrollView {
                     VStack(alignment: .leading, spacing: 18) {
-                        HStack(spacing: 12) {
-                            MetricCard(title: "峰值功率", value: String(format: "%.1f W", session.peakPowerW), icon: "bolt.fill")
-                            MetricCard(title: "平均功率", value: String(format: "%.1f W", session.averagePowerW), icon: "waveform.path")
-                            MetricCard(title: "实时功率", value: String(format: "%.1f W", latestPowerW), icon: "gauge.medium")
-                            MetricCard(title: "耗时", value: durationText(session), icon: "clock")
+                        if session.isStandaloneBatterySession {
+                            let samples = store.selectedSessionSamples
+                            let firstBat = samples.first(where: { $0.batteryPercent != nil })?.batteryPercent
+                            let lastBat = samples.last(where: { $0.batteryPercent != nil })?.batteryPercent ?? session.finalBatteryPercent
+                            let delta = (firstBat != nil && lastBat != nil) ? (lastBat! - firstBat!) : nil
+                            let durationSecs = (session.endedAt ?? Date()).timeIntervalSince(session.startedAt)
+                            let ratePerHour: Double? = (delta != nil && durationSecs > 60) ? (delta! / (durationSecs / 3600.0)) : nil
+
+                            HStack(spacing: 12) {
+                                MetricCard(
+                                    title: "电量变化",
+                                    value: (firstBat != nil && lastBat != nil) ? String(format: "%.0f%% → %.0f%%", firstBat!, lastBat!) : (lastBat.map { String(format: "%.0f%%", $0) } ?? "--"),
+                                    icon: "bolt.batteryblock.fill"
+                                )
+                                MetricCard(
+                                    title: "净变化量",
+                                    value: delta.map { String(format: "%+.0f%%", $0) } ?? "--",
+                                    icon: "arrow.up.arrow.down"
+                                )
+                                MetricCard(
+                                    title: "平均速率",
+                                    value: ratePerHour.map { String(format: "%+.1f%%/h", $0) } ?? "--",
+                                    icon: "speedometer"
+                                )
+                                MetricCard(
+                                    title: "最高温度 / 耗时",
+                                    value: session.maxBatteryTempC.map { String(format: "%.1f℃ · %@", $0, durationText(session)) } ?? durationText(session),
+                                    icon: "thermometer.medium"
+                                )
+                            }
+                        } else {
+                            HStack(spacing: 12) {
+                                MetricCard(title: "峰值功率", value: String(format: "%.1f W", session.peakPowerW), icon: "bolt.fill")
+                                MetricCard(title: "平均功率", value: String(format: "%.1f W", session.averagePowerW), icon: "waveform.path")
+                                MetricCard(title: "实时功率", value: String(format: "%.1f W", latestPowerW), icon: "gauge.medium")
+                                MetricCard(title: "耗时", value: durationText(session), icon: "clock")
+                            }
                         }
 
                         SessionPowerChart(samples: store.selectedSessionSamples)
+
+                        chargerLABSummaryCard(session: session)
                     }
                     .padding(24)
                 }
@@ -2393,6 +2921,239 @@ private struct SessionDetailView: View {
         let minutes = seconds / 60
         if minutes < 60 { return "\(minutes)m" }
         return "\(minutes / 60)h \(minutes % 60)m"
+    }
+
+    @ViewBuilder
+    private func chargerLABSummaryCard(session: ChargingSession) -> some View {
+        if session.isStandaloneBatterySession {
+            let samples = store.selectedSessionSamples
+            let firstBat = samples.first(where: { $0.batteryPercent != nil })?.batteryPercent
+            let lastBat = samples.last(where: { $0.batteryPercent != nil })?.batteryPercent ?? session.finalBatteryPercent
+            let delta = (firstBat != nil && lastBat != nil) ? (lastBat! - firstBat!) : nil
+            let durationSecs = (session.endedAt ?? Date()).timeIntervalSince(session.startedAt)
+            let ratePerHour: Double? = (delta != nil && durationSecs > 60) ? (delta! / (durationSecs / 3600.0)) : nil
+            let minVolt = samples.compactMap(\.batteryVoltageMV).min()
+            let maxVolt = samples.compactMap(\.batteryVoltageMV).max()
+
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    Label("Android 设备电池表现总结", systemImage: "bolt.batteryblock.fill")
+                        .font(.headline)
+                        .foregroundStyle(CandyTheme.mint)
+
+                    Spacer()
+
+                    if let serial = session.boundAndroidSerial {
+                        Text("监视设备: \(serial)")
+                            .font(.caption.monospaced())
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(CandyTheme.mint.opacity(0.12), in: Capsule())
+                            .foregroundStyle(CandyTheme.mint)
+                    }
+                }
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("充放电阶段变化")
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.secondary)
+
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 4), spacing: 12) {
+                        summaryItem(title: "初始电量", value: firstBat.map { String(format: "%.0f%%", $0) } ?? "--", icon: "battery.25")
+                        summaryItem(title: "当前/终止电量", value: lastBat.map { String(format: "%.0f%%", $0) } ?? "--", icon: "battery.100")
+                        summaryItem(title: "电量净变化", value: delta.map { String(format: "%+.0f%%", $0) } ?? "--", icon: "arrow.up.arrow.down")
+                        summaryItem(title: "变化速率", value: ratePerHour.map { String(format: "%+.1f%%/h", $0) } ?? "--", icon: "speedometer")
+                    }
+                }
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("电压与温升表现")
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.secondary)
+
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 4), spacing: 12) {
+                        summaryItem(title: "最高电池温度", value: session.maxBatteryTempC.map { String(format: "%.1f ℃", $0) } ?? "--", icon: "thermometer.high")
+                        summaryItem(title: "最低电池电压", value: minVolt.map { String(format: "%.3f V", Double($0) / 1000.0) } ?? "--", icon: "bolt.fill")
+                        summaryItem(title: "最高电池电压", value: maxVolt.map { String(format: "%.3f V", Double($0) / 1000.0) } ?? "--", icon: "bolt.badge.clock.fill")
+                        summaryItem(title: "有效采样点", value: "\(session.sampleCount) 点", icon: "waveform.path")
+                    }
+                }
+            }
+            .padding(18)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+            }
+        } else {
+            let analytics = store.sessionAnalytics(for: session)
+            
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    Label("ChargerLAB 充电性能总结", systemImage: "chart.bar.doc.horizontal.fill")
+                        .font(.headline)
+                        .foregroundStyle(CandyTheme.syrup)
+
+                Spacer()
+
+                if let serial = session.boundAndroidSerial {
+                    Text("联动设备: \(serial)")
+                        .font(.caption.monospaced())
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(CandyTheme.syrup.opacity(0.12), in: Capsule())
+                        .foregroundStyle(CandyTheme.syrup)
+                }
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("阶段充电耗时里程碑")
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.secondary)
+
+                let startPct = analytics.initialBatteryPercent.map { Int(round($0)) }
+                let startLabel = startPct.map { "\($0)%" } ?? "0%"
+
+                let title50: String = {
+                    if let start = startPct, start >= 50 {
+                        return "50% 里程碑"
+                    }
+                    return "\(startLabel) → 50%"
+                }()
+
+                let value50: String = {
+                    if let start = startPct, start >= 50 {
+                        return "起充 \(start)%"
+                    }
+                    return formatDuration(analytics.timeTo50PercentS)
+                }()
+
+                let title80: String = {
+                    if let start = startPct, start >= 80 {
+                        return "80% 里程碑"
+                    }
+                    return "\(startLabel) → 80%"
+                }()
+
+                let value80: String = {
+                    if let start = startPct, start >= 80 {
+                        return "起充 \(start)%"
+                    }
+                    return formatDuration(analytics.timeTo80PercentS)
+                }()
+
+                let title100: String = {
+                    if let start = startPct, start >= 99 {
+                        return "100% (UI)"
+                    }
+                    return "\(startLabel) → 100% (UI)"
+                }()
+
+                let value100: String = {
+                    if let start = startPct, start >= 99 {
+                        return "起充 \(start)%"
+                    }
+                    return formatDuration(analytics.timeTo100PercentS)
+                }()
+
+                let titleFull = "实际充满 (涓流结束)"
+                let valueFull: String = {
+                    if let fullS = analytics.timeToFullChargeS {
+                        return formatDuration(fullS)
+                    }
+                    if analytics.isTrickleCharging {
+                        return "涓流中..."
+                    }
+                    if let start = startPct, start >= 99 {
+                        return "起充 \(start)%"
+                    }
+                    return "--"
+                }()
+
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 5), spacing: 12) {
+                    summaryItem(title: title50, value: value50, icon: "bolt.badge.clock")
+                    summaryItem(title: title80, value: value80, icon: "bolt.badge.clock.fill")
+                    summaryItem(title: title100, value: value100, icon: "battery.100")
+                    summaryItem(title: titleFull, value: valueFull, icon: "checkmark.seal.fill", valueColor: analytics.isTrickleCharging ? CandyTheme.syrup : nil)
+                    summaryItem(title: "峰值维持时长", value: formatDuration(analytics.peakDurationS > 0 ? analytics.peakDurationS : nil), icon: "timer")
+                }
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("分阶段功率与温度表现")
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.secondary)
+
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 4), spacing: 12) {
+                    summaryItem(title: "30% 阶段功率", value: analytics.powerAt30PercentW.map { String(format: "%.1f W", $0) } ?? "--", icon: "gauge.with.dots.needle.33percent")
+                    summaryItem(title: "50% 阶段功率", value: analytics.powerAt50PercentW.map { String(format: "%.1f W", $0) } ?? "--", icon: "gauge.with.dots.needle.50percent")
+                    summaryItem(title: "80% 阶段功率", value: analytics.powerAt80PercentW.map { String(format: "%.1f W", $0) } ?? "--", icon: "gauge.with.dots.needle.bottom.50percent")
+                    summaryItem(title: "最高电池温度", value: analytics.maxBatteryTempC.map { String(format: "%.1f ℃", $0) } ?? "--", icon: "thermometer.high")
+                }
+            }
+
+            if analytics.timeTo50PercentS == nil && analytics.maxBatteryTempC == nil {
+                HStack(spacing: 6) {
+                    Image(systemName: "info.circle")
+                        .font(.caption)
+                    Text("未检测到关联的 Android 调试电池数据。在开始充电前连接 Android 设备并与端口绑定，即可自动生成阶段耗时与温升分析。")
+                        .font(.caption)
+                }
+                .foregroundStyle(.secondary)
+                .padding(.top, 4)
+            }
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+        }
+    }
+}
+
+    private func summaryItem(title: String, value: String, icon: String, valueColor: Color? = nil) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 4) {
+                Image(systemName: icon)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text(title)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+            }
+            Text(value)
+                .font(.headline.weight(.semibold).monospacedDigit())
+                .foregroundStyle(valueColor ?? .primary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.85)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private func formatDuration(_ seconds: TimeInterval?) -> String {
+        guard let seconds, seconds > 0 else { return "--" }
+        let totalSec = Int(seconds)
+        let mins = totalSec / 60
+        let secs = totalSec % 60
+        if mins == 0 {
+            return "\(secs)秒"
+        }
+        return "\(mins)分\(secs)秒"
     }
 }
 
@@ -2442,15 +3203,52 @@ private struct RenameSessionSheet: View {
 
 private struct SessionPowerChart: View {
     let samples: [PortSample]
+    @State private var showPower = true
+    @State private var showBattery = true
+    @State private var showTemp = false
+
     @State private var hoveredSample: PortSample?
     @State private var hoverLocation: CGPoint?
     @State private var hoverX: CGFloat?
     @State private var hoverY: CGFloat?
+    @State private var hoverBatteryY: CGFloat?
+    @State private var hoverTempY: CGFloat?
+
+    private var hasBatteryData: Bool {
+        samples.contains { $0.batteryPercent != nil }
+    }
+
+    private var hasTempData: Bool {
+        samples.contains { $0.batteryTempC != nil }
+    }
+
+    private var latestSample: PortSample? {
+        samples.last
+    }
+
+    private var maxPower: Double {
+        let maxSample = samples.map(\.powerW).max() ?? 30.0
+        return max(30.0, ceil(maxSample * 1.15 / 10.0) * 10.0)
+    }
+
+    private var isStandaloneBattery: Bool {
+        samples.allSatisfy { $0.powerW == 0 } && hasBatteryData
+    }
 
     var body: some View {
-        GeometryReader { geometry in
-            ZStack(alignment: .topLeading) {
-                StaticSessionChart(plottedSamples: samples)
+        VStack(alignment: .leading, spacing: 12) {
+            // 图例与双轨控制栏
+            legendBar
+
+            // 图表核心区域
+            GeometryReader { geometry in
+                ZStack(alignment: .topLeading) {
+                    StaticSessionChart(
+                        plottedSamples: samples,
+                        showPower: showPower,
+                        showBattery: showBattery,
+                        showTemp: showTemp
+                    )
                     .equatable()
                     .frame(height: 300)
                     .chartOverlay { proxy in
@@ -2465,6 +3263,8 @@ private struct SessionPowerChart: View {
                                     hoveredSample = nil
                                     hoverX = nil
                                     hoverY = nil
+                                    hoverBatteryY = nil
+                                    hoverTempY = nil
                                     self.hoverLocation = nil
                                 }
                             }
@@ -2475,36 +3275,146 @@ private struct SessionPowerChart: View {
                             }
                     }
 
-                // 顶层指示虚线
-                if let hoverX, let hoverY {
-                    Path { path in
-                        path.move(to: CGPoint(x: hoverX, y: 0))
-                        path.addLine(to: CGPoint(x: hoverX, y: 280))
-                    }
-                    .stroke(CandyTheme.berry.opacity(0.45), style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
-                    .allowsHitTesting(false)
-
-                    Circle()
-                        .fill(CandyTheme.berry)
-                        .frame(width: 8, height: 8)
-                        .overlay {
-                            Circle()
-                                .stroke(Color.white, lineWidth: 2)
+                    // 顶层指示虚线与双/三轨道圆点
+                    if let hoverX {
+                        Path { path in
+                            path.move(to: CGPoint(x: hoverX, y: 0))
+                            path.addLine(to: CGPoint(x: hoverX, y: 280))
                         }
-                        .shadow(radius: 2)
-                        .position(x: hoverX, y: hoverY)
+                        .stroke(Color.primary.opacity(0.35), style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
                         .allowsHitTesting(false)
-                }
 
-                if let hoveredSample {
-                    SessionReadout(sample: hoveredSample)
-                        .padding(14)
+                        // 1. 功率圆点 (橙色，仅在非纯电池模式显示)
+                        if !isStandaloneBattery, showPower, let hoverY {
+                            Circle()
+                                .fill(CandyTheme.syrup)
+                                .frame(width: 8, height: 8)
+                                .overlay {
+                                    Circle().stroke(Color.white, lineWidth: 2)
+                                }
+                                .shadow(radius: 2)
+                                .position(x: hoverX, y: hoverY)
+                                .allowsHitTesting(false)
+                        }
+
+                        // 2. 手机电量圆点 (绿色)
+                        if showBattery, let hoverBatteryY {
+                            Circle()
+                                .fill(CandyTheme.mint)
+                                .frame(width: 8, height: 8)
+                                .overlay {
+                                    Circle().stroke(Color.white, lineWidth: 2)
+                                }
+                                .shadow(radius: 2)
+                                .position(x: hoverX, y: hoverBatteryY)
+                                .allowsHitTesting(false)
+                        }
+
+                        // 3. 电池温度圆点 (蓝色)
+                        if showTemp, let hoverTempY {
+                            Circle()
+                                .fill(Color.blue)
+                                .frame(width: 8, height: 8)
+                                .overlay {
+                                    Circle().stroke(Color.white, lineWidth: 2)
+                                }
+                                .shadow(radius: 2)
+                                .position(x: hoverX, y: hoverTempY)
+                                .allowsHitTesting(false)
+                        }
+                    }
+
+                    if let hoveredSample {
+                        SessionReadout(sample: hoveredSample)
+                            .padding(14)
+                    }
+                }
+            }
+            .frame(height: 300)
+        }
+        .padding(16)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .onAppear {
+            if isStandaloneBattery {
+                showPower = false
+                showBattery = true
+                showTemp = true
+            }
+        }
+    }
+
+    private var legendBar: some View {
+        HStack(spacing: 16) {
+            if !isStandaloneBattery {
+                Toggle(isOn: $showPower) {
+                    HStack(spacing: 5) {
+                        Circle().fill(CandyTheme.syrup).frame(width: 8, height: 8)
+                        Text("充电功率 (W)")
+                            .font(.caption.weight(.medium))
+                        if let latest = latestSample?.powerW {
+                            Text(String(format: "%.1fW", latest))
+                                .font(.caption.monospacedDigit().weight(.bold))
+                                .foregroundStyle(CandyTheme.syrup)
+                        }
+                    }
+                }
+                .toggleStyle(.checkbox)
+            }
+
+            if hasBatteryData {
+                Toggle(isOn: $showBattery) {
+                    HStack(spacing: 5) {
+                        Circle().fill(CandyTheme.mint).frame(width: 8, height: 8)
+                        Text("手机电量 (%)")
+                            .font(.caption.weight(.medium))
+                        if let latestBat = latestSample?.batteryPercent ?? samples.last(where: { $0.batteryPercent != nil })?.batteryPercent {
+                            Text(String(format: "%.0f%%", latestBat))
+                                .font(.caption.monospacedDigit().weight(.bold))
+                                .foregroundStyle(CandyTheme.mint)
+                        }
+                    }
+                }
+                .toggleStyle(.checkbox)
+            }
+
+            if hasTempData {
+                Toggle(isOn: $showTemp) {
+                    HStack(spacing: 5) {
+                        Circle().fill(Color.blue).frame(width: 8, height: 8)
+                        Text("电池温度 (℃)")
+                            .font(.caption.weight(.medium))
+                        if let latestTemp = latestSample?.batteryTempC ?? samples.last(where: { $0.batteryTempC != nil })?.batteryTempC {
+                            Text(String(format: "%.1f℃", latestTemp))
+                                .font(.caption.monospacedDigit().weight(.bold))
+                                .foregroundStyle(Color.blue)
+                        }
+                    }
+                }
+                .toggleStyle(.checkbox)
+            }
+
+            Spacer()
+
+            if isStandaloneBattery {
+                HStack(spacing: 5) {
+                    Image(systemName: "bolt.batteryblock.fill")
+                        .font(.caption2)
+                        .foregroundStyle(CandyTheme.mint)
+                    Text("独立电量与温度时序曲线")
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(.secondary)
+                }
+            } else if hasBatteryData {
+                HStack(spacing: 5) {
+                    Image(systemName: "checkmark.seal.fill")
+                        .font(.caption2)
+                        .foregroundStyle(CandyTheme.mint)
+                    Text("双轨齐头并进记录已生效")
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(.secondary)
                 }
             }
         }
-        .frame(height: 300)
-        .padding(16)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 
     private func updateHover(location: CGPoint, proxy: ChartProxy, geometry: GeometryProxy) {
@@ -2512,6 +3422,8 @@ private struct SessionPowerChart: View {
             hoveredSample = nil
             hoverX = nil
             hoverY = nil
+            hoverBatteryY = nil
+            hoverTempY = nil
             return
         }
         let plotFrame = geometry[plotAnchor]
@@ -2520,6 +3432,8 @@ private struct SessionPowerChart: View {
             hoveredSample = nil
             hoverX = nil
             hoverY = nil
+            hoverBatteryY = nil
+            hoverTempY = nil
             return
         }
 
@@ -2527,11 +3441,39 @@ private struct SessionPowerChart: View {
             abs($0.timestamp.timeIntervalSince(date)) < abs($1.timestamp.timeIntervalSince(date))
         }) {
             hoveredSample = nearest
+            let peak = isStandaloneBattery ? 100.0 : maxPower
             
-            if let xPos = proxy.position(forX: nearest.timestamp),
-               let yPos = proxy.position(forY: nearest.powerW) {
+            if let xPos = proxy.position(forX: nearest.timestamp) {
                 self.hoverX = xPos + plotFrame.origin.x
-                self.hoverY = yPos + plotFrame.origin.y
+                
+                if !isStandaloneBattery, let yPos = proxy.position(forY: nearest.powerW) {
+                    self.hoverY = yPos + plotFrame.origin.y
+                } else {
+                    self.hoverY = nil
+                }
+
+                if let pct = nearest.batteryPercent {
+                    let yVal = isStandaloneBattery ? pct : ((pct / 100.0) * peak)
+                    if let batY = proxy.position(forY: yVal) {
+                        self.hoverBatteryY = batY + plotFrame.origin.y
+                    } else {
+                        self.hoverBatteryY = nil
+                    }
+                } else {
+                    self.hoverBatteryY = nil
+                }
+
+                if let temp = nearest.batteryTempC {
+                    let clamped = min(max(temp, 20.0), 50.0)
+                    let normY = ((clamped - 20.0) / 30.0) * peak
+                    if let tY = proxy.position(forY: normY) {
+                        self.hoverTempY = tY + plotFrame.origin.y
+                    } else {
+                        self.hoverTempY = nil
+                    }
+                } else {
+                    self.hoverTempY = nil
+                }
             }
         }
     }
@@ -2540,27 +3482,106 @@ private struct SessionPowerChart: View {
 private struct SessionReadout: View {
     let sample: PortSample
 
+    private var isStandaloneBattery: Bool {
+        sample.powerW == 0 && sample.batteryPercent != nil
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(sample.portName)
-                .font(.caption.weight(.semibold))
-            Text(sample.timestamp, format: .dateTime.hour().minute().second())
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-            Text(String(format: "功率 %.2f W", sample.powerW))
-                .font(.headline.monospacedDigit())
-            Text("\(sample.voltageMV) mV / \(sample.currentMA) mA")
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(sample.deviceName ?? sample.portName)
+                    .font(.caption.weight(.bold))
+                Spacer()
+                Text(sample.timestamp, format: .dateTime.hour().minute().second())
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            Divider()
+
+            if isStandaloneBattery {
+                // 手机电量
+                if let percent = sample.batteryPercent {
+                    HStack(spacing: 6) {
+                        Circle().fill(CandyTheme.mint).frame(width: 8, height: 8)
+                        Text(String(format: "电池电量: %.0f%%", percent))
+                            .font(.headline.weight(.bold).monospacedDigit())
+                            .foregroundStyle(CandyTheme.mint)
+                    }
+                }
+
+                // 手机电池电压与温度
+                if let mv = sample.batteryVoltageMV {
+                    Text(String(format: "电池电压: %.3f V (%d mV)", Double(mv) / 1000.0, mv))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+
+                if let temp = sample.batteryTempC {
+                    HStack(spacing: 4) {
+                        Image(systemName: "thermometer.medium")
+                            .font(.caption2)
+                        Text(String(format: "电池温度: %.1f ℃", temp))
+                            .font(.caption.weight(.semibold).monospacedDigit())
+                    }
+                    .foregroundStyle(temp > 40 ? .red : (temp > 35 ? .orange : .blue))
+                }
+
+                if !sample.protocolName.isEmpty {
+                    Text(sample.protocolName)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                // 功率
+                HStack(spacing: 6) {
+                    Circle().fill(CandyTheme.syrup).frame(width: 6, height: 6)
+                    Text(String(format: "功率: %.2f W", sample.powerW))
+                        .font(.headline.weight(.bold).monospacedDigit())
+                        .foregroundStyle(CandyTheme.syrup)
+                }
+
+                // 电压/电流
+                Text("\(String(format: "%.2f V", Double(sample.voltageMV) / 1000.0)) · \(String(format: "%.2f A", Double(sample.currentMA) / 1000.0))")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+
+                // 手机电量
+                if let percent = sample.batteryPercent {
+                    HStack(spacing: 6) {
+                        Circle().fill(CandyTheme.mint).frame(width: 6, height: 6)
+                        Text(String(format: "手机电量: %.0f%%", percent))
+                            .font(.subheadline.weight(.bold).monospacedDigit())
+                            .foregroundStyle(CandyTheme.mint)
+                    }
+                }
+
+                // 手机电池电压与温度
+                if let mv = sample.batteryVoltageMV {
+                    Text(String(format: "电池电压: %.3f V (%d mV)", Double(mv) / 1000.0, mv))
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+
+                if let temp = sample.batteryTempC {
+                    HStack(spacing: 4) {
+                        Image(systemName: "thermometer.medium")
+                            .font(.caption2)
+                        Text(String(format: "电池温度: %.1f ℃", temp))
+                            .font(.caption.weight(.semibold).monospacedDigit())
+                    }
+                    .foregroundStyle(temp > 40 ? .red : (temp > 35 ? .orange : .blue))
+                }
+            }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(CandyTheme.syrup.opacity(0.28), lineWidth: 1)
+                .stroke(isStandaloneBattery ? CandyTheme.mint.opacity(0.35) : CandyTheme.syrup.opacity(0.35), lineWidth: 1)
         }
-        .shadow(color: .black.opacity(0.12), radius: 12, y: 6)
+        .shadow(color: .black.opacity(0.15), radius: 12, y: 6)
     }
 }
 
@@ -3317,7 +4338,7 @@ private struct AddDeviceSheet: View {
     }
 }
 
-private struct HeaderBar<Trailing: View>: View {
+struct HeaderBar<Trailing: View>: View {
     let title: String
     let subtitle: String
     let trailing: () -> Trailing
@@ -3346,7 +4367,7 @@ private struct HeaderBar<Trailing: View>: View {
     }
 }
 
-private struct SyncStatusView: View {
+struct SyncStatusView: View {
     let date: Date?
     let isRefreshing: Bool
 
@@ -3376,7 +4397,7 @@ private struct SyncStatusView: View {
     }
 }
 
-private struct StatusPill: View {
+struct StatusPill: View {
     let text: String
     let color: Color
 
@@ -3432,7 +4453,7 @@ private struct SettingsCard<Content: View>: View {
     }
 }
 
-private struct SoftButtonStyle: ButtonStyle {
+struct SoftButtonStyle: ButtonStyle {
     var prominent = false
     var destructive = false
 
