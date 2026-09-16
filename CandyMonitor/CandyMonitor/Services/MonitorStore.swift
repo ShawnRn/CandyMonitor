@@ -97,6 +97,23 @@ final class MonitorStore {
     @ObservationIgnored private var lastStandaloneRecordTime: [String: Date] = [:]
     @ObservationIgnored private var trickleStoppedKeys = Set<String>()
     @ObservationIgnored private var disconnectDebounce: [String: Int] = [:]
+    /// 会话级手动解绑防回潮黑名单：用户主动解绑后，在物理拔线前绝不再被自动绑定引擎绑回
+    @ObservationIgnored private var manuallyUnboundPorts = Set<Int>()
+
+    func manuallyUnbindPort(_ portIndex: Int) {
+        adbService.bindPort(portIndex, to: nil)
+        manuallyUnboundPorts.insert(portIndex)
+    }
+
+    func manuallyBindPort(_ portIndex: Int, to deviceSerial: String?) {
+        if let deviceSerial {
+            adbService.bindPort(portIndex, to: deviceSerial)
+            manuallyUnboundPorts.remove(portIndex)
+        } else {
+            manuallyUnbindPort(portIndex)
+        }
+    }
+
     @ObservationIgnored private var knownProtocols: [UUID: Set<String>] = [:]
     @ObservationIgnored private var cachedFacts: [UUID: MachineFacts] = [:]
     @ObservationIgnored private var factsRefreshedAt: [UUID: Date] = [:]
@@ -181,10 +198,14 @@ final class MonitorStore {
         }
     }
 
-    func reloadPersistedState() {
+    func reloadPersistedState(force: Bool = false) {
         guard modelContext != nil else { return }
-        loadDevices(restartPolling: false)
-        loadSessions()
+        if force || devices.isEmpty {
+            loadDevices(restartPolling: false)
+        }
+        if force || sessions.isEmpty {
+            loadSessions()
+        }
     }
 
     func loadDevices(restartPolling: Bool = true) {
@@ -1323,7 +1344,7 @@ final class MonitorStore {
         let detailsByPort = Dictionary(uniqueKeysWithValues: details.ports.map { ($0.port, $0) })
 
         // 1. 构建各端口的实时识别数据
-        let portStates: [(port: MachinePort, detail: PortDetail?, pdStatus: PDPortStatus?, isApple: Bool, powerW: Double, isCharging: Bool, isConnected: Bool)] = facts.ports.map { port in
+        let portStates = facts.ports.map { port in
             let detail = detailsByPort[port.index]
             let directPD = mcpPDByPort[port.index]
             let wsPD = wsPDByPort[port.index]
@@ -1332,29 +1353,48 @@ final class MonitorStore {
             let isCharging = (charging.statusBitmask & (1 << (port.index - 1))) != 0 || powerW >= 1.0
             let isConnected = isCharging || detail?.connected == true
 
-            var isApple = false
-            if let model = pdStatus?.modelName?.lowercased() {
-                if model.contains("iphone") || model.contains("ipad") || model.contains("macbook") || model.contains("apple") || model.contains("ios") {
-                    isApple = true
-                }
-            }
-            if let name = detail?.deviceNameZH?.lowercased() ?? detail?.deviceNameEN?.lowercased() {
-                if name.contains("iphone") || name.contains("ipad") || name.contains("macbook") || name.contains("apple") || name.contains("ios") {
-                    isApple = true
-                }
-            }
-            return (port, detail, pdStatus, isApple, powerW, isCharging, isConnected)
+            let viewState = PortViewState(
+                port: port,
+                detail: detail,
+                pdStatus: pdStatus,
+                charging: isCharging,
+                boundADBDevice: nil
+            )
+            return (
+                port: port,
+                detail: detail,
+                pdStatus: pdStatus,
+                isApple: viewState.isAppleDevice,
+                isNonAndroid: viewState.isNonAndroidDevice,
+                hasNativePD: viewState.hasNativePDBattery,
+                canAutoBind: viewState.canAutoBindADB,
+                powerW: powerW,
+                isCharging: isCharging,
+                isConnected: isConnected
+            )
         }
 
-        // 2. Apple 设备隔离与空闲端口自动解绑：
-        // A. 如果端口已接入 Apple/iPhone 设备，立即强制解除任何 ADB 设备绑定
-        for state in portStates where state.isApple {
+        // 2. 隔离与物理冲突自愈（Auto-Healing）：
+        // A. 如果端口已接入 Apple/iPhone 或非 Android 设备（如 ROG Ally、Steam Deck、笔记本等），强制解除任何 ADB 绑定
+        for state in portStates where state.isApple || state.isNonAndroid {
             if adbService.boundDevice(for: state.port.index) != nil {
                 adbService.bindPort(state.port.index, to: nil)
             }
         }
-        // B. 如果端口已完全断开，且绑定的 ADB 设备已未在充电或离线，自动释放该端口绑定
+        // B. 物理冲突自愈：若端口大功率供电（powerW >= 1.5），而绑定的在线 ADB 设备处于【放电中】（!bound.isCharging），
+        //    或者端口已具备原生 PD 电池数据（如 ROG Ally 64%），物理状态严重不符，立即自动解除误绑！
+        for state in portStates where state.powerW >= 1.5 {
+            if let bound = adbService.boundDevice(for: state.port.index) {
+                if bound.isOnline && !bound.isCharging {
+                    adbService.bindPort(state.port.index, to: nil)
+                } else if state.hasNativePD {
+                    adbService.bindPort(state.port.index, to: nil)
+                }
+            }
+        }
+        // C. 如果端口已完全断开，清理手动解绑黑名单；若绑定的 ADB 设备未充电或离线，自动释放该端口绑定
         for state in portStates where !state.isConnected && state.powerW < 0.2 {
+            manuallyUnboundPorts.remove(state.port.index)
             if let bound = adbService.boundDevice(for: state.port.index) {
                 if !bound.isOnline || !bound.isCharging {
                     adbService.bindPort(state.port.index, to: nil)
@@ -1363,23 +1403,29 @@ final class MonitorStore {
         }
 
         // 3. 智能自动匹配与绑定引擎（ADB Auto-binding Engine）：
-        let onlineDevices = adbService.devices.filter { $0.isOnline }
-        let unboundDevices = onlineDevices.filter { adbService.boundPort(for: $0.serial) == nil }
-        let unboundActiveNonApplePorts = portStates.filter { state in
-            !state.isApple && state.isCharging && adbService.boundDevice(for: state.port.index) == nil
+        // 核心约束 1：只有【在线且正在充电】的 ADB 设备才参与自动绑定！放电中（!isCharging）的设备绝对不参与自动绑定！
+        let onlineChargingDevices = adbService.devices.filter { $0.isOnline && $0.isCharging }
+        let unboundChargingDevices = onlineChargingDevices.filter { adbService.boundPort(for: $0.serial) == nil }
+
+        // 核心约束 2：候选端口必须满足：允许自动绑定（非Apple、非PC/掌机、无原生PD电池数据）、正在充电、未绑定、且不在手动解绑黑名单中
+        let candidatePorts = portStates.filter { state in
+            state.canAutoBind &&
+            state.isCharging &&
+            adbService.boundDevice(for: state.port.index) == nil &&
+            !manuallyUnboundPorts.contains(state.port.index)
         }
 
-        // 场景 A：单设备单端口精准直连绑定（最常见场景：测试机插入任意空闲充电口）
-        if unboundDevices.count == 1, unboundActiveNonApplePorts.count == 1,
-           let targetDevice = unboundDevices.first,
-           let targetPort = unboundActiveNonApplePorts.first {
+        // 场景 A：单设备单端口精准直连绑定（必须是正在充电中的设备）
+        if unboundChargingDevices.count == 1, candidatePorts.count == 1,
+           let targetDevice = unboundChargingDevices.first,
+           let targetPort = candidatePorts.first {
             adbService.bindPort(targetPort.port.index, to: targetDevice.serial)
-        } else if !unboundDevices.isEmpty && !unboundActiveNonApplePorts.isEmpty {
+        } else if !unboundChargingDevices.isEmpty && !candidatePorts.isEmpty {
             // 场景 B：多设备联动匹配（基于快充协议特征或优先匹配正在充电中的设备）
-            for portState in unboundActiveNonApplePorts {
+            for portState in candidatePorts {
                 let proto = portState.detail?.fcProtocol ?? ""
                 if proto.contains("MI_PPS") || proto == "21" {
-                    if let miDevice = unboundDevices.first(where: {
+                    if let miDevice = unboundChargingDevices.first(where: {
                         let name = "\($0.brand) \($0.model)".lowercased()
                         return name.contains("xiaomi") || name.contains("redmi") || name.contains("poco")
                     }) {
@@ -1387,14 +1433,14 @@ final class MonitorStore {
                         continue
                     }
                 }
-                if let chargingDevice = unboundDevices.first(where: { $0.isCharging && adbService.boundPort(for: $0.serial) == nil }) {
+                if let chargingDevice = unboundChargingDevices.first(where: { adbService.boundPort(for: $0.serial) == nil }) {
                     adbService.bindPort(portState.port.index, to: chargingDevice.serial)
                 }
             }
         }
 
         livePorts = portStates.map { state in
-            let boundADB = state.isApple ? nil : adbService.boundDevice(for: state.port.index)
+            let boundADB = (state.isApple || state.isNonAndroid) ? nil : adbService.boundDevice(for: state.port.index)
             return PortViewState(
                 port: state.port,
                 detail: state.detail,
@@ -1597,44 +1643,60 @@ final class MonitorStore {
                 session = canonical
             }
 
-            // 活跃会话智能回填：如果已在充电中且尚未记录绑定设备，当端口关联 ADB 或 PD 识别到型号时自动同步绑定
+            // 活跃会话智能回填与解绑自愈：
             if let activeSession = session, activeSession.endedAt == nil {
-                if port.isAppleDevice {
+                let bound = (port.isAppleDevice || port.isNonAndroidDevice) ? nil : adbService.boundDevice(for: port.port.index)
+                if port.isAppleDevice || port.isNonAndroidDevice || bound == nil {
+                    // 如果端口已无绑定 ADB，或者是非 Android 设备：清除会话中可能误存的 boundAndroidSerial
                     if activeSession.boundAndroidSerial != nil {
                         activeSession.boundAndroidSerial = nil
                         result.didChangeSessions = true
                     }
-                    if let pdModel = port.pdStatus?.modelName, !pdModel.isEmpty {
-                        activeSession.connectedDeviceName = pdModel
+                    // 如果会话名称曾被误填为 Android 手机名，自动纠正为 PD 型号或端口默认名称
+                    if let currentName = activeSession.connectedDeviceName,
+                       adbService.devices.contains(where: { $0.displayName == currentName }) {
+                        if let pdModel = port.pdStatus?.modelName, !pdModel.isEmpty, pdModel != "0x0000" {
+                            activeSession.connectedDeviceName = pdModel
+                        } else if let devName = detail.deviceNameZH ?? detail.deviceNameEN, !devName.isEmpty {
+                            activeSession.connectedDeviceName = devName
+                        } else if port.hasNativePDBattery {
+                            activeSession.connectedDeviceName = "标准 PD 设备"
+                        } else {
+                            activeSession.connectedDeviceName = nil
+                        }
                         result.didChangeSessions = true
                     }
-                } else {
-                    if activeSession.boundAndroidSerial == nil, let bound = adbService.boundDevice(for: port.port.index) {
+                    if let pdModel = port.pdStatus?.modelName, !pdModel.isEmpty, pdModel != "0x0000" {
+                        activeSession.connectedDeviceName = pdModel
+                        result.didChangeSessions = true
+                    } else if port.hasNativePDBattery && (activeSession.connectedDeviceName == nil || activeSession.connectedDeviceName == "未知设备型号") {
+                        activeSession.connectedDeviceName = "标准 PD 设备"
+                        result.didChangeSessions = true
+                    }
+                } else if let bound {
+                    if activeSession.boundAndroidSerial != bound.serial {
                         activeSession.boundAndroidSerial = bound.serial
-                        if activeSession.connectedDeviceName == nil || activeSession.connectedDeviceName == "未知设备型号" {
-                            activeSession.connectedDeviceName = bound.displayName
-                        }
                         result.didChangeSessions = true
                     }
                     if activeSession.connectedDeviceName == nil || activeSession.connectedDeviceName == "未知设备型号" {
-                        if let pdModel = port.pdStatus?.modelName, !pdModel.isEmpty {
-                            activeSession.connectedDeviceName = pdModel
-                            result.didChangeSessions = true
-                        }
+                        activeSession.connectedDeviceName = bound.displayName
+                        result.didChangeSessions = true
                     }
                 }
             }
 
             var justCreated = false
             if session == nil, hasOutputPower, !isTrickleStopped {
-                let boundADB = port.isAppleDevice ? nil : adbService.boundDevice(for: port.port.index)
+                let boundADB = (port.isAppleDevice || port.isNonAndroidDevice) ? nil : adbService.boundDevice(for: port.port.index)
                 let connectedName: String?
                 if port.isAppleDevice {
                     connectedName = port.pdStatus?.modelName ?? "iPhone"
+                } else if let pdModel = port.pdStatus?.modelName, !pdModel.isEmpty, pdModel != "0x0000" {
+                    connectedName = pdModel
                 } else if let boundADB, !boundADB.displayName.isEmpty {
                     connectedName = boundADB.displayName
-                } else if let pdModel = port.pdStatus?.modelName, !pdModel.isEmpty {
-                    connectedName = pdModel
+                } else if port.hasNativePDBattery {
+                    connectedName = "标准 PD 设备"
                 } else {
                     connectedName = detail.deviceNameZH ?? detail.deviceNameEN
                 }
@@ -1645,7 +1707,7 @@ final class MonitorStore {
                     portName: port.port.name,
                     connectedDeviceName: connectedName,
                     startedAt: now,
-                    boundAndroidSerial: port.isAppleDevice ? nil : boundADB?.serial
+                    boundAndroidSerial: (port.isAppleDevice || port.isNonAndroidDevice) ? nil : boundADB?.serial
                 )
                 modelContext.insert(newSession)
                 activeSessions[key] = newSession.id

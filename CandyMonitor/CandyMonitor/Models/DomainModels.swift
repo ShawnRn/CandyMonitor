@@ -721,6 +721,13 @@ struct PDPortStatus: Codable, Hashable, Sendable {
             cycleCount != nil
     }
 
+    nonisolated var hasNativeBatteryTelemetry: Bool {
+        batteryPercent != nil ||
+            batteryCapacityMWh != nil ||
+            batteryPresentCapacityMWh != nil ||
+            batteryLastFullChargeCapacityMWh != nil
+    }
+
     nonisolated func merged(withFallback fallback: PDPortStatus?) -> PDPortStatus {
         guard let fallback else { return self }
         return PDPortStatus(
@@ -825,23 +832,48 @@ struct PortViewState: Identifiable, Hashable {
         return false
     }
 
+    var hasNativePDBattery: Bool {
+        pdStatus?.hasNativeBatteryTelemetry == true
+    }
+
+    var isNonAndroidDevice: Bool {
+        if isAppleDevice { return true }
+        let textToCheck = [
+            pdStatus?.modelName,
+            pdStatus?.manufacturer,
+            detail?.deviceNameZH,
+            detail?.deviceNameEN
+        ].compactMap { $0?.lowercased() }.joined(separator: " ")
+        
+        let nonAndroidKeywords = [
+            "rog", "ally", "asus", "steam", "deck", "valve", "switch", "nintendo",
+            "lenovo", "thinkpad", "legion", "dell", "alienware", "hp", "omen",
+            "surface", "microsoft", "razer", "blade", "gpd", "ayaneo", "onexplayer", "aokzoe"
+        ]
+        return nonAndroidKeywords.contains { textToCheck.contains($0) }
+    }
+
+    var canAutoBindADB: Bool {
+        !isAppleDevice && !isNonAndroidDevice && !hasNativePDBattery
+    }
+
     var powerW: Double { detail?.powerW ?? 0 }
     
-    // 如果是 Apple/iPhone 设备，绝对与 ADB 解耦，仅读取小电拼原生 PD 报文中的电池数据
+    // 如果是 Apple 设备、非 Android 设备或已具备原生 PD 电池遥测的设备，优先使用原生 PD 电池数据
     var batteryPercent: Double? {
-        if isAppleDevice {
-            return pdStatus?.batteryPercent
+        if isAppleDevice || isNonAndroidDevice || hasNativePDBattery {
+            return pdStatus?.batteryPercent ?? boundADBDevice?.batteryPercent
         }
         return boundADBDevice?.batteryPercent ?? pdStatus?.batteryPercent
     }
     
     var batteryTempC: Double? {
-        if isAppleDevice { return nil }
+        if isAppleDevice || (isNonAndroidDevice && boundADBDevice == nil) { return nil }
         return boundADBDevice?.batteryTempC
     }
     
     var batteryVoltageMV: Int? {
-        if isAppleDevice { return nil }
+        if isAppleDevice || (isNonAndroidDevice && boundADBDevice == nil) { return nil }
         return boundADBDevice?.batteryVoltageMV
     }
     var voltageText: String { "\(detail?.voutMV ?? 0) mV" }
@@ -1174,11 +1206,21 @@ struct ADBDevice: Identifiable, Hashable, Sendable {
         return serial
     }
 
+    var isMDNSWireless: Bool {
+        serial.contains("._tcp") || serial.contains("._adb")
+    }
+
     var shortAddress: String {
-        if isWireless, let ip, let port {
-            return "\(ip):\(port)"
+        if isWireless {
+            if let ip, let port {
+                return "\(ip):\(port)"
+            }
+            if isMDNSWireless {
+                return "Wi-Fi (mDNS TLS)"
+            }
+            return "Wi-Fi 无线"
         }
-        return serial
+        return "USB 有线"
     }
 }
 

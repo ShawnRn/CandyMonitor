@@ -32,17 +32,32 @@ public struct ADBRawDevice: Sendable, Identifiable, Hashable {
 
     public var id: String { serial }
     public var isOnline: Bool { state.lowercased() == "device" }
-    public var isWireless: Bool { serial.contains(":") }
+    public var isWireless: Bool {
+        serial.contains(":") ||
+        serial.contains("._tcp") ||
+        serial.contains("._adb") ||
+        serial.hasSuffix(".local")
+    }
+
+    public var isMDNSWireless: Bool {
+        serial.contains("._tcp") || serial.contains("._adb")
+    }
 
     public var ip: String? {
         guard isWireless else { return nil }
-        return serial.components(separatedBy: ":").first
+        if serial.contains(":") {
+            return serial.components(separatedBy: ":").first
+        }
+        return nil
     }
 
     public var port: Int? {
         guard isWireless else { return nil }
-        let parts = serial.components(separatedBy: ":")
-        return parts.count > 1 ? Int(parts[1]) : nil
+        if serial.contains(":") {
+            let parts = serial.components(separatedBy: ":")
+            return parts.count > 1 ? Int(parts[1]) : nil
+        }
+        return nil
     }
 
     public var displayName: String {
@@ -134,6 +149,10 @@ public actor ADBClient {
             throw ADBError.protocolError("无法解析 ADB 版本响应: \(raw)")
         }
         return ver
+    }
+
+    public func killServer(timeout: TimeInterval = 2.0) async throws {
+        _ = try await executeHostCommand("host:kill", timeout: timeout)
     }
 
     // MARK: - Device Listing

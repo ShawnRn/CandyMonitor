@@ -550,23 +550,31 @@ private struct ADBDeviceCard: View {
                         }
 
                         if device.isWireless {
-                            Text("Wi-Fi 无线")
-                                .font(.system(size: 10))
-                                .foregroundStyle(.blue)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Color.blue.opacity(0.12), in: Capsule())
+                            HStack(spacing: 3) {
+                                Image(systemName: "wifi")
+                                    .font(.system(size: 9, weight: .bold))
+                                Text(device.isMDNSWireless ? "Wi-Fi 无线调试" : "Wi-Fi 无线")
+                                    .font(.system(size: 10, weight: .semibold))
+                            }
+                            .foregroundStyle(.blue)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.blue.opacity(0.12), in: Capsule())
                         } else {
-                            Text("USB")
-                                .font(.system(size: 10))
-                                .foregroundStyle(.secondary)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Color.secondary.opacity(0.12), in: Capsule())
+                            HStack(spacing: 3) {
+                                Image(systemName: "cable.connector")
+                                    .font(.system(size: 9, weight: .semibold))
+                                Text("USB 有线")
+                                    .font(.system(size: 10, weight: .medium))
+                            }
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.secondary.opacity(0.12), in: Capsule())
                         }
                     }
 
-                    Text("序列号 / 地址: \(device.serial)")
+                    Text(device.isMDNSWireless ? "无线服务名: \(device.serial)" : "序列号 / 地址: \(device.serial)")
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(.secondary)
                 }
@@ -796,112 +804,441 @@ private struct ADBEnvironmentTabView: View {
     let store: MonitorStore
     @State private var customPathInput: String = ""
     @State private var copiedNotice: Bool = false
+    @State private var copiedUpgradeNotice: Bool = false
 
     private var adb: ADBService { store.adbService }
+    private var updateChecker: ADBUpdateChecker { adb.updateChecker }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
-            // Server Status Card
-            VStack(alignment: .leading, spacing: 10) {
-                HStack {
-                    Label("ADB 服务状态 (127.0.0.1:5037)", systemImage: "network")
-                        .font(.headline)
-                    Spacer()
-                    StatusPill(
-                        text: adb.serverState.statusDescription,
-                        color: adb.serverState.isReady ? .green : .orange
-                    )
-                }
+            // 1. Server Status Card
+            serverStatusCard
 
-                if adb.serverState.isReady {
-                    Text("纯原生 Swift TCP 通信已就绪，App 已与系统 ADB 守护进程连接，轮询开销极低。")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text("未检测到 127.0.0.1:5037 处的 ADB Server 守护进程。")
-                        .font(.caption)
-                        .foregroundStyle(.red)
+            // 2. Version & Update Detection Card
+            versionUpdateCard
 
-                    HStack(spacing: 10) {
-                        Button("尝试启动 ADB 服务") {
-                            adb.tryStartServer()
-                        }
-                        .buttonStyle(.borderedProminent)
-
-                        Button("重新检测") {
-                            adb.checkEnvironment()
-                        }
-                        .buttonStyle(SoftButtonStyle())
-                    }
-                }
-            }
-            .padding(16)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-            .overlay {
-                RoundedRectangle(cornerRadius: 12).stroke(CandyTheme.separator, lineWidth: 1)
-            }
-
-            // Tool Installation Guide
-            VStack(alignment: .leading, spacing: 12) {
-                Label("ADB 工具安装与路径配置", systemImage: "wrench.and.screwdriver")
-                    .font(.headline)
-
-                if let path = adb.detectedADBPath {
-                    HStack {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundStyle(.green)
-                        Text("系统已检测到 adb 执行程序: \(path)")
-                            .font(.caption)
-                    }
-                } else {
-                    Text("如果您的 Mac 尚未安装 Android 调试工具，可通过 Homebrew 快速安装：")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-
-                    HStack {
-                        Text("brew install android-platform-tools")
-                            .font(.system(size: 12, design: .monospaced))
-                            .padding(8)
-                            .background(.secondary.opacity(0.1), in: RoundedRectangle(cornerRadius: 6))
-
-                        Button(copiedNotice ? "已复制" : "复制命令") {
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString("brew install android-platform-tools", forType: .string)
-                            copiedNotice = true
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                                copiedNotice = false
-                            }
-                        }
-                        .buttonStyle(SoftButtonStyle())
-                    }
-                }
-
-                Divider()
-
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("自定义 ADB 执行程序路径 (选填)")
-                        .font(.subheadline.weight(.semibold))
-
-                    HStack {
-                        TextField("如 /opt/homebrew/bin/adb", text: $customPathInput)
-                            .textFieldStyle(.roundedBorder)
-
-                        Button("保存并测试") {
-                            adb.customADBPath = customPathInput.trimmingCharacters(in: .whitespacesAndNewlines)
-                            adb.checkEnvironment()
-                        }
-                        .buttonStyle(.bordered)
-                    }
-                }
-            }
-            .padding(16)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-            .overlay {
-                RoundedRectangle(cornerRadius: 12).stroke(CandyTheme.separator, lineWidth: 1)
-            }
+            // 3. Tool Installation & Path Configuration Card
+            toolInstallationCard
         }
         .onAppear {
             customPathInput = adb.customADBPath
+            Task {
+                await updateChecker.checkForUpdates(installedVersion: adb.detectedPlatformToolsVersion)
+            }
+        }
+    }
+
+    // MARK: - 1. Server Status Card
+
+    private var serverStatusCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("ADB 服务状态 (127.0.0.1:5037)", systemImage: "network")
+                    .font(.headline)
+                Spacer()
+                StatusPill(
+                    text: adb.serverState.statusDescription,
+                    color: adb.serverState.isReady ? .green : .orange
+                )
+            }
+
+            if adb.serverState.isReady {
+                HStack {
+                    Text("纯原生 Swift TCP 通信已就绪，App 已与系统 ADB 守护进程连接，轮询开销极低。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Spacer()
+
+                    Button {
+                        adb.restartServer()
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "arrow.clockwise")
+                            Text("重启守护进程")
+                        }
+                        .font(.caption)
+                    }
+                    .buttonStyle(SoftButtonStyle())
+                }
+            } else {
+                Text("未检测到 127.0.0.1:5037 处的 ADB Server 守护进程。")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+
+                HStack(spacing: 10) {
+                    Button("尝试启动 ADB 服务") {
+                        adb.tryStartServer()
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    Button("重新检测") {
+                        adb.checkEnvironment()
+                    }
+                    .buttonStyle(SoftButtonStyle())
+                }
+            }
+        }
+        .padding(16)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12).stroke(CandyTheme.separator, lineWidth: 1)
+        }
+    }
+
+    // MARK: - 2. Version & Update Detection Card
+
+    private var versionUpdateCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            // Header
+            HStack(spacing: 10) {
+                Label("ADB 版本与更新检测", systemImage: "arrow.triangle.2.circlepath.circle")
+                    .font(.headline)
+
+                Spacer()
+
+                // 状态徽章
+                switch updateChecker.status {
+                case .checking:
+                    HStack(spacing: 5) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("正在检测...")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                case .upToDate(let ver):
+                    StatusPill(text: "✓ 已是最新版本 (v\(ver))", color: .green)
+                case .updateAvailable(_, let latest, _, _):
+                    StatusPill(text: "发现新版本 v\(latest)", color: CandyTheme.syrup)
+                case .failed:
+                    StatusPill(text: "检测失败", color: .red)
+                case .idle:
+                    StatusPill(text: "就绪", color: .secondary)
+                }
+
+                // 检查更新按钮
+                Button {
+                    Task {
+                        await updateChecker.checkForUpdates(
+                            installedVersion: adb.detectedPlatformToolsVersion,
+                            force: true
+                        )
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "arrow.clockwise")
+                        Text("检查更新")
+                    }
+                    .font(.caption.weight(.medium))
+                }
+                .buttonStyle(SoftButtonStyle())
+                .disabled(updateChecker.status.isChecking)
+            }
+
+            Divider()
+
+            // 版本对照网格
+            HStack(alignment: .top, spacing: 24) {
+                // 本地当前版本
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("当前已安装版本")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+
+                    if let ver = adb.detectedPlatformToolsVersion {
+                        HStack(spacing: 6) {
+                            Text("Platform-Tools v\(ver)")
+                                .font(.system(size: 14, weight: .bold, design: .monospaced))
+                            StatusPill(text: "已定位", color: .blue)
+                        }
+                    } else if case .running(let proto) = adb.serverState {
+                        HStack(spacing: 6) {
+                            Text("ADB Server 协议 v\(proto)")
+                                .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                            StatusPill(text: "1.0.\(proto)", color: .secondary)
+                        }
+                    } else {
+                        Text("待指定可执行程序路径")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    if case .running(let proto) = adb.serverState, adb.detectedPlatformToolsVersion != nil {
+                        Text("守护进程协议: 1.0.\(proto) (v\(proto))")
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                // 云端最新版本
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("官方最新可用版本")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+
+                    if let latest = updateChecker.latestVersion {
+                        HStack(spacing: 6) {
+                            Text("Platform-Tools v\(latest)")
+                                .font(.system(size: 14, weight: .bold, design: .monospaced))
+                                .foregroundStyle(CandyTheme.syrup)
+                            Text("Google 官方发布")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    } else if updateChecker.status.isChecking {
+                        Text("正在获取官方版本...")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("点击右上角「检查更新」拉取")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Text("来源: Google Developer / Homebrew Cask")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            // 若检测到系统中另有已安装的更新版本，提示一键切换
+            if let alt = adb.latestAlternativeInstallation {
+                HStack(spacing: 12) {
+                    Image(systemName: "sparkles")
+                        .font(.title3)
+                        .foregroundStyle(CandyTheme.syrup)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("检测到系统已安装更高版本的 ADB")
+                            .font(.subheadline.weight(.bold))
+                        Text("位置: \(alt.path)\(alt.version.map { " (v\($0))" } ?? "")")
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Spacer()
+
+                    Button {
+                        adb.switchToInstallation(alt)
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.triangle.2.circlepath")
+                            Text("一键切换至此版本 (v\(alt.version ?? ""))")
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(CandyTheme.syrup)
+                }
+                .padding(12)
+                .background(CandyTheme.syrup.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+            }
+
+            // 更新提示与升级操作区
+            if case .updateAvailable(let current, let latest, let notesURL, let dlURL) = updateChecker.status {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "arrow.up.circle.fill")
+                            .foregroundStyle(CandyTheme.syrup)
+                        Text(current != nil ? "检测到 Google 官方已发布更新版本的 Platform-Tools (当前 v\(current!) → 最新 v\(latest))" : "检测到 Google 官方已发布最新的 Platform-Tools v\(latest)，建议升级以获得最佳兼容性。")
+                            .font(.caption.weight(.medium))
+                    }
+
+                    // 一键自动升级与命令操作条
+                    HStack(spacing: 10) {
+                        // 一键自动执行升级（主按钮）
+                        Button {
+                            adb.runOneClickUpgrade()
+                        } label: {
+                            HStack(spacing: 5) {
+                                Image(systemName: "bolt.fill")
+                                Text("一键自动执行升级")
+                                    .font(.subheadline.weight(.semibold))
+                            }
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 3)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(CandyTheme.syrup)
+
+                        // 复制升级命令辅助按钮
+                        Button(copiedUpgradeNotice ? "已复制升级命令" : "复制升级命令") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString("brew upgrade android-platform-tools", forType: .string)
+                            copiedUpgradeNotice = true
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                                copiedUpgradeNotice = false
+                            }
+                        }
+                        .buttonStyle(SoftButtonStyle())
+
+                        Spacer()
+
+                        if let notes = notesURL {
+                            Button {
+                                NSWorkspace.shared.open(notes)
+                            } label: {
+                                Label("发行说明", systemImage: "arrow.up.right.square")
+                                    .font(.caption)
+                            }
+                            .buttonStyle(SoftButtonStyle())
+                        }
+
+                        if let dl = dlURL {
+                            Button {
+                                NSWorkspace.shared.open(dl)
+                            } label: {
+                                Label("官方下载", systemImage: "arrow.down.circle")
+                                    .font(.caption)
+                            }
+                            .buttonStyle(SoftButtonStyle())
+                        }
+                    }
+
+                    Text("点击「一键自动执行升级」将自动唤起系统终端执行 Homebrew 升级并重启守护进程，无需手动输入。")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(12)
+                .background(CandyTheme.syrup.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+            } else if case .upToDate = updateChecker.status {
+                HStack(spacing: 6) {
+                    Image(systemName: "checkmark.seal.fill")
+                        .foregroundStyle(.green)
+                    Text("您的 ADB 工具组件已是最新版本，具备最优的无线调试与长时时序采样稳定性。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(10)
+                .background(Color.green.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+            } else if case .failed(let msg) = updateChecker.status {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text("更新检测失败: \(msg)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            // 底部元数据小注
+            HStack {
+                if let checked = updateChecker.lastCheckedAt {
+                    Text("上次检测: \(checked.formatted(date: .omitted, time: .standard))")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+                Spacer()
+                Link("Android SDK Platform-Tools 发行说明", destination: ADBUpdateChecker.officialReleaseNotesURL)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(16)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12).stroke(CandyTheme.separator, lineWidth: 1)
+        }
+    }
+
+    // MARK: - 3. Tool Installation & Path Configuration Card
+
+    private var toolInstallationCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("ADB 工具安装与路径配置", systemImage: "wrench.and.screwdriver")
+                .font(.headline)
+
+            if let path = adb.detectedADBPath {
+                HStack(spacing: 8) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                    Text("已定位 adb 可执行程序: \(path)")
+                        .font(.caption.monospaced())
+
+                    if let ver = adb.detectedPlatformToolsVersion {
+                        StatusPill(text: "v\(ver)", color: .blue)
+                    }
+                }
+            } else {
+                Text("如果您的 Mac 尚未安装 Android 调试工具，可通过 Homebrew 快速安装：")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                HStack {
+                    Text("brew install android-platform-tools")
+                        .font(.system(size: 12, design: .monospaced))
+                        .padding(8)
+                        .background(.secondary.opacity(0.1), in: RoundedRectangle(cornerRadius: 6))
+
+                    Button(copiedNotice ? "已复制" : "复制命令") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString("brew install android-platform-tools", forType: .string)
+                        copiedNotice = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                            copiedNotice = false
+                        }
+                    }
+                    .buttonStyle(SoftButtonStyle())
+                }
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("自定义 ADB 执行程序路径 (选填)")
+                    .font(.subheadline.weight(.semibold))
+
+                HStack(spacing: 8) {
+                    TextField("如 /opt/homebrew/bin/adb 或 ~/android-sdk/platform-tools/adb", text: $customPathInput)
+                        .textFieldStyle(.roundedBorder)
+
+                    Button("浏览选择...") {
+                        selectExecutableFile()
+                    }
+                    .buttonStyle(SoftButtonStyle())
+
+                    Button("保存并测试") {
+                        adb.customADBPath = customPathInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                        adb.checkEnvironment()
+                    }
+                    .buttonStyle(.bordered)
+                }
+
+                Text("支持选择 adb 执行文件或软链接，沙盒将自动记忆读取权限。")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(16)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12).stroke(CandyTheme.separator, lineWidth: 1)
+        }
+    }
+
+    private func selectExecutableFile() {
+        let panel = NSOpenPanel()
+        panel.title = "选择 ADB 可执行程序"
+        panel.prompt = "选择"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.treatsFilePackagesAsDirectories = false
+
+        if let window = NSApplication.shared.windows.first(where: { $0.isKeyWindow }) {
+            panel.beginSheetModal(for: window) { response in
+                if response == .OK, let selectedURL = panel.url {
+                    customPathInput = selectedURL.path
+                    adb.setCustomADBExecutableURL(selectedURL)
+                }
+            }
+        } else {
+            if panel.runModal() == .OK, let selectedURL = panel.url {
+                customPathInput = selectedURL.path
+                adb.setCustomADBExecutableURL(selectedURL)
+            }
         }
     }
 }

@@ -34,11 +34,11 @@ struct ContentView: View {
         }
         .onAppear {
             store.configure(modelContext: modelContext)
-            store.reloadPersistedState()
+            store.reloadPersistedState(force: false)
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
-                store.reloadPersistedState()
+                store.reloadPersistedState(force: false)
             }
         }
         .sheet(isPresented: Binding(
@@ -324,6 +324,8 @@ private struct NativeMonitorView: View {
         self.lineSamplesCache = segmentedChartPoints(from: plotted)
     }
 
+    @State private var monitorContentWidth: CGFloat = 850
+
     var body: some View {
         VStack(spacing: 0) {
             HeaderBar(title: "我的设备", subtitle: store.selectedDevice?.effectiveProductFamily ?? "CoCan Mirror") {
@@ -348,23 +350,35 @@ private struct NativeMonitorView: View {
 
                     WirelessADBBar(store: store)
 
-                    ViewThatFits(in: .horizontal) {
-                        HStack(alignment: .top, spacing: 12) {
-                            topologyPanel
-                                .frame(minWidth: 500)
-                                .frame(height: dashboardHeight)
+                    Group {
+                        if monitorContentWidth >= 800 {
+                            HStack(alignment: .top, spacing: 12) {
+                                topologyPanel
+                                    .frame(minWidth: 500)
+                                    .frame(height: dashboardHeight)
 
-                            VStack(spacing: 10) {
-                                nativeMetrics
-                                recordingPanel(fillsHeight: true)
+                                VStack(spacing: 10) {
+                                    nativeMetrics
+                                    recordingPanel(fillsHeight: true)
+                                }
+                                .frame(width: 280, height: dashboardHeight, alignment: .top)
                             }
-                            .frame(width: 280, height: dashboardHeight, alignment: .top)
+                        } else {
+                            VStack(spacing: 12) {
+                                topologyPanel
+                                nativeMetrics
+                                recordingPanel()
+                            }
                         }
-
-                        VStack(spacing: 12) {
-                            topologyPanel
-                            nativeMetrics
-                            recordingPanel()
+                    }
+                    .background(
+                        GeometryReader { proxy in
+                            Color.clear.preference(key: MonitorWidthKey.self, value: proxy.size.width)
+                        }
+                    )
+                    .onPreferenceChange(MonitorWidthKey.self) { width in
+                        if abs(width - monitorContentWidth) > 15 {
+                            monitorContentWidth = width
                         }
                     }
 
@@ -419,6 +433,16 @@ private struct NativeMonitorView: View {
     }
 
     private var dashboardHeight: CGFloat { 408 }
+}
+
+private struct MonitorWidthKey: PreferenceKey {
+    static var defaultValue: CGFloat = 850
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+extension NativeMonitorView {
 
     private var chartPanel: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -1317,15 +1341,44 @@ private func segmentedChartPoints(from samples: [ChartSamplePoint]) -> [ChartLin
     return points
 }
 
+/// 在按时间戳递增排序的集合中快速定位距离目标时间最近的元素，时间复杂度 O(log N)
+func binarySearchNearest<T>(in sortedItems: [T], dateKeyPath: KeyPath<T, Date>, target: Date) -> T? {
+    guard !sortedItems.isEmpty else { return nil }
+    if sortedItems.count == 1 { return sortedItems[0] }
+
+    var low = 0
+    var high = sortedItems.count - 1
+
+    while low <= high {
+        let mid = (low + high) / 2
+        let midDate = sortedItems[mid][keyPath: dateKeyPath]
+        if midDate < target {
+            low = mid + 1
+        } else if midDate > target {
+            high = mid - 1
+        } else {
+            return sortedItems[mid]
+        }
+    }
+
+    if low >= sortedItems.count {
+        return sortedItems[high]
+    }
+    if high < 0 {
+        return sortedItems[low]
+    }
+    let diffLow = abs(sortedItems[low][keyPath: dateKeyPath].timeIntervalSince(target))
+    let diffHigh = abs(sortedItems[high][keyPath: dateKeyPath].timeIntervalSince(target))
+    return diffLow < diffHigh ? sortedItems[low] : sortedItems[high]
+}
+
 private func nearestSamplesByPort(to date: Date, in samples: [ChartSamplePoint]) -> [ChartSamplePoint] {
     let grouped = Dictionary(grouping: samples) { $0.portIndex }
     let tolerance: TimeInterval = 10
 
     return grouped.keys.sorted().compactMap { portIndex in
-        let nearest = grouped[portIndex]?.min {
-            abs($0.timestamp.timeIntervalSince(date)) < abs($1.timestamp.timeIntervalSince(date))
-        }
-        guard let nearest,
+        guard let portSamples = grouped[portIndex], !portSamples.isEmpty else { return nil }
+        guard let nearest = binarySearchNearest(in: portSamples, dateKeyPath: \.timestamp, target: date),
               abs(nearest.timestamp.timeIntervalSince(date)) <= tolerance else {
             return nil
         }
@@ -2069,7 +2122,7 @@ private struct PortDetailSheet: View {
                                     HStack(spacing: 6) {
                                         Text("无线调试设备绑定")
                                             .font(.headline)
-                                        if store.adbService.boundDevice(for: port.port.index) != nil {
+                                        if store.adbService.boundDevice(for: port.port.index) != nil && !port.hasNativePDBattery && !port.isNonAndroidDevice {
                                             Text("已自动绑定")
                                                 .font(.system(size: 10, weight: .bold))
                                                 .padding(.horizontal, 6)
@@ -2078,21 +2131,27 @@ private struct PortDetailSheet: View {
                                                 .foregroundStyle(CandyTheme.mint)
                                         }
                                     }
-                                    Text("支持智能自动识别绑定；同步记录手机电池电量、电压与温度")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
+                                    if port.hasNativePDBattery {
+                                        Text("当前端口已通过 USB-PD 原生读取到设备电池数据，无需 ADB 联动；如需联动测试亦可手动选择")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    } else {
+                                        Text("支持智能自动识别绑定；同步记录手机电池电量、电压与温度")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
                                 }
 
                                 Spacer()
 
                                 Menu {
                                     Button("解除绑定") {
-                                        store.adbService.bindPort(port.port.index, to: nil)
+                                        store.manuallyUnbindPort(port.port.index)
                                     }
                                     Divider()
                                     ForEach(store.adbService.devices) { dev in
                                         Button {
-                                            store.adbService.bindPort(port.port.index, to: dev.serial)
+                                            store.manuallyBindPort(port.port.index, to: dev.serial)
                                         } label: {
                                             HStack {
                                                 Text("\(dev.displayName) (\(dev.serial))")
@@ -2105,7 +2164,7 @@ private struct PortDetailSheet: View {
                                 } label: {
                                     HStack(spacing: 6) {
                                         let boundDevice = store.adbService.boundDevice(for: port.port.index)
-                                        Text(boundDevice?.displayName ?? "选择 Android 设备")
+                                        Text(boundDevice?.displayName ?? (port.hasNativePDBattery ? "未绑定 (已原生遥测)" : "选择 Android 设备"))
                                             .font(.callout.weight(.medium))
                                         Image(systemName: "chevron.up.chevron.down")
                                             .font(.caption2)
@@ -2224,7 +2283,7 @@ private struct PortDetailSheet: View {
     }
 
     private var deviceTitle: String {
-        if let model = port.pdStatus?.modelName, model.isEmpty == false {
+        if let model = port.pdStatus?.modelName, model.isEmpty == false, model != "0x0000" {
             return model
         }
         if let name = port.detail?.deviceNameZH ?? port.detail?.deviceNameEN, name.isEmpty == false {
@@ -2232,6 +2291,9 @@ private struct PortDetailSheet: View {
         }
         if isXiaomiSurgeCharge {
             return "小米澎湃秒充设备"
+        }
+        if port.hasNativePDBattery {
+            return "标准 USB-PD 设备"
         }
         return "未知设备型号"
     }
@@ -3437,9 +3499,7 @@ private struct SessionPowerChart: View {
             return
         }
 
-        if let nearest = samples.min(by: {
-            abs($0.timestamp.timeIntervalSince(date)) < abs($1.timestamp.timeIntervalSince(date))
-        }) {
+        if let nearest = binarySearchNearest(in: samples, dateKeyPath: \.timestamp, target: date) {
             hoveredSample = nearest
             let peak = isStandaloneBattery ? 100.0 : maxPower
             
@@ -5383,9 +5443,7 @@ private struct MenuBarMiniPowerChart: View {
         let span = max(last.timeIntervalSince(first), 1)
         let ratio = min(max((x - rect.minX) / max(rect.width, 1), 0), 1)
         let date = first.addingTimeInterval(span * ratio)
-        return samples.min {
-            abs($0.timestamp.timeIntervalSince(date)) < abs($1.timestamp.timeIntervalSince(date))
-        }
+        return binarySearchNearest(in: samples, dateKeyPath: \.timestamp, target: date)
     }
 }
 
