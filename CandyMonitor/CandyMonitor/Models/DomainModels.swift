@@ -409,7 +409,7 @@ final class ControlEvent {
     }
 }
 
-struct MachinePort: Identifiable, Codable, Hashable, Sendable {
+nonisolated struct MachinePort: Identifiable, Codable, Hashable, Sendable {
     let index: Int
     let name: String
     let connectorType: String
@@ -426,7 +426,7 @@ struct MachinePort: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
-struct DeviceInfo: Codable, Sendable {
+nonisolated struct DeviceInfo: Codable, Sendable {
     let appVersion: String?
     let fpgaVersion: String?
     let model: String?
@@ -444,7 +444,7 @@ struct DeviceInfo: Codable, Sendable {
     }
 }
 
-struct MachineFacts: Codable, Sendable {
+nonisolated struct MachineFacts: Codable, Sendable {
     let productFamily: String?
     let brandEN: String?
     let brandZH: String?
@@ -464,11 +464,11 @@ struct MachineFacts: Codable, Sendable {
     }
 }
 
-struct PortDetailsEnvelope: Codable, Sendable {
+nonisolated struct PortDetailsEnvelope: Codable, Sendable {
     let ports: [PortDetail]
 }
 
-struct PortDetail: Codable, Identifiable, Hashable, Sendable {
+nonisolated struct PortDetail: Codable, Identifiable, Hashable, Sendable {
     let connected: Bool
     let dieTemperature: String
     let enable: Bool?
@@ -506,7 +506,7 @@ struct PortDetail: Codable, Identifiable, Hashable, Sendable {
     }
 }
 
-struct ChargingStatus: Codable, Sendable {
+nonisolated struct ChargingStatus: Codable, Sendable {
     let statusBitmask: Int
 
     enum CodingKeys: String, CodingKey {
@@ -514,7 +514,7 @@ struct ChargingStatus: Codable, Sendable {
     }
 }
 
-struct TemperatureModeResponse: Codable, Sendable {
+nonisolated struct TemperatureModeResponse: Codable, Sendable {
     let mode: Int
     let modeName: String?
 
@@ -524,11 +524,11 @@ struct TemperatureModeResponse: Codable, Sendable {
     }
 }
 
-struct PDStatusEnvelope: Codable, Sendable {
+nonisolated struct PDStatusEnvelope: Codable, Sendable {
     let ports: [PDPortStatus]
 }
 
-struct PDPortStatus: Codable, Hashable, Sendable {
+nonisolated struct PDPortStatus: Codable, Hashable, Sendable {
     let port: Int
     let batteryPercent: Double?
     let manufacturer: String?
@@ -1129,12 +1129,15 @@ enum LocalizedTelemetry {
 
 // MARK: - Wireless ADB Models
 
-struct ADBDevice: Identifiable, Hashable, Sendable {
+nonisolated struct ADBDevice: Identifiable, Hashable, Sendable {
     let serial: String
+    var hardwareSerial: String?
     var brand: String
     var model: String
     var isOnline: Bool
     var isWireless: Bool
+    var hasUSBConnection: Bool
+    var hasWirelessConnection: Bool
     var ip: String?
     var port: Int?
     var batteryPercent: Double?
@@ -1144,10 +1147,10 @@ struct ADBDevice: Identifiable, Hashable, Sendable {
     var isCharging: Bool
     var lastSeenAt: Date
 
-    var id: String { serial }
+    var id: String { hardwareSerial ?? serial }
 
     var virtualDeviceID: UUID {
-        Self.virtualDeviceID(for: serial)
+        Self.virtualDeviceID(for: hardwareSerial ?? serial)
     }
 
     static func virtualDeviceID(for serial: String) -> UUID {
@@ -1166,10 +1169,13 @@ struct ADBDevice: Identifiable, Hashable, Sendable {
 
     init(
         serial: String,
+        hardwareSerial: String? = nil,
         brand: String = "",
         model: String = "",
         isOnline: Bool = true,
         isWireless: Bool = false,
+        hasUSBConnection: Bool? = nil,
+        hasWirelessConnection: Bool? = nil,
         ip: String? = nil,
         port: Int? = nil,
         batteryPercent: Double? = nil,
@@ -1180,10 +1186,13 @@ struct ADBDevice: Identifiable, Hashable, Sendable {
         lastSeenAt: Date = Date()
     ) {
         self.serial = serial
+        self.hardwareSerial = hardwareSerial
         self.brand = brand
         self.model = model
         self.isOnline = isOnline
         self.isWireless = isWireless
+        self.hasUSBConnection = hasUSBConnection ?? !isWireless
+        self.hasWirelessConnection = hasWirelessConnection ?? isWireless
         self.ip = ip
         self.port = port
         self.batteryPercent = batteryPercent
@@ -1224,7 +1233,7 @@ struct ADBDevice: Identifiable, Hashable, Sendable {
     }
 }
 
-struct ADBConnectionHistory: Codable, Identifiable, Hashable, Sendable {
+nonisolated struct ADBConnectionHistory: Codable, Identifiable, Hashable, Sendable {
     var id: String { "\(host):\(port)" }
     let host: String
     let port: Int
@@ -1236,6 +1245,47 @@ struct ADBConnectionHistory: Codable, Identifiable, Hashable, Sendable {
         self.port = port
         self.displayName = displayName
         self.lastConnectedAt = lastConnectedAt
+    }
+}
+
+/// 局域网通过 Bonjour / mDNS 自动发现的开启了无线调试的 Android 设备
+nonisolated struct DiscoveredADBDevice: Identifiable, Hashable, Sendable {
+    var id: String { "\(host):\(port)" }
+    let name: String
+    let host: String
+    let port: Int
+    let model: String
+    let serial: String
+    let serviceName: String
+    var lastSeenAt: Date
+
+    init(
+        name: String,
+        host: String,
+        port: Int,
+        model: String = "",
+        serial: String = "",
+        serviceName: String = "",
+        lastSeenAt: Date = Date()
+    ) {
+        self.name = name
+        self.host = host
+        self.port = port
+        self.model = model
+        self.serial = serial
+        self.serviceName = serviceName
+        self.lastSeenAt = lastSeenAt
+    }
+
+    var displayName: String {
+        let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cleanName.isEmpty && !cleanModel.isEmpty && cleanName != cleanModel {
+            return "\(cleanName) (\(cleanModel))"
+        }
+        if !cleanName.isEmpty { return cleanName }
+        if !cleanModel.isEmpty { return cleanModel }
+        return host
     }
 }
 

@@ -258,7 +258,7 @@ public final class ADBUpdateChecker {
         }
 
         // 尝试解析 Caskroom 软链接路径（如 /opt/homebrew/Caskroom/android-platform-tools/37.0.1/...）
-        let resolvedPath = (try? URL(fileURLWithPath: executablePath).resolvingSymlinksInPath())?.path ?? executablePath
+        let resolvedPath = URL(fileURLWithPath: executablePath).resolvingSymlinksInPath().path
         if resolvedPath != executablePath {
             let resolvedDir = URL(fileURLWithPath: resolvedPath).deletingLastPathComponent()
             let resolvedProps = resolvedDir.appendingPathComponent("source.properties")

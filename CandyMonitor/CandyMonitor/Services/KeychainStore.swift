@@ -26,11 +26,15 @@ enum KeychainStore {
     }
 
     static func loadMCPURL(account: String) throws -> String? {
-        try loadSecret(account: account, migrateWith: saveMCPURL)
+        try loadSecret(account: account) { url, acc in
+            try saveMCPURL(url, account: acc)
+        }
     }
 
     static func loadLANURL(account: String) throws -> String? {
-        try loadSecret(account: account + lanURLSuffix, migrateWith: saveLANURL)
+        try loadSecret(account: account + lanURLSuffix) { url, acc in
+            try saveLANURL(url, account: acc)
+        }
     }
 
     static func loadIOTGatewayJWT(account: String) throws -> String? {

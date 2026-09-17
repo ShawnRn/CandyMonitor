@@ -276,6 +276,7 @@ private struct ADBPairingTabView: View {
 
     @State private var isPairing: Bool = false
     @State private var isConnecting: Bool = false
+    @State private var connectingTarget: String?
     @State private var statusMessage: String?
     @State private var isError: Bool = false
 
@@ -283,99 +284,237 @@ private struct ADBPairingTabView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
-            // Pairing Card
-            VStack(alignment: .leading, spacing: 12) {
-                Label("使用配对码配对新手机", systemImage: "qrcode")
+            // 1. 局域网已发现的无线调试设备 (Bonjour / mDNS)
+            discoveredLANDevicesCard
+
+            // 2. 直接连接已配对设备
+            directConnectCard
+
+            // 3. 配对新手机
+            pairingCard
+
+            // 4. 最近连接记录
+            recentConnectionsCard
+        }
+    }
+
+    // MARK: - 1. Discovered LAN Devices Card (mDNS)
+
+    private var discoveredLANDevicesCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "antenna.radiowaves.left.and.right")
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundStyle(CandyTheme.syrup)
+
+                Text("局域网已发现的无线调试设备")
                     .font(.headline)
 
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("1. 手机连接与 Mac 相同的 Wi-Fi 局域网。")
-                    Text("2. 手机进入「设置 → 开发者选项 → 无线调试」。")
-                    Text("3. 点击「使用配对码配对设备」，查看显示的 IP、配对端口及 6 位配对码。")
+                if !adb.discoveredLANDevices.isEmpty {
+                    Text("\(adb.discoveredLANDevices.count) 台在线")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(CandyTheme.syrup)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(CandyTheme.syrup.opacity(0.12), in: Capsule())
                 }
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .padding(10)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
 
+                Spacer()
+
+                Button {
+                    adb.refreshLANDevices()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "arrow.clockwise")
+                        Text("重新扫描")
+                    }
+                    .font(.caption.weight(.medium))
+                }
+                .buttonStyle(SoftButtonStyle())
+            }
+
+            if adb.discoveredLANDevices.isEmpty {
                 HStack(spacing: 10) {
-                    TextField("IP 地址 (如 192.168.31.182)", text: $pairHost)
-                        .textFieldStyle(.roundedBorder)
-
-                    TextField("配对端口", text: $pairPort)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 100)
-                }
-
-                HStack(spacing: 10) {
-                    TextField("6 位配对码 (如 123456)", text: $pairingCode)
-                        .textFieldStyle(.roundedBorder)
-
-                    TextField("调试端口 (选填)", text: $debugPort)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 130)
-                }
-
-                HStack {
-                    if isPairing {
-                        ProgressView()
-                            .controlSize(.small)
-                        Text("正在配对与连接...")
-                            .font(.caption)
+                    ProgressView()
+                        .controlSize(.small)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("正在持续监听局域网中的 Android 无线调试广播...")
+                            .font(.caption.weight(.medium))
+                        Text("请确保手机与 Mac 处于同一 Wi-Fi，且手机已进入「开发者选项 → 无线调试」开启开关。")
+                            .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
-
-                    Spacer()
-
-                    Button {
-                        startPairing()
-                    } label: {
-                        Text("配对并自动连接")
+                }
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(.secondary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+            } else {
+                VStack(spacing: 8) {
+                    ForEach(adb.discoveredLANDevices) { dev in
+                        discoveredDeviceRow(dev)
                     }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(isPairing || pairHost.isEmpty || pairPort.isEmpty || pairingCode.isEmpty)
                 }
             }
-            .padding(16)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-            .overlay {
-                RoundedRectangle(cornerRadius: 12).stroke(CandyTheme.separator, lineWidth: 1)
+        }
+        .padding(16)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12).stroke(CandyTheme.separator, lineWidth: 1)
+        }
+    }
+
+    private func discoveredDeviceRow(_ dev: DiscoveredADBDevice) -> some View {
+        let connected = isDeviceConnected(dev)
+        let isThisConnecting = isConnecting && connectingTarget == "\(dev.host):\(dev.port)"
+
+        return HStack(spacing: 12) {
+            Image(systemName: "smartphone")
+                .font(.system(size: 20))
+                .foregroundStyle(connected ? .green : CandyTheme.syrup)
+                .frame(width: 32, height: 32)
+                .background((connected ? Color.green : CandyTheme.syrup).opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(dev.displayName)
+                        .font(.system(size: 13, weight: .bold))
+
+                    if connected {
+                        HStack(spacing: 3) {
+                            Circle().fill(.green).frame(width: 6, height: 6)
+                            Text("已连接")
+                        }
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.green)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.green.opacity(0.12), in: Capsule())
+                    } else {
+                        Text("就绪")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.secondary.opacity(0.1), in: Capsule())
+                    }
+                }
+
+                HStack(spacing: 8) {
+                    Text(verbatim: "\(dev.host):\(dev.port)")
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.secondary)
+
+                    if !dev.serial.isEmpty {
+                        Text(verbatim: "S/N: \(dev.serial)")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                    }
+                }
             }
 
-            // Direct Connect Card
-            VStack(alignment: .leading, spacing: 12) {
+            Spacer()
+
+            if connected {
+                Button("断开") {
+                    disconnectDevice(dev)
+                }
+                .buttonStyle(SoftButtonStyle(destructive: true))
+            } else {
+                Button {
+                    directHost = dev.host
+                    directPort = String(dev.port)
+                } label: {
+                    Text("填入下方")
+                        .font(.caption)
+                }
+                .buttonStyle(SoftButtonStyle())
+
+                Button {
+                    connectToDiscovered(dev)
+                } label: {
+                    if isThisConnecting {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        HStack(spacing: 4) {
+                            Image(systemName: "bolt.fill")
+                            Text("一键连接")
+                        }
+                        .font(.system(size: 11, weight: .semibold))
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(CandyTheme.syrup)
+                .disabled(isConnecting)
+            }
+        }
+        .padding(10)
+        .background(.secondary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    // MARK: - 2. Direct Connect Card
+
+    private var directConnectCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
                 Label("直接连接已配对设备", systemImage: "cable.connector")
                     .font(.headline)
 
-                HStack(spacing: 10) {
-                    TextField("IP 地址 (如 192.168.31.182)", text: $directHost)
-                        .textFieldStyle(.roundedBorder)
+                Spacer()
 
-                    TextField("调试端口", text: $directPort)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 100)
+                Button {
+                    adb.restartServer()
+                } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: "arrow.clockwise")
+                        Text("重启 ADB 服务")
+                    }
+                    .font(.caption2)
+                }
+                .buttonStyle(SoftButtonStyle())
+                .help("若提示 No route to host 或端口被占用，点击重启底层 adb daemon 路由缓存")
+            }
 
-                    Button {
-                        startDirectConnect()
-                    } label: {
-                        if isConnecting {
-                            ProgressView().controlSize(.small)
-                        } else {
-                            Text("连接")
+            Text("适用于已配对过的手机。若手机开启无线调试后端口发生变动，直接输入当前端口或从上方列表一键直连。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 10) {
+                TextField("IP 地址 (如 192.168.10.152)", text: $directHost)
+                    .textFieldStyle(.roundedBorder)
+                    .onChange(of: directHost) { _, newValue in
+                        if let parsed = smartParseHostAndPort(from: newValue) {
+                            directHost = parsed.host
+                            if let p = parsed.port {
+                                directPort = p
+                            }
                         }
                     }
-                    .buttonStyle(.bordered)
-                    .disabled(isConnecting || directHost.isEmpty || directPort.isEmpty)
+
+                TextField("调试端口", text: $directPort)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 110)
+                    .onChange(of: directPort) { _, newValue in
+                        let cleaned = newValue.filter { $0.isNumber }
+                        if cleaned != newValue {
+                            directPort = cleaned
+                        }
+                    }
+
+                Button {
+                    startDirectConnect()
+                } label: {
+                    if isConnecting && connectingTarget == nil {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Text("连接")
+                    }
                 }
-            }
-            .padding(16)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-            .overlay {
-                RoundedRectangle(cornerRadius: 12).stroke(CandyTheme.separator, lineWidth: 1)
+                .buttonStyle(.borderedProminent)
+                .tint(CandyTheme.syrup)
+                .disabled(isConnecting || directHost.isEmpty || directPort.isEmpty)
             }
 
-            // Status Message
+            // 状态反馈与自愈提示
             if let msg = statusMessage {
                 HStack(spacing: 6) {
                     Image(systemName: isError ? "exclamationmark.circle.fill" : "checkmark.circle.fill")
@@ -383,49 +522,235 @@ private struct ADBPairingTabView: View {
                     Text(msg)
                         .font(.caption)
                         .foregroundStyle(isError ? .red : .primary)
+
+                    if isError && (msg.contains("No route") || msg.contains("Connection refused") || msg.contains("拒绝")) {
+                        Spacer()
+                        Button("一键重启 ADB 服务") {
+                            adb.restartServer()
+                        }
+                        .buttonStyle(SoftButtonStyle())
+                    }
                 }
                 .padding(.horizontal, 4)
+                .padding(.top, 4)
+            }
+        }
+        .padding(16)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12).stroke(CandyTheme.separator, lineWidth: 1)
+        }
+    }
+
+    // MARK: - 3. Pairing Card
+
+    private var pairingCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("使用配对码配对新手机", systemImage: "qrcode")
+                .font(.headline)
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("1. 手机连接与 Mac 相同的 Wi-Fi 局域网。")
+                Text("2. 手机进入「设置 → 开发者选项 → 无线调试」。")
+                Text("3. 点击「使用配对码配对设备」，查看显示的 IP、配对端口及 6 位配对码。")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+
+            HStack(spacing: 10) {
+                TextField("IP 地址 (如 192.168.10.152)", text: $pairHost)
+                    .textFieldStyle(.roundedBorder)
+                    .onChange(of: pairHost) { _, newValue in
+                        if let parsed = smartParseHostAndPort(from: newValue) {
+                            pairHost = parsed.host
+                            if let p = parsed.port {
+                                pairPort = p
+                            }
+                        }
+                    }
+
+                TextField("配对端口", text: $pairPort)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 110)
+                    .onChange(of: pairPort) { _, newValue in
+                        let cleaned = newValue.filter { $0.isNumber }
+                        if cleaned != newValue {
+                            pairPort = cleaned
+                        }
+                    }
             }
 
-            // Recent Connections
-            if !adb.recentConnections.isEmpty {
-                VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                TextField("6 位配对码 (如 123456)", text: $pairingCode)
+                    .textFieldStyle(.roundedBorder)
+                    .onChange(of: pairingCode) { _, newValue in
+                        let cleaned = newValue.filter { $0.isNumber }
+                        if cleaned != newValue {
+                            pairingCode = cleaned
+                        }
+                    }
+
+                TextField("调试端口 (选填)", text: $debugPort)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 140)
+                    .onChange(of: debugPort) { _, newValue in
+                        let cleaned = newValue.filter { $0.isNumber }
+                        if cleaned != newValue {
+                            debugPort = cleaned
+                        }
+                    }
+            }
+
+            HStack {
+                if isPairing {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("正在配对与连接...")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                Button {
+                    startPairing()
+                } label: {
+                    Text("配对并自动连接")
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(CandyTheme.syrup)
+                .disabled(isPairing || pairHost.isEmpty || pairPort.isEmpty || pairingCode.isEmpty)
+            }
+        }
+        .padding(16)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12).stroke(CandyTheme.separator, lineWidth: 1)
+        }
+    }
+
+    // MARK: - 4. Recent Connections Card
+
+    @ViewBuilder
+    private var recentConnectionsCard: some View {
+        if !adb.recentConnections.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
                     Text("最近连接记录")
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.secondary)
 
-                    ForEach(adb.recentConnections) { item in
-                        HStack {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("\(item.host):\(item.port)")
-                                    .font(.system(size: 12, weight: .medium, design: .monospaced))
-                                Text("最近连接: \(item.lastConnectedAt.formatted(date: .abbreviated, time: .shortened))")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
+                    Spacer()
 
-                            Spacer()
-
-                            Button("快速连接") {
-                                directHost = item.host
-                                directPort = "\(item.port)"
-                                startDirectConnect()
-                            }
-                            .buttonStyle(SoftButtonStyle())
-
-                            Button {
-                                adb.removeRecentConnection(host: item.host, port: item.port)
-                            } label: {
-                                Image(systemName: "trash")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                        .padding(10)
-                        .background(.secondary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
-                    }
+                    Text("\(adb.recentConnections.count) 条记录")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
                 }
+
+                ForEach(adb.recentConnections) { item in
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 6) {
+                                Text(verbatim: "\(item.host):\(item.port)")
+                                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+
+                                if let name = item.displayName, !name.isEmpty {
+                                    Text(name)
+                                        .font(.caption2.weight(.medium))
+                                        .foregroundStyle(.secondary)
+                                        .padding(.horizontal, 5)
+                                        .padding(.vertical, 1)
+                                        .background(.secondary.opacity(0.1), in: Capsule())
+                                }
+                            }
+
+                            Text("最近连接: \(item.lastConnectedAt.formatted(date: .abbreviated, time: .shortened))")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        Spacer()
+
+                        Button("快速连接") {
+                            directHost = item.host
+                            directPort = String(item.port)
+                            startDirectConnect()
+                        }
+                        .buttonStyle(SoftButtonStyle())
+
+                        Button {
+                            adb.removeRecentConnection(host: item.host, port: item.port)
+                        } label: {
+                            Image(systemName: "trash")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(10)
+                    .background(.secondary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
+                }
+            }
+        }
+    }
+
+    // MARK: - Helper Methods
+
+    private func smartParseHostAndPort(from text: String) -> (host: String, port: String?)? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.contains(":") {
+            let parts = trimmed.split(separator: ":", maxSplits: 1).map(String.init)
+            if parts.count == 2 {
+                let host = parts[0].trimmingCharacters(in: .whitespacesAndNewlines)
+                let portCleaned = parts[1].filter { $0.isNumber }
+                return (host, portCleaned.isEmpty ? nil : portCleaned)
+            }
+        }
+        return nil
+    }
+
+    private func isDeviceConnected(_ dev: DiscoveredADBDevice) -> Bool {
+        adb.devices.contains { d in
+            d.isOnline && (
+                (d.ip == dev.host && d.port == dev.port) ||
+                (!dev.serial.isEmpty && d.serial.contains(dev.serial)) ||
+                (!dev.serviceName.isEmpty && d.serial.contains(dev.serviceName))
+            )
+        }
+    }
+
+    private func disconnectDevice(_ dev: DiscoveredADBDevice) {
+        if let matching = adb.devices.first(where: { d in
+            (d.ip == dev.host && d.port == dev.port) ||
+            (!dev.serial.isEmpty && d.serial.contains(dev.serial)) ||
+            (!dev.serviceName.isEmpty && d.serial.contains(dev.serviceName))
+        }) {
+            Task { _ = await adb.disconnect(serial: matching.serial) }
+        } else {
+            Task { _ = await adb.disconnect(serial: "\(dev.host):\(dev.port)") }
+        }
+    }
+
+    private func connectToDiscovered(_ dev: DiscoveredADBDevice) {
+        isConnecting = true
+        connectingTarget = "\(dev.host):\(dev.port)"
+        statusMessage = nil
+        isError = false
+
+        Task {
+            let res = await adb.connect(host: dev.host, port: dev.port)
+            isConnecting = false
+            connectingTarget = nil
+            switch res {
+            case .success(let output):
+                statusMessage = "连接成功: \(output)"
+                isError = false
+            case .failure(let error):
+                statusMessage = "连接失败: \(error.localizedDescription)"
+                isError = true
             }
         }
     }
@@ -549,7 +874,7 @@ private struct ADBDeviceCard: View {
                                 .background(Color.secondary.opacity(0.12), in: Capsule())
                         }
 
-                        if device.isWireless {
+                        if device.hasWirelessConnection {
                             HStack(spacing: 3) {
                                 Image(systemName: "wifi")
                                     .font(.system(size: 9, weight: .bold))
@@ -560,7 +885,9 @@ private struct ADBDeviceCard: View {
                             .padding(.horizontal, 6)
                             .padding(.vertical, 2)
                             .background(Color.blue.opacity(0.12), in: Capsule())
-                        } else {
+                        }
+
+                        if device.hasUSBConnection {
                             HStack(spacing: 3) {
                                 Image(systemName: "cable.connector")
                                     .font(.system(size: 9, weight: .semibold))
@@ -574,9 +901,15 @@ private struct ADBDeviceCard: View {
                         }
                     }
 
-                    Text(device.isMDNSWireless ? "无线服务名: \(device.serial)" : "序列号 / 地址: \(device.serial)")
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(.secondary)
+                    if let hw = device.hardwareSerial, !hw.isEmpty, hw != device.serial {
+                        Text("序列号: \(hw) (\(device.shortAddress))")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text(device.isMDNSWireless ? "无线服务名: \(device.serial)" : "序列号 / 地址: \(device.serial)")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
                 }
 
                 Spacer()
@@ -666,7 +999,7 @@ private struct ADBDeviceCard: View {
 
                 Spacer()
 
-                if let boundPort = adb.boundPort(for: device.serial) {
+                if adb.boundPort(for: device.serial) != nil {
                     Text("充电时数据将自动融合到该端口会话")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
@@ -1260,7 +1593,21 @@ struct WirelessADBConsoleView: View {
     var body: some View {
         VStack(spacing: 0) {
             HeaderBar(title: "无线调试", subtitle: "Android Wireless ADB · 电池电量与温度采样") {
-                SyncStatusView(date: store.lastRefreshedAt, isRefreshing: store.isRefreshingNow)
+                HStack(spacing: 8) {
+                    Button {
+                        store.adbService.restartServer()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.clockwise")
+                            Text("重启 ADB 服务")
+                        }
+                        .font(.caption)
+                    }
+                    .buttonStyle(SoftButtonStyle())
+                    .help("重启本地 ADB 守护进程并重置路由缓存")
+
+                    SyncStatusView(date: store.lastRefreshedAt, isRefreshing: store.isRefreshingNow)
+                }
             }
 
             ScrollView {
@@ -1317,6 +1664,10 @@ struct WirelessADBConsoleView: View {
                             }
                         } else {
                             StatusPill(text: adb.serverState.statusDescription, color: adb.serverState.isReady ? .orange : .secondary)
+                        }
+
+                        if !adb.discoveredLANDevices.isEmpty {
+                            StatusPill(text: "局域网发现 \(adb.discoveredLANDevices.count) 台", color: .blue)
                         }
                     }
 

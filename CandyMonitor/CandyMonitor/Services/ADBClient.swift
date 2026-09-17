@@ -22,7 +22,7 @@ public enum ADBError: LocalizedError, Sendable {
     }
 }
 
-public struct ADBRawDevice: Sendable, Identifiable, Hashable {
+public nonisolated struct ADBRawDevice: Sendable, Identifiable, Hashable {
     public let serial: String
     public let state: String
     public let product: String?
@@ -69,7 +69,7 @@ public struct ADBRawDevice: Sendable, Identifiable, Hashable {
     }
 }
 
-public struct ADBBatteryStatus: Sendable {
+public nonisolated struct ADBBatteryStatus: Sendable {
     public let level: Double
     public let voltageMV: Int
     public let temperatureC: Double
@@ -111,22 +111,47 @@ public struct ADBBatteryStatus: Sendable {
     }
 }
 
-private final class ContinuationGuard<T: Sendable>: @unchecked Sendable {
+private nonisolated final class ConnectionHolder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var connection: NWConnection?
+    private var isCancelled = false
+
+    init() {}
+
+    func set(_ conn: NWConnection) {
+        lock.lock()
+        defer { lock.unlock() }
+        if isCancelled {
+            conn.cancel()
+        } else {
+            self.connection = conn
+        }
+    }
+
+    func cancel() {
+        lock.lock()
+        defer { lock.unlock() }
+        isCancelled = true
+        connection?.cancel()
+        connection = nil
+    }
+}
+
+private nonisolated final class ContinuationGuard<T: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<T, Error>?
 
-    init(_ continuation: CheckedContinuation<T, Error>) {
+    nonisolated init(_ continuation: CheckedContinuation<T, Error>) {
         self.continuation = continuation
     }
 
-    func resume(with result: Result<T, Error>, cleanup: (() -> Void)? = nil) {
+    nonisolated func resume(with result: Result<T, Error>, cleanup: (() -> Void)? = nil) {
         lock.lock()
-        defer { lock.unlock() }
-        if let c = continuation {
-            continuation = nil
-            cleanup?()
-            c.resume(with: result)
-        }
+        let c = continuation
+        continuation = nil
+        lock.unlock()
+        cleanup?()
+        c?.resume(with: result)
     }
 }
 
@@ -176,7 +201,19 @@ public actor ADBClient {
     public func connect(host: String, port: Int, timeout: TimeInterval = 6.0) async throws -> String {
         let cleanHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
         let cmd = "host:connect:\(cleanHost):\(port)"
-        return try await executeHostCommand(cmd, timeout: timeout)
+        let response = try await executeHostCommand(cmd, timeout: timeout)
+        let lower = response.lowercased()
+        if lower.contains("failed to connect") ||
+           lower.contains("connection refused") ||
+           lower.contains("no route to host") ||
+           lower.contains("connection reset") ||
+           lower.contains("unable to connect") ||
+           lower.contains("cannot connect") ||
+           lower.contains("timed out") ||
+           lower.contains("operation timed out") {
+            throw ADBError.commandFailed(response.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        return response
     }
 
     /// 断开设备连接: host:disconnect:<host>:<port>
@@ -252,95 +289,101 @@ public actor ADBClient {
     /// 执行主机命令（如 host:version, host:devices-l, host:connect:..., host:pair:...）
     private func executeHostCommand(_ command: String, timeout: TimeInterval) async throws -> String {
         try await withTimeout(seconds: timeout) {
-            try await withCheckedThrowingContinuation { continuation in
-                let nwHost = NWEndpoint.Host(self.host)
-                guard let nwPort = NWEndpoint.Port(rawValue: self.port) else {
-                    continuation.resume(throwing: ADBError.serverNotReachable("无效的端口"))
-                    return
-                }
+            let holder = ConnectionHolder()
+            return try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    let nwHost = NWEndpoint.Host(self.host)
+                    guard let nwPort = NWEndpoint.Port(rawValue: self.port) else {
+                        continuation.resume(throwing: ADBError.serverNotReachable("无效的端口"))
+                        return
+                    }
 
-                let connection = NWConnection(host: nwHost, port: nwPort, using: .tcp)
-                let guardContinuation = ContinuationGuard(continuation)
+                    let connection = NWConnection(host: nwHost, port: nwPort, using: .tcp)
+                    holder.set(connection)
+                    let guardContinuation = ContinuationGuard(continuation)
 
-                connection.stateUpdateHandler = { state in
-                    switch state {
-                    case .ready:
-                        let payload = String(format: "%04x%@", command.utf8.count, command)
-                        guard let data = payload.data(using: .utf8) else {
-                            guardContinuation.resume(with: .failure(ADBError.protocolError("UTF8 编码错误")), cleanup: { connection.cancel() })
-                            return
-                        }
-                        connection.send(content: data, completion: .contentProcessed { error in
-                            if let error = error {
-                                guardContinuation.resume(with: .failure(ADBError.serverNotReachable(error.localizedDescription)), cleanup: { connection.cancel() })
+                    connection.stateUpdateHandler = { state in
+                        switch state {
+                        case .ready:
+                            let payload = String(format: "%04x%@", command.utf8.count, command)
+                            guard let data = payload.data(using: .utf8) else {
+                                guardContinuation.resume(with: .failure(ADBError.protocolError("UTF8 编码错误")), cleanup: { connection.cancel() })
                                 return
                             }
-                            // 1. 读取 4 字节状态 (OKAY / FAIL)
-                            Self.readExactBytes(connection: connection, count: 4) { statusResult in
-                                switch statusResult {
-                                case .failure(let err):
-                                    guardContinuation.resume(with: .failure(err), cleanup: { connection.cancel() })
-                                case .success(let statusData):
-                                    let status = String(data: statusData, encoding: .utf8) ?? ""
-                                    if status == "OKAY" {
-                                        // 2. 成功，读取接下来的 4 字节长度
-                                        Self.readExactBytes(connection: connection, count: 4) { lenResult in
-                                            switch lenResult {
-                                            case .failure:
-                                                guardContinuation.resume(with: .success(""), cleanup: { connection.cancel() })
-                                            case .success(let lenData):
-                                                guard let lenHex = String(data: lenData, encoding: .utf8),
-                                                      let length = Int(lenHex, radix: 16) else {
+                            connection.send(content: data, completion: .contentProcessed { error in
+                                if let error = error {
+                                    guardContinuation.resume(with: .failure(ADBError.serverNotReachable(error.localizedDescription)), cleanup: { connection.cancel() })
+                                    return
+                                }
+                                // 1. 读取 4 字节状态 (OKAY / FAIL)
+                                Self.readExactBytes(connection: connection, count: 4) { statusResult in
+                                    switch statusResult {
+                                    case .failure(let err):
+                                        guardContinuation.resume(with: .failure(err), cleanup: { connection.cancel() })
+                                    case .success(let statusData):
+                                        let status = String(data: statusData, encoding: .utf8) ?? ""
+                                        if status == "OKAY" {
+                                            // 2. 成功，读取接下来的 4 字节长度
+                                            Self.readExactBytes(connection: connection, count: 4) { lenResult in
+                                                switch lenResult {
+                                                case .failure:
                                                     guardContinuation.resume(with: .success(""), cleanup: { connection.cancel() })
-                                                    return
-                                                }
-                                                if length <= 0 {
-                                                    guardContinuation.resume(with: .success(""), cleanup: { connection.cancel() })
-                                                    return
-                                                }
-                                                // 3. 读取指定长度的内容
-                                                Self.readExactBytes(connection: connection, count: length) { bodyResult in
-                                                    switch bodyResult {
-                                                    case .failure(let err):
-                                                        guardContinuation.resume(with: .failure(err), cleanup: { connection.cancel() })
-                                                    case .success(let bodyData):
-                                                        let responseStr = String(data: bodyData, encoding: .utf8) ?? ""
-                                                        guardContinuation.resume(with: .success(responseStr), cleanup: { connection.cancel() })
+                                                case .success(let lenData):
+                                                    guard let lenHex = String(data: lenData, encoding: .utf8),
+                                                          let length = Int(lenHex, radix: 16) else {
+                                                        guardContinuation.resume(with: .success(""), cleanup: { connection.cancel() })
+                                                        return
+                                                    }
+                                                    if length <= 0 {
+                                                        guardContinuation.resume(with: .success(""), cleanup: { connection.cancel() })
+                                                        return
+                                                    }
+                                                    // 3. 读取指定长度的内容
+                                                    Self.readExactBytes(connection: connection, count: length) { bodyResult in
+                                                        switch bodyResult {
+                                                        case .failure(let err):
+                                                            guardContinuation.resume(with: .failure(err), cleanup: { connection.cancel() })
+                                                        case .success(let bodyData):
+                                                            let responseStr = String(data: bodyData, encoding: .utf8) ?? ""
+                                                            guardContinuation.resume(with: .success(responseStr), cleanup: { connection.cancel() })
+                                                        }
                                                     }
                                                 }
                                             }
-                                        }
-                                    } else {
-                                        // FAIL 状态，读取错误长度与错误信息
-                                        Self.readExactBytes(connection: connection, count: 4) { errLenResult in
-                                            switch errLenResult {
-                                            case .failure:
-                                                guardContinuation.resume(with: .failure(ADBError.commandFailed("未知错误 (\(status))")), cleanup: { connection.cancel() })
-                                            case .success(let errLenData):
-                                                guard let lenHex = String(data: errLenData, encoding: .utf8),
-                                                      let length = Int(lenHex, radix: 16), length > 0 else {
-                                                    guardContinuation.resume(with: .failure(ADBError.commandFailed("执行失败 (\(status))")), cleanup: { connection.cancel() })
-                                                    return
-                                                }
-                                                Self.readExactBytes(connection: connection, count: length) { errBodyResult in
-                                                    let msg = (try? errBodyResult.get()).flatMap { String(data: $0, encoding: .utf8) } ?? status
-                                                    guardContinuation.resume(with: .failure(ADBError.commandFailed(msg)), cleanup: { connection.cancel() })
+                                        } else {
+                                            // FAIL 状态，读取错误长度与错误信息
+                                            Self.readExactBytes(connection: connection, count: 4) { errLenResult in
+                                                switch errLenResult {
+                                                case .failure:
+                                                    guardContinuation.resume(with: .failure(ADBError.commandFailed("未知错误 (\(status))")), cleanup: { connection.cancel() })
+                                                case .success(let errLenData):
+                                                    guard let lenHex = String(data: errLenData, encoding: .utf8),
+                                                          let length = Int(lenHex, radix: 16), length > 0 else {
+                                                        guardContinuation.resume(with: .failure(ADBError.commandFailed("执行失败 (\(status))")), cleanup: { connection.cancel() })
+                                                        return
+                                                    }
+                                                    Self.readExactBytes(connection: connection, count: length) { errBodyResult in
+                                                        let msg = (try? errBodyResult.get()).flatMap { String(data: $0, encoding: .utf8) } ?? status
+                                                        guardContinuation.resume(with: .failure(ADBError.commandFailed(msg)), cleanup: { connection.cancel() })
+                                                    }
                                                 }
                                             }
                                         }
                                     }
                                 }
-                            }
-                        })
-                    case .failed(let error):
-                        guardContinuation.resume(with: .failure(ADBError.serverNotReachable(error.localizedDescription)), cleanup: { connection.cancel() })
-                    case .cancelled:
-                        break
-                    default:
-                        break
+                            })
+                        case .failed(let error):
+                            guardContinuation.resume(with: .failure(ADBError.serverNotReachable(error.localizedDescription)), cleanup: { connection.cancel() })
+                        case .cancelled:
+                            guardContinuation.resume(with: .failure(ADBError.cancelled), cleanup: nil)
+                        default:
+                            break
+                        }
                     }
+                    connection.start(queue: .global())
                 }
-                connection.start(queue: .global())
+            } onCancel: {
+                holder.cancel()
             }
         }
     }
@@ -348,95 +391,101 @@ public actor ADBClient {
     /// 执行设备端命令（host:transport:<serial> -> exec:<cmd> / shell:<cmd> -> 持续读取输出流至结束）
     private func executeDeviceCommand(serial: String, command: String, timeout: TimeInterval) async throws -> String {
         try await withTimeout(seconds: timeout) {
-            try await withCheckedThrowingContinuation { continuation in
-                let nwHost = NWEndpoint.Host(self.host)
-                guard let nwPort = NWEndpoint.Port(rawValue: self.port) else {
-                    continuation.resume(throwing: ADBError.serverNotReachable("无效的端口"))
-                    return
-                }
+            let holder = ConnectionHolder()
+            return try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    let nwHost = NWEndpoint.Host(self.host)
+                    guard let nwPort = NWEndpoint.Port(rawValue: self.port) else {
+                        continuation.resume(throwing: ADBError.serverNotReachable("无效的端口"))
+                        return
+                    }
 
-                let connection = NWConnection(host: nwHost, port: nwPort, using: .tcp)
-                let guardContinuation = ContinuationGuard(continuation)
+                    let connection = NWConnection(host: nwHost, port: nwPort, using: .tcp)
+                    holder.set(connection)
+                    let guardContinuation = ContinuationGuard(continuation)
 
-                connection.stateUpdateHandler = { state in
-                    switch state {
-                    case .ready:
-                        // 1. 发送 host:transport:<serial>
-                        let transportCmd = "host:transport:\(serial)"
-                        let transportPayload = String(format: "%04x%@", transportCmd.utf8.count, transportCmd)
-                        guard let tData = transportPayload.data(using: .utf8) else {
-                            guardContinuation.resume(with: .failure(ADBError.protocolError("编码错误")), cleanup: { connection.cancel() })
-                            return
-                        }
-
-                        connection.send(content: tData, completion: .contentProcessed { error in
-                            if let error = error {
-                                guardContinuation.resume(with: .failure(ADBError.serverNotReachable(error.localizedDescription)), cleanup: { connection.cancel() })
+                    connection.stateUpdateHandler = { state in
+                        switch state {
+                        case .ready:
+                            // 1. 发送 host:transport:<serial>
+                            let transportCmd = "host:transport:\(serial)"
+                            let transportPayload = String(format: "%04x%@", transportCmd.utf8.count, transportCmd)
+                            guard let tData = transportPayload.data(using: .utf8) else {
+                                guardContinuation.resume(with: .failure(ADBError.protocolError("编码错误")), cleanup: { connection.cancel() })
                                 return
                             }
 
-                            // 2. 读取 transport 应答 (OKAY / FAIL)
-                            Self.readExactBytes(connection: connection, count: 4) { tResult in
-                                switch tResult {
-                                case .failure(let err):
-                                    guardContinuation.resume(with: .failure(err), cleanup: { connection.cancel() })
-                                case .success(let tStatusData):
-                                    let tStatus = String(data: tStatusData, encoding: .utf8) ?? ""
-                                    guard tStatus == "OKAY" else {
-                                        guardContinuation.resume(with: .failure(ADBError.deviceNotFound(serial)), cleanup: { connection.cancel() })
-                                        return
-                                    }
+                            connection.send(content: tData, completion: .contentProcessed { error in
+                                if let error = error {
+                                    guardContinuation.resume(with: .failure(ADBError.serverNotReachable(error.localizedDescription)), cleanup: { connection.cancel() })
+                                    return
+                                }
 
-                                    // 3. 发送具体命令（如 exec:dumpsys battery）
-                                    let cmdPayload = String(format: "%04x%@", command.utf8.count, command)
-                                    guard let cData = cmdPayload.data(using: .utf8) else {
-                                        guardContinuation.resume(with: .failure(ADBError.protocolError("编码错误")), cleanup: { connection.cancel() })
-                                        return
-                                    }
-
-                                    connection.send(content: cData, completion: .contentProcessed { error in
-                                        if let error = error {
-                                            guardContinuation.resume(with: .failure(ADBError.commandFailed(error.localizedDescription)), cleanup: { connection.cancel() })
+                                // 2. 读取 transport 应答 (OKAY / FAIL)
+                                Self.readExactBytes(connection: connection, count: 4) { tResult in
+                                    switch tResult {
+                                    case .failure(let err):
+                                        guardContinuation.resume(with: .failure(err), cleanup: { connection.cancel() })
+                                    case .success(let tStatusData):
+                                        let tStatus = String(data: tStatusData, encoding: .utf8) ?? ""
+                                        guard tStatus == "OKAY" else {
+                                            guardContinuation.resume(with: .failure(ADBError.deviceNotFound(serial)), cleanup: { connection.cancel() })
                                             return
                                         }
 
-                                        // 4. 读取命令初步应答
-                                        Self.readExactBytes(connection: connection, count: 4) { cmdResult in
-                                            switch cmdResult {
-                                            case .failure(let err):
-                                                guardContinuation.resume(with: .failure(err), cleanup: { connection.cancel() })
-                                            case .success(let cmdStatusData):
-                                                let cmdStatus = String(data: cmdStatusData, encoding: .utf8) ?? ""
-                                                guard cmdStatus == "OKAY" else {
-                                                    guardContinuation.resume(with: .failure(ADBError.commandFailed("命令执行被拒绝: \(cmdStatus)")), cleanup: { connection.cancel() })
-                                                    return
-                                                }
+                                        // 3. 发送具体命令（如 exec:dumpsys battery）
+                                        let cmdPayload = String(format: "%04x%@", command.utf8.count, command)
+                                        guard let cData = cmdPayload.data(using: .utf8) else {
+                                            guardContinuation.resume(with: .failure(ADBError.protocolError("编码错误")), cleanup: { connection.cancel() })
+                                            return
+                                        }
 
-                                                // 5. 持续流式接收数据直至 EOF 或连接关闭
-                                                Self.readStreamUntilComplete(connection: connection) { streamResult in
-                                                    switch streamResult {
-                                                    case .failure(let err):
-                                                        guardContinuation.resume(with: .failure(err), cleanup: { connection.cancel() })
-                                                    case .success(let fullData):
-                                                        let output = String(data: fullData, encoding: .utf8) ?? ""
-                                                        guardContinuation.resume(with: .success(output), cleanup: { connection.cancel() })
+                                        connection.send(content: cData, completion: .contentProcessed { error in
+                                            if let error = error {
+                                                guardContinuation.resume(with: .failure(ADBError.commandFailed(error.localizedDescription)), cleanup: { connection.cancel() })
+                                                return
+                                            }
+
+                                            // 4. 读取命令初步应答
+                                            Self.readExactBytes(connection: connection, count: 4) { cmdResult in
+                                                switch cmdResult {
+                                                case .failure(let err):
+                                                    guardContinuation.resume(with: .failure(err), cleanup: { connection.cancel() })
+                                                case .success(let cmdStatusData):
+                                                    let cmdStatus = String(data: cmdStatusData, encoding: .utf8) ?? ""
+                                                    guard cmdStatus == "OKAY" else {
+                                                        guardContinuation.resume(with: .failure(ADBError.commandFailed("命令执行被拒绝: \(cmdStatus)")), cleanup: { connection.cancel() })
+                                                        return
+                                                    }
+
+                                                    // 5. 持续流式接收数据直至 EOF 或连接关闭
+                                                    Self.readStreamUntilComplete(connection: connection) { streamResult in
+                                                        switch streamResult {
+                                                        case .failure(let err):
+                                                            guardContinuation.resume(with: .failure(err), cleanup: { connection.cancel() })
+                                                        case .success(let fullData):
+                                                            let output = String(data: fullData, encoding: .utf8) ?? ""
+                                                            guardContinuation.resume(with: .success(output), cleanup: { connection.cancel() })
+                                                        }
                                                     }
                                                 }
                                             }
-                                        }
-                                    })
+                                        })
+                                    }
                                 }
-                            }
-                        })
-                    case .failed(let error):
-                        guardContinuation.resume(with: .failure(ADBError.serverNotReachable(error.localizedDescription)), cleanup: { connection.cancel() })
-                    case .cancelled:
-                        break
-                    default:
-                        break
+                            })
+                        case .failed(let error):
+                            guardContinuation.resume(with: .failure(ADBError.serverNotReachable(error.localizedDescription)), cleanup: { connection.cancel() })
+                        case .cancelled:
+                            guardContinuation.resume(with: .failure(ADBError.cancelled), cleanup: nil)
+                        default:
+                            break
+                        }
                     }
+                    connection.start(queue: .global())
                 }
-                connection.start(queue: .global())
+            } onCancel: {
+                holder.cancel()
             }
         }
     }
