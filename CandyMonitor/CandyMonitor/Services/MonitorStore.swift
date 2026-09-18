@@ -1382,12 +1382,12 @@ final class MonitorStore {
             }
         }
         // B. 物理冲突自愈：若端口大功率供电（powerW >= 1.5），而绑定的在线 ADB 设备处于【放电中】（!bound.isCharging），
-        //    或者端口已具备原生 PD 电池数据（如 ROG Ally 64%），物理状态严重不符，立即自动解除误绑！
+        //    或者端口已被判定为非 Android（如 ROG Ally、Steam Deck）或 Apple 设备，立即自动解除误绑！
         for state in portStates where state.powerW >= 1.5 {
             if let bound = adbService.boundDevice(for: state.port.index) {
                 if bound.isOnline && !bound.isCharging {
                     adbService.bindPort(state.port.index, to: nil)
-                } else if state.hasNativePD {
+                } else if state.isNonAndroid || state.isApple {
                     adbService.bindPort(state.port.index, to: nil)
                 }
             }
@@ -1678,7 +1678,7 @@ final class MonitorStore {
                         activeSession.boundAndroidSerial = bound.serial
                         result.didChangeSessions = true
                     }
-                    if activeSession.connectedDeviceName == nil || activeSession.connectedDeviceName == "未知设备型号" {
+                    if activeSession.connectedDeviceName == nil || activeSession.connectedDeviceName == "未知设备型号" || activeSession.connectedDeviceName == "标准 PD 设备" {
                         activeSession.connectedDeviceName = bound.displayName
                         result.didChangeSessions = true
                     }

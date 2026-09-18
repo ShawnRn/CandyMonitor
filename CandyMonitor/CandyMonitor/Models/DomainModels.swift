@@ -627,12 +627,26 @@ nonisolated struct PDPortStatus: Codable, Hashable, Sendable {
 
         if decodedPercent == nil, let present = rawPresentCapacity, present > 0 {
             if let full = rawLastFullCapacity, full > 0 {
-                decodedPercent = min(100.0, max(0.0, (present / full) * 100.0))
+                if present <= 100.0 && full >= 1000.0 {
+                    decodedPercent = min(100.0, max(0.0, present))
+                } else {
+                    let pct = (present / full) * 100.0
+                    if pct >= 1.0 && pct <= 100.0 {
+                        decodedPercent = pct
+                    }
+                }
             } else if let design = rawDesignCapacity, design > 0 {
-                decodedPercent = min(100.0, max(0.0, (present / design) * 100.0))
+                if present <= 100.0 && design >= 1000.0 {
+                    decodedPercent = min(100.0, max(0.0, present))
+                } else {
+                    let pct = (present / design) * 100.0
+                    if pct >= 1.0 && pct <= 100.0 {
+                        decodedPercent = pct
+                    }
+                }
             }
         }
-        batteryPercent = decodedPercent
+        batteryPercent = Self.normalizedPercent(decodedPercent)
 
         var decodedHealth = Self.normalizedPercent(Self.decodeFirstDouble(in: containers, keys: [
             "battery_health", "battery_health_percent", "health", "health_percent", "soh",
@@ -854,14 +868,15 @@ struct PortViewState: Identifiable, Hashable {
     }
 
     var canAutoBindADB: Bool {
-        !isAppleDevice && !isNonAndroidDevice && !hasNativePDBattery
+        !isAppleDevice && !isNonAndroidDevice
     }
 
     var powerW: Double { detail?.powerW ?? 0 }
     
-    // 如果是 Apple 设备、非 Android 设备或已具备原生 PD 电池遥测的设备，优先使用原生 PD 电池数据
+    // 如果是 Apple 设备或已识别为非 Android 的掌机/PC，优先使用原生 PD 电池数据；
+    // 否则对于 Android 设备，只要有绑定的活跃 ADB 设备，永远以真实的 ADB 系统级电量为准。
     var batteryPercent: Double? {
-        if isAppleDevice || isNonAndroidDevice || hasNativePDBattery {
+        if isAppleDevice || isNonAndroidDevice {
             return pdStatus?.batteryPercent ?? boundADBDevice?.batteryPercent
         }
         return boundADBDevice?.batteryPercent ?? pdStatus?.batteryPercent

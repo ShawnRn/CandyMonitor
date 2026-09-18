@@ -397,10 +397,18 @@ struct IonBridgePDStatus: Decodable, Sendable {
             }
             guard let present = batteryPresentCapacity, present > 0 else { return nil }
             if let full = batteryLastFullChargeCapacity, full > 0 {
-                return min(100.0, max(0.0, (present / full) * 100.0))
+                if present <= 100.0 && full >= 1000.0 {
+                    return min(100.0, max(0.0, present))
+                }
+                let pct = (present / full) * 100.0
+                return (pct >= 1.0 && pct <= 100.0) ? pct : nil
             }
             if let design = batteryDesignCapacity, design > 0 {
-                return min(100.0, max(0.0, (present / design) * 100.0))
+                if present <= 100.0 && design >= 1000.0 {
+                    return min(100.0, max(0.0, present))
+                }
+                let pct = (present / design) * 100.0
+                return (pct >= 1.0 && pct <= 100.0) ? pct : nil
             }
             return nil
         }()
