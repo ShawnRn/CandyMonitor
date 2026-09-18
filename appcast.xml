@@ -8,8 +8,8 @@
             <sparkle:version>25</sparkle:version>
             <sparkle:shortVersionString>1.0.20</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <enclosure url="https://github.com/ShawnRn/CandyMonitor/releases/download/v1.0.20/CandyMonitor_1.0.20_arm64.dmg" length="6640887" type="application/octet-stream" sparkle:os="macos" sparkle:nativeArchitecture="arm64" sparkle:edSignature="F96DXcaSGaHVm4efwyJvCwZqHtrPepLFpbvJXK25UN+T41V3YeOOcTNbgfJSUTJx78QRojgXKnhQUHoVZKAoAg=="/>
-            <enclosure url="https://github.com/ShawnRn/CandyMonitor/releases/download/v1.0.20/CandyMonitor_1.0.20_x86_64.dmg" length="6775424" type="application/octet-stream" sparkle:os="macos" sparkle:nativeArchitecture="x86_64" sparkle:edSignature="lwoBVL6hMhAYMs1zMscB1TJGMZfVUiBlCli3u1dF67UFQ/iiNHRb+MWGAIKne3Kkcu+atY+SALbzqBOaY9EQAA=="/>
+            <enclosure url="https://github.com/ShawnRn/CandyMonitor/releases/download/v1.0.20/CandyMonitor_1.0.20_arm64.dmg" length="6642385" type="application/octet-stream" sparkle:os="macos" sparkle:nativeArchitecture="arm64" sparkle:edSignature="gmwjKop6e/SAqn/c6RORl0a4Rjx6L3bKFDZ9IYqu61Aa6qU9T2cPAGM/Uiz8r0IXPRVoA0i7oviFoSy0Xw2ACA=="/>
+            <enclosure url="https://github.com/ShawnRn/CandyMonitor/releases/download/v1.0.20/CandyMonitor_1.0.20_x86_64.dmg" length="6778065" type="application/octet-stream" sparkle:os="macos" sparkle:nativeArchitecture="x86_64" sparkle:edSignature="4yEYapoEjtnfVKcX9vwqMkczg/eR/sVsnuFykU1JzlGtObCf+tf3S25exyMluYJLXNFE7J87pzNLZsagKenyBw=="/>
         </item>
         <item>
                             <title>1.0.19</title>
