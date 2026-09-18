@@ -2270,7 +2270,7 @@ final class MonitorStore {
             knownProtocols[session.id, default: []].insert(protocolLabel)
             session.protocolSummary = knownProtocols[session.id, default: []].sorted().joined(separator: " / ")
         }
-        if let battery = sample.batteryPercent {
+        if let battery = sample.batteryPercent, battery >= 1.0 {
             session.hasBatteryData = true
             session.finalBatteryPercent = battery
         }
