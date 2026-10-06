@@ -441,7 +441,8 @@ final class ADBService {
         pollingTask = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.refreshOnce()
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                let interval: UInt64 = (self?.devices.isEmpty ?? true) ? 2_000_000_000 : 1_000_000_000
+                try? await Task.sleep(nanoseconds: interval)
             }
         }
     }

@@ -318,6 +318,32 @@ final class ChargingSession {
     }
 }
 
+struct SessionRowData: Identifiable, Equatable, Sendable {
+    let id: UUID
+    let displayTitle: String
+    let startedAt: Date
+    let isEnded: Bool
+    let isStandaloneBattery: Bool
+    let finalBatteryPercent: Double?
+    let maxBatteryTempC: Double?
+    let sampleCount: Int
+    let peakPowerW: Double
+    let averagePowerW: Double
+
+    init(session: ChargingSession) {
+        self.id = session.id
+        self.displayTitle = session.displayTitle
+        self.startedAt = session.startedAt
+        self.isEnded = session.endedAt != nil
+        self.isStandaloneBattery = session.isStandaloneBatterySession
+        self.finalBatteryPercent = session.finalBatteryPercent
+        self.maxBatteryTempC = session.maxBatteryTempC
+        self.sampleCount = session.sampleCount
+        self.peakPowerW = session.peakPowerW
+        self.averagePowerW = session.averagePowerW
+    }
+}
+
 @Model
 final class PortSample {
     var id: UUID

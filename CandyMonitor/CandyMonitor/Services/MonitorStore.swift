@@ -2,6 +2,7 @@ import AppKit
 import Foundation
 import Observation
 import os
+import SQLite3
 import SwiftData
 import UniformTypeIdentifiers
 import UserNotifications
@@ -56,8 +57,11 @@ final class MonitorStore {
     var showMenuBarPower: Bool = false
     var recentSamples: [ChartSamplePoint] = []
     var sessions: [ChargingSession] = []
+    var sessionRowDataList: [SessionRowData] = []
     var selectedSession: ChargingSession?
     var selectedSessionSamples: [PortSample] = []
+    var selectedSessionAnalytics: ChargingSessionAnalytics?
+    @ObservationIgnored private var analyticsCache: [UUID: ChargingSessionAnalytics] = [:]
     var portStatsByPort: [Int: [String: String]] = [:]
     var sessionSettings: ChargingSessionSettings {
         get { ChargingSessionSettings.load() }
@@ -79,13 +83,15 @@ final class MonitorStore {
     }
 
     var currentPollingInterval: TimeInterval {
-        // 如果开启了实时刷新，保持 1.0 秒以快速响应插入设备和状态变化
-        if isRealtimeRefreshEnabled {
+        guard isRealtimeRefreshEnabled else { return 30.0 }
+        
+        // 如果有正在充电的端口（总功率 > 0.8W）或有活跃记录会话，保持 1.0 秒以快速响应并绘制高精度曲线
+        if totalPowerW > 0.8 || !activeChargingSessions.isEmpty {
             return 1.0
         }
         
-        // 否则（比如非实时状态），采用 30.0 秒轮询
-        return 30.0
+        // 空闲待机时（无设备充电、功率微弱），使用 2.0 秒轮询足以快速响应设备接入，同时节省 50% 后台开销
+        return 2.0
     }
 
     @ObservationIgnored private var modelContext: ModelContext?
@@ -169,15 +175,36 @@ final class MonitorStore {
         livePorts.reduce(0) { $0 + $1.powerW }
     }
 
-    var activeChargingSessions: [ChargingSession] {
-        sessions
+    private(set) var activeChargingSessions: [ChargingSession] = []
+
+    func updateActiveChargingSessions() {
+        activeChargingSessions = sessions
             .filter { $0.endedAt == nil }
             .sorted { $0.startedAt > $1.startedAt }
+    }
+
+    private func ensureDatabaseIndexes() {
+        guard let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return }
+        let storeURL = appSupport.appendingPathComponent("default.store")
+        guard FileManager.default.fileExists(atPath: storeURL.path) else { return }
+
+        var db: OpaquePointer?
+        if sqlite3_open(storeURL.path, &db) == SQLITE_OK {
+            let sql = """
+            CREATE INDEX IF NOT EXISTS idx_portsample_session ON ZPORTSAMPLE(ZSESSIONID, ZTIMESTAMP);
+            CREATE INDEX IF NOT EXISTS idx_portsample_device_time ON ZPORTSAMPLE(ZDEVICEID, ZTIMESTAMP);
+            """
+            sqlite3_exec(db, sql, nil, nil, nil)
+            sqlite3_close(db)
+        }
     }
 
     func configure(modelContext: ModelContext) {
         if self.modelContext == nil {
             self.modelContext = modelContext
+            modelContext.undoManager = nil
+            modelContext.autosaveEnabled = false
+            ensureDatabaseIndexes()
             diagnosticLog.record("store_configured", metadata: ["log": diagnosticLog.path])
             loadDevices()
             loadSessions()
@@ -256,6 +283,8 @@ final class MonitorStore {
             fetchedSessions = (try? modelContext.fetch(descriptor)) ?? []
         }
         sessions = fetchedSessions
+        updateActiveChargingSessions()
+        sessionRowDataList = fetchedSessions.map(SessionRowData.init)
         logger.info("sessions_loaded count=\(self.sessions.count)")
         diagnosticLog.record("sessions_loaded", metadata: ["count": "\(self.sessions.count)"])
         if let selectedSession {
@@ -663,6 +692,7 @@ final class MonitorStore {
     func loadSelectedSessionSamples() {
         guard let modelContext, let selectedSession else {
             selectedSessionSamples = []
+            selectedSessionAnalytics = nil
             return
         }
         let id = selectedSession.id
@@ -674,6 +704,12 @@ final class MonitorStore {
         )
         let samples = (try? modelContext.fetch(descriptor)) ?? []
         selectedSessionSamples = downsampleSessionSamples(samples)
+
+        let analytics = ChargingSessionAnalytics.analyze(session: selectedSession, samples: samples)
+        selectedSessionAnalytics = analytics
+        if selectedSession.endedAt != nil {
+            analyticsCache[id] = analytics
+        }
 
         // 历史会话自愈与补齐：如果样本中包含手机电池数据，同步补齐 session 的最高温度与关联设备信息
         let batteryTemps = samples.compactMap(\.batteryTempC)
@@ -986,12 +1022,27 @@ final class MonitorStore {
     }
 
     func sessionAnalytics(for session: ChargingSession) -> ChargingSessionAnalytics {
+        if let cached = analyticsCache[session.id] {
+            return cached
+        }
+        if selectedSession?.id == session.id, let current = selectedSessionAnalytics {
+            return current
+        }
         let sessionSamples = samples(for: session)
-        return ChargingSessionAnalytics.analyze(session: session, samples: sessionSamples)
+        let analytics = ChargingSessionAnalytics.analyze(session: session, samples: sessionSamples)
+        if session.endedAt != nil {
+            analyticsCache[session.id] = analytics
+        }
+        return analytics
     }
 
     func previewSamples(for session: ChargingSession, limit: Int = 180) -> [PortSample] {
-        let allSamples = samples(for: session)
+        let allSamples: [PortSample]
+        if selectedSession?.id == session.id && !selectedSessionSamples.isEmpty {
+            allSamples = selectedSessionSamples
+        } else {
+            allSamples = samples(for: session)
+        }
         guard allSamples.count > limit else { return allSamples }
         let stride = Double(allSamples.count - 1) / Double(max(limit - 1, 1))
         return (0..<limit).map { index in
@@ -1716,6 +1767,8 @@ final class MonitorStore {
                 justCreated = true
                 knownProtocols[newSession.id] = []
                 sessions.insert(newSession, at: 0)
+                sessionRowDataList.insert(SessionRowData(session: newSession), at: 0)
+                updateActiveChargingSessions()
                 if selectedSession == nil {
                     selectedSession = newSession
                 }
@@ -1724,6 +1777,7 @@ final class MonitorStore {
                 disconnectDebounce.removeValue(forKey: key)
                 selectedSession = newSession
                 selectedSessionSamples = []
+                selectedSessionAnalytics = nil
                 logger.info("session_started port=\(port.port.index, privacy: .public) power=\(detail.powerW, privacy: .public)")
                 diagnosticLog.record("session_started", metadata: [
                     "port": "\(port.port.index)",
@@ -1912,6 +1966,9 @@ final class MonitorStore {
                     if selectedSessionSamples.count > selectedSessionChartSampleLimit * 3 {
                         selectedSessionSamples = downsampleSessionSamples(selectedSessionSamples)
                     }
+                    if let curSession = selectedSession {
+                        selectedSessionAnalytics = ChargingSessionAnalytics.analyze(session: curSession, samples: selectedSessionSamples)
+                    }
                 }
                 result.didMutateStore = true
             }
@@ -1938,6 +1995,17 @@ final class MonitorStore {
 
         if result.didChangeSessions {
             sessions.sort { $0.startedAt > $1.startedAt }
+            updateActiveChargingSessions()
+            sessionRowDataList = sessions.map(SessionRowData.init)
+        } else {
+            for port in ports {
+                let key = sessionKey(deviceID: deviceID, port: port.port.index)
+                if let sID = activeSessions[key], let s = sessions.first(where: { $0.id == sID }) {
+                    if let idx = sessionRowDataList.firstIndex(where: { $0.id == sID }) {
+                        sessionRowDataList[idx] = SessionRowData(session: s)
+                    }
+                }
+            }
         }
         let cutoff = Date().addingTimeInterval(-recentSampleWindow)
         recentSamples.removeAll { $0.timestamp < cutoff }
@@ -2074,6 +2142,10 @@ final class MonitorStore {
         activeSessions.removeValue(forKey: sessionKey(deviceID: session.deviceID, port: session.portIndex))
         if lowPowerSessionPrompt?.id == session.id {
             lowPowerSessionPrompt = nil
+        }
+        updateActiveChargingSessions()
+        if let idx = sessionRowDataList.firstIndex(where: { $0.id == session.id }) {
+            sessionRowDataList[idx] = SessionRowData(session: session)
         }
         logger.info("session_ended port=\(session.portIndex, privacy: .public) reason=\(reason, privacy: .public)")
     }

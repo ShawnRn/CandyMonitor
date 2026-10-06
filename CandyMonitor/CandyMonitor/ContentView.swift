@@ -306,13 +306,12 @@ private struct NativeMonitorView: View {
     @State private var portFilterAnchor: Int?
     @State private var detailPort: PortViewState?
 
-    private var effectivePortIDs: Set<Int> {
-        selectedPortIDs.isEmpty ? Set(store.livePorts.map(\.port.index)) : selectedPortIDs
-    }
-
     private var filteredSamples: [ChartSamplePoint] {
-        store.recentSamples
-            .filter { effectivePortIDs.contains($0.portIndex) }
+        if selectedPortIDs.isEmpty {
+            return store.recentSamples
+        }
+        let ids = selectedPortIDs
+        return store.recentSamples.filter { ids.contains($0.portIndex) }
     }
 
     @State private var plottedSamplesCache: [ChartSamplePoint] = []
@@ -324,34 +323,33 @@ private struct NativeMonitorView: View {
         self.lineSamplesCache = segmentedChartPoints(from: plotted)
     }
 
-    @State private var monitorContentWidth: CGFloat = 850
-
     var body: some View {
-        VStack(spacing: 0) {
-            HeaderBar(title: "我的设备", subtitle: store.selectedDevice?.effectiveProductFamily ?? "CoCan Mirror") {
-                Button {
-                    store.selectedSection = .control
-                } label: {
-                    Label("控制台", systemImage: "slider.horizontal.3")
+        GeometryReader { outerProxy in
+            let isWide = outerProxy.size.width >= 800
+            VStack(spacing: 0) {
+                HeaderBar(title: "我的设备", subtitle: store.selectedDevice?.effectiveProductFamily ?? "CoCan Mirror") {
+                    Button {
+                        store.selectedSection = .control
+                    } label: {
+                        Label("控制台", systemImage: "slider.horizontal.3")
+                    }
                 }
-            }
 
-            ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    MirrorDeviceHero(
-                        deviceName: store.selectedDevice?.name ?? "AI 小电拼",
-                        productFamily: store.selectedDevice?.effectiveProductFamily,
-                        connectionState: store.connectionState,
-                        lastRefreshedAt: store.lastRefreshedAt,
-                        temperatureMode: LocalizedTelemetry.temperatureModeLabel(store.temperatureModeLabel),
-                        activeSessions: store.activeChargingSessions.count,
-                        totalPowerW: store.totalPowerW
-                    )
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 12) {
+                        MirrorDeviceHero(
+                            deviceName: store.selectedDevice?.name ?? "AI 小电拼",
+                            productFamily: store.selectedDevice?.effectiveProductFamily,
+                            connectionState: store.connectionState,
+                            lastRefreshedAt: store.lastRefreshedAt,
+                            temperatureMode: LocalizedTelemetry.temperatureModeLabel(store.temperatureModeLabel),
+                            activeSessions: store.activeChargingSessions.count,
+                            totalPowerW: store.totalPowerW
+                        )
 
-                    WirelessADBBar(store: store)
+                        WirelessADBBar(store: store)
 
-                    Group {
-                        if monitorContentWidth >= 800 {
+                        if isWide {
                             HStack(alignment: .top, spacing: 12) {
                                 topologyPanel
                                     .frame(minWidth: 500)
@@ -370,21 +368,11 @@ private struct NativeMonitorView: View {
                                 recordingPanel()
                             }
                         }
-                    }
-                    .background(
-                        GeometryReader { proxy in
-                            Color.clear.preference(key: MonitorWidthKey.self, value: proxy.size.width)
-                        }
-                    )
-                    .onPreferenceChange(MonitorWidthKey.self) { width in
-                        if abs(width - monitorContentWidth) > 15 {
-                            monitorContentWidth = width
-                        }
-                    }
 
-                    chartPanel
+                        chartPanel
+                    }
+                    .padding(16)
                 }
-                .padding(16)
             }
         }
         .onChange(of: store.livePorts) { _, ports in
@@ -433,13 +421,6 @@ private struct NativeMonitorView: View {
     }
 
     private var dashboardHeight: CGFloat { 408 }
-}
-
-private struct MonitorWidthKey: PreferenceKey {
-    static var defaultValue: CGFloat = 850
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
-    }
 }
 
 extension NativeMonitorView {
@@ -2634,13 +2615,15 @@ private struct SessionsView: View {
                         }
                         ScrollView {
                             LazyVStack(spacing: 8) {
-                                ForEach(store.sessions, id: \.id) { session in
+                                ForEach(store.sessionRowDataList) { rowData in
                                     Button {
-                                        selectSession(session)
+                                        if let session = store.sessions.first(where: { $0.id == rowData.id }) {
+                                            selectSession(session)
+                                        }
                                     } label: {
                                         SessionRow(
-                                            data: SessionRowData(session: session),
-                                            isSelected: selectedSessionIDs.contains(session.id)
+                                            data: rowData,
+                                            isSelected: selectedSessionIDs.contains(rowData.id)
                                         )
                                         .equatable()
                                     }
@@ -2724,32 +2707,6 @@ private struct SessionsView: View {
         let left = store.sessions.firstIndex { $0.id == lhs } ?? Int.max
         let right = store.sessions.firstIndex { $0.id == rhs } ?? Int.max
         return left < right
-    }
-}
-
-struct SessionRowData: Identifiable, Equatable {
-    let id: UUID
-    let displayTitle: String
-    let startedAt: Date
-    let isEnded: Bool
-    let isStandaloneBattery: Bool
-    let finalBatteryPercent: Double?
-    let maxBatteryTempC: Double?
-    let sampleCount: Int
-    let peakPowerW: Double
-    let averagePowerW: Double
-
-    init(session: ChargingSession) {
-        self.id = session.id
-        self.displayTitle = session.displayTitle
-        self.startedAt = session.startedAt
-        self.isEnded = session.endedAt != nil
-        self.isStandaloneBattery = session.isStandaloneBatterySession
-        self.finalBatteryPercent = session.finalBatteryPercent
-        self.maxBatteryTempC = session.maxBatteryTempC
-        self.sampleCount = session.sampleCount
-        self.peakPowerW = session.peakPowerW
-        self.averagePowerW = session.averagePowerW
     }
 }
 
@@ -3053,7 +3010,7 @@ private struct SessionDetailView: View {
                     .stroke(Color.primary.opacity(0.06), lineWidth: 1)
             }
         } else {
-            let analytics = store.sessionAnalytics(for: session)
+            let analytics = (store.selectedSession?.id == session.id ? store.selectedSessionAnalytics : nil) ?? store.sessionAnalytics(for: session)
             
             VStack(alignment: .leading, spacing: 14) {
                 HStack {
@@ -4672,21 +4629,34 @@ struct MenuBarPowerLabel: View {
     }
 }
 
+@MainActor
+private enum MenuBarImageCache {
+    static var cachedKey: String?
+    static var cachedImage: NSImage?
+}
+
 struct MenuBarStatusLabel: View {
     @Environment(\.openWindow) private var openWindow
     let store: MonitorStore
 
     var body: some View {
-        Image(nsImage: renderedCandyPowerImage)
-            .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("OpenMainWindowNotification"))) { _ in
-                openWindow(id: "main")
-                DispatchQueue.main.async {
-                    if let window = NSApp.windows.first(where: { $0.canBecomeMain && $0.styleMask.contains(.titled) }) {
-                        window.makeKeyAndOrderFront(nil)
-                        NSApp.activate(ignoringOtherApps: true)
-                    }
+        Group {
+            if store.showMenuBarPower {
+                Image(nsImage: renderedCandyPowerImage)
+            } else {
+                Image("CandyMenuBarIconBlack")
+                    .renderingMode(.template)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("OpenMainWindowNotification"))) { _ in
+            openWindow(id: "main")
+            DispatchQueue.main.async {
+                if let window = NSApp.windows.first(where: { $0.canBecomeMain && $0.styleMask.contains(.titled) }) {
+                    window.makeKeyAndOrderFront(nil)
+                    NSApp.activate(ignoringOtherApps: true)
                 }
             }
+        }
     }
 
     private var renderedCandyPowerImage: NSImage {
@@ -4703,61 +4673,49 @@ struct MenuBarStatusLabel: View {
             iconImage = NSImage()
         }
 
-        if store.showMenuBarPower {
-            let font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
-            let attributes: [NSAttributedString.Key: Any] = [
-                .font: font,
-                .foregroundColor: NSColor.black
-            ]
-            let powerText: String
-            if power >= 100 {
-                powerText = "\(Int(power.rounded()))W"
-            } else {
-                powerText = String(format: "%.1fW", power)
-            }
-            let text = powerText as NSString
-            let textSize = text.size(withAttributes: attributes)
-            let spacing: CGFloat = 5
-            let width = ceil(iconSize.width + spacing + textSize.width)
-            
-            let image = NSImage(size: NSSize(width: width, height: height))
-            image.lockFocus()
-            NSColor.clear.setFill()
-            NSRect(origin: .zero, size: image.size).fill()
-            
-            iconImage.draw(in: NSRect(
-                x: 0,
-                y: floor((height - iconSize.height) / 2),
-                width: iconSize.width,
-                height: iconSize.height
-            ))
-            
-            text.draw(at: NSPoint(
-                x: iconSize.width + spacing,
-                y: floor((height - textSize.height) / 2)
-            ), withAttributes: attributes)
-            
-            image.unlockFocus()
-            image.isTemplate = true
-            return image
+        let powerText: String
+        if power >= 100 {
+            powerText = "\(Int(power.rounded()))W"
         } else {
-            let width = iconSize.width
-            let image = NSImage(size: NSSize(width: width, height: height))
-            image.lockFocus()
-            NSColor.clear.setFill()
-            NSRect(origin: .zero, size: image.size).fill()
-            
-            iconImage.draw(in: NSRect(
-                x: 0,
-                y: floor((height - iconSize.height) / 2),
-                width: iconSize.width,
-                height: iconSize.height
-            ))
-            
-            image.unlockFocus()
-            image.isTemplate = true
-            return image
+            powerText = String(format: "%.1fW", power)
         }
+        let cacheKey = "p_\(powerText)"
+        if let cached = MenuBarImageCache.cachedImage, MenuBarImageCache.cachedKey == cacheKey {
+            return cached
+        }
+
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: NSColor.black
+        ]
+        let text = powerText as NSString
+        let textSize = text.size(withAttributes: attributes)
+        let spacing: CGFloat = 5
+        let width = ceil(iconSize.width + spacing + textSize.width)
+        
+        let image = NSImage(size: NSSize(width: width, height: height))
+        image.lockFocus()
+        NSColor.clear.setFill()
+        NSRect(origin: .zero, size: image.size).fill()
+        
+        iconImage.draw(in: NSRect(
+            x: 0,
+            y: floor((height - iconSize.height) / 2),
+            width: iconSize.width,
+            height: iconSize.height
+        ))
+        
+        text.draw(at: NSPoint(
+            x: iconSize.width + spacing,
+            y: floor((height - textSize.height) / 2)
+        ), withAttributes: attributes)
+        
+        image.unlockFocus()
+        image.isTemplate = true
+        MenuBarImageCache.cachedKey = cacheKey
+        MenuBarImageCache.cachedImage = image
+        return image
     }
 }
 
