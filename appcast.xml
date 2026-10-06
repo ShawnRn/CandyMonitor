@@ -3,6 +3,15 @@
     <channel>
         <title>CandyMonitor</title>
         <item>
+            <title>1.0.21</title>
+            <pubDate>Tue, 06 Oct 2026 18:23:27 +0800</pubDate>
+            <sparkle:version>26</sparkle:version>
+            <sparkle:shortVersionString>1.0.21</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/ShawnRn/CandyMonitor/releases/download/v1.0.21/CandyMonitor_1.0.21_arm64.dmg" length="6840313" type="application/octet-stream" sparkle:os="macos" sparkle:nativeArchitecture="arm64" sparkle:edSignature="gmHHlTiSDBcBN/V6wZL6uieDZUeDRbPqPyZeAeReyDHFawCPJV9vvDoTJRQGp5e9C9oKzFF5ukfD5as8bEHOBw=="/>
+            <enclosure url="https://github.com/ShawnRn/CandyMonitor/releases/download/v1.0.21/CandyMonitor_1.0.21_x86_64.dmg" length="6977499" type="application/octet-stream" sparkle:os="macos" sparkle:nativeArchitecture="x86_64" sparkle:edSignature="s4kihZ3HbGwAKOPph0VGUVoT83Jl5BK5xGmFeHR5MTqI8CvffwqECBHBKaK47V4JbYVfmrUh4ni1COT7ZpH1Dw=="/>
+        </item>
+        <item>
             <title>1.0.20</title>
             <pubDate>Wed, 16 Sep 2026 15:03:04 +0800</pubDate>
             <sparkle:version>25</sparkle:version>
