@@ -101,7 +101,7 @@ final class MonitorStore {
     @ObservationIgnored private var pollingTask: Task<Void, Never>?
     @ObservationIgnored private var activeSessions: [String: UUID] = [:]
     @ObservationIgnored private var lastStandaloneRecordTime: [String: Date] = [:]
-    @ObservationIgnored private var trickleStoppedKeys = Set<String>()
+    @ObservationIgnored private var cycleFinishedKeys = Set<String>()
     @ObservationIgnored private var disconnectDebounce: [String: Int] = [:]
     /// 会话级手动解绑防回潮黑名单：用户主动解绑后，在物理拔线前绝不再被自动绑定引擎绑回
     @ObservationIgnored private var manuallyUnboundPorts = Set<Int>()
@@ -745,6 +745,28 @@ final class MonitorStore {
         lowPowerSessionPrompt = nil
         try? modelContext?.save()
         loadSessions()
+    }
+
+    // MARK: - Connection Cycle Recording Control
+
+    /// 检查指定端口是否处于“同拔插周期已记录完成（静默待机供电中）”状态
+    public func isPortCycleFinished(portIndex: Int, deviceID: UUID? = nil) -> Bool {
+        let targetDevID = deviceID ?? selectedDeviceID ?? devices.first?.id
+        guard let targetDevID else { return false }
+        let key = sessionKey(deviceID: targetDevID, port: portIndex)
+        return cycleFinishedKeys.contains(key) && activeSessions[key] == nil
+    }
+
+    /// 在同一个拔插周期内手动重新开始记录（解除已结束状态并立即开启新会话）
+    public func startSession(for portIndex: Int, deviceID: UUID? = nil) {
+        let targetDevID = deviceID ?? selectedDeviceID ?? devices.first?.id
+        guard let targetDevID else { return }
+        let key = sessionKey(deviceID: targetDevID, port: portIndex)
+        cycleFinishedKeys.remove(key)
+        logger.info("cycle_finished_cleared_manually port=\(portIndex, privacy: .public)")
+        Task {
+            await refreshSelectedDeviceNow()
+        }
     }
 
     // MARK: - Standalone ADB Battery Recording (Decoupled from Ports)
@@ -1443,8 +1465,10 @@ final class MonitorStore {
                 }
             }
         }
-        // C. 如果端口已完全断开，清理手动解绑黑名单；若绑定的 ADB 设备未充电或离线，自动释放该端口绑定
+        // C. 如果端口已完全断开，清理手动解绑黑名单与拔插周期结束标记；若绑定的 ADB 设备未充电或离线，自动释放该端口绑定
         for state in portStates where !state.isConnected && state.powerW < 0.2 {
+            let key = sessionKey(deviceID: device.id, port: state.port.index)
+            cycleFinishedKeys.remove(key)
             manuallyUnboundPorts.remove(state.port.index)
             if let bound = adbService.boundDevice(for: state.port.index) {
                 if !bound.isOnline || !bound.isCharging {
@@ -1492,12 +1516,15 @@ final class MonitorStore {
 
         livePorts = portStates.map { state in
             let boundADB = (state.isApple || state.isNonAndroid) ? nil : adbService.boundDevice(for: state.port.index)
+            let key = sessionKey(deviceID: device.id, port: state.port.index)
+            let cycleFinished = cycleFinishedKeys.contains(key) && activeSessions[key] == nil
             return PortViewState(
                 port: state.port,
                 detail: state.detail,
                 pdStatus: state.pdStatus,
                 charging: state.isCharging,
-                boundADBDevice: boundADB
+                boundADBDevice: boundADB,
+                isCycleFinished: cycleFinished
             )
         }
 
@@ -1608,7 +1635,9 @@ final class MonitorStore {
             if port.connected {
                 attachedKeys.insert(key)
             } else {
-                trickleStoppedKeys.remove(key)
+                if port.detail == nil || (port.detail?.powerW ?? 0) < 0.2 {
+                    cycleFinishedKeys.remove(key)
+                }
             }
 
             guard let detail = port.detail else { continue }
@@ -1666,14 +1695,8 @@ final class MonitorStore {
 
             let isAttached = port.connected
             let hasOutputPower = detail.powerW >= recordingPowerThresholdW
-            
-            // 如果物理连接还在，且被标记为 trickle stopped，但当前功率回升到 >= 2.5W，说明设备重新开始充电或大功耗，重置涓流停止状态
-            if isAttached && trickleStoppedKeys.contains(key) && detail.powerW >= 2.5 {
-                trickleStoppedKeys.remove(key)
-            }
-            
-            let isTrickleStopped = trickleStoppedKeys.contains(key)
-            let shouldPersistSample = activeSessions[key] != nil || (hasOutputPower && !isTrickleStopped)
+            let isCycleFinished = cycleFinishedKeys.contains(key)
+            let shouldPersistSample = activeSessions[key] != nil || (hasOutputPower && !isCycleFinished)
             guard shouldPersistSample else { continue }
 
             var event: String?
@@ -1737,7 +1760,7 @@ final class MonitorStore {
             }
 
             var justCreated = false
-            if session == nil, hasOutputPower, !isTrickleStopped {
+            if session == nil, hasOutputPower, !isCycleFinished {
                 let boundADB = (port.isAppleDevice || port.isNonAndroidDevice) ? nil : adbService.boundDevice(for: port.port.index)
                 let connectedName: String?
                 if port.isAppleDevice {
@@ -1798,6 +1821,7 @@ final class MonitorStore {
                 if count >= disconnectDebounceThreshold {
                     event = "device_disconnected"
                     end(session, at: now, reason: "device_disconnected")
+                    cycleFinishedKeys.remove(key)
                     sessionEndedThisCycle = true
                     disconnectDebounce.removeValue(forKey: key)
                     result.didMutateStore = true
@@ -1872,7 +1896,7 @@ final class MonitorStore {
 
                 
                 if shouldStopForTrickle {
-                    trickleStoppedKeys.insert(key)
+                    cycleFinishedKeys.insert(key)
                     result.didChangeSessions = true
                     diagnosticLog.record("session_ended", metadata: [
                         "port": "\(port.port.index)",
@@ -1982,6 +2006,7 @@ final class MonitorStore {
             disconnectDebounce[key] = count
             if count >= disconnectDebounceThreshold {
                 end(session, at: now, reason: "device_disconnected")
+                cycleFinishedKeys.remove(key)
                 disconnectDebounce.removeValue(forKey: key)
                 result.didMutateStore = true
                 result.didChangeSessions = true
@@ -2014,6 +2039,14 @@ final class MonitorStore {
 
     // MARK: - Timeout & Local Notification Helpers
 
+    private func timeoutPromptNotificationID(for sessionID: UUID) -> String {
+        "session_timeout_prompt_\(sessionID.uuidString)"
+    }
+
+    private func sessionCompletedNotificationID(for sessionID: UUID) -> String {
+        "session_completed_\(sessionID.uuidString)"
+    }
+
     private func hasActiveTimeoutPrompt(for sessionID: UUID, type: SessionTimeoutType) -> Bool {
         sessionTimeoutPrompts.contains { $0.sessionID == sessionID && $0.type == type }
     }
@@ -2033,7 +2066,8 @@ final class MonitorStore {
         
         sendLocalNotification(
             title: "\(session.portName) \(title)",
-            body: "\(desc)，将在 \(countdown) 秒后自动结束记录。点击可在应用内取消。"
+            body: "\(desc)，将在 \(countdown) 秒后自动结束记录。点击可在应用内取消。",
+            identifier: timeoutPromptNotificationID(for: session.id)
         )
     }
 
@@ -2050,9 +2084,13 @@ final class MonitorStore {
                     let reason = prompt.type == .maxDuration ? "max_duration_exceeded" : "trickle_timeout_exceeded"
                     end(session, at: now, reason: reason)
                     didMutate = true
+                    
+                    // 倒计时结束会话已完成，移除原提示通知，发送单条完成通知，防止通知中心重复堆叠
+                    removeLocalNotification(identifier: timeoutPromptNotificationID(for: prompt.sessionID))
                     sendLocalNotification(
                         title: "充电记录已自动结束",
-                        body: "\(prompt.portName) 倒计时结束，会话已自动完成。"
+                        body: "\(prompt.portName) 倒计时结束，会话已自动完成。",
+                        identifier: sessionCompletedNotificationID(for: prompt.sessionID)
                     )
                 }
             } else {
@@ -2069,25 +2107,32 @@ final class MonitorStore {
 
     public func extendSessionTimeoutPrompt(_ prompt: SessionTimeoutPrompt) {
         sessionTimeoutPrompts.removeAll { $0.id == prompt.id }
+        removeLocalNotification(identifier: timeoutPromptNotificationID(for: prompt.sessionID))
         diagnosticLog.record("session_timeout_extended", metadata: ["session": prompt.sessionID.uuidString])
     }
 
     public func stopSessionFromPrompt(_ prompt: SessionTimeoutPrompt) {
         sessionTimeoutPrompts.removeAll { $0.id == prompt.id }
+        removeLocalNotification(identifier: timeoutPromptNotificationID(for: prompt.sessionID))
         if let session = fetchSession(id: prompt.sessionID), session.endedAt == nil {
             let reason = prompt.type == .maxDuration ? "max_duration_user_stopped" : "trickle_user_stopped"
             end(session, at: Date(), reason: reason)
+            sendLocalNotification(
+                title: "充电记录已结束",
+                body: "\(prompt.portName) 会话已按要求停止并保存完整数据。",
+                identifier: sessionCompletedNotificationID(for: prompt.sessionID)
+            )
         }
     }
 
-    private func sendLocalNotification(title: String, body: String) {
+    private func sendLocalNotification(title: String, body: String, identifier: String? = nil) {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
         content.sound = .default
         
         let request = UNNotificationRequest(
-            identifier: UUID().uuidString,
+            identifier: identifier ?? UUID().uuidString,
             content: content,
             trigger: nil // immediate deliver
         )
@@ -2097,6 +2142,11 @@ final class MonitorStore {
                 self.logger.error("Failed to post local notification: \(error.localizedDescription)")
             }
         }
+    }
+
+    private func removeLocalNotification(identifier: String) {
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [identifier])
+        UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [identifier])
     }
 
     private func trimTrailingZeroSamples(for session: ChargingSession) {
@@ -2139,9 +2189,18 @@ final class MonitorStore {
         trimTrailingZeroSamples(for: session)
         session.endedAt = date
         session.endReason = reason
-        activeSessions.removeValue(forKey: sessionKey(deviceID: session.deviceID, port: session.portIndex))
+        let key = sessionKey(deviceID: session.deviceID, port: session.portIndex)
+        activeSessions.removeValue(forKey: key)
         if lowPowerSessionPrompt?.id == session.id {
             lowPowerSessionPrompt = nil
+        }
+        // 如果结束原因不是物理拔出断开（例如涓流超时、最大时长、用户手动停止等），
+        // 且非 0 号 ADB 独立虚拟监视会话，则在同一次拔插周期内记住已结束状态，防止死循环重新开启
+        if !session.isStandaloneBatterySession && session.portIndex != 0 {
+            if reason != "device_disconnected" && reason != "device_disconnected_sweep" && reason != "superseded_by_new_session" {
+                cycleFinishedKeys.insert(key)
+                logger.info("cycle_finished port=\(session.portIndex, privacy: .public) reason=\(reason, privacy: .public)")
+            }
         }
         updateActiveChargingSessions()
         if let idx = sessionRowDataList.firstIndex(where: { $0.id == session.id }) {

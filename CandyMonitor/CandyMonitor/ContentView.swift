@@ -2217,6 +2217,29 @@ private struct PortDetailSheet: View {
                             PortDetailMetric(title: "端口", value: port.port.connectorType.uppercased())
                             PortDetailMetric(title: "充电时长(min)", value: sessionDurationText)
                         }
+
+                        if port.isCycleFinished {
+                            Divider()
+                            HStack(spacing: 12) {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundStyle(CandyTheme.mint)
+                                    .font(.system(size: 18))
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("当前拔插周期已结束记录")
+                                        .font(.subheadline.weight(.semibold))
+                                    Text("设备充满后已保持静默供电，不重复记录或弹窗；拔插后将自动重置，亦可立即手动开启新会话。")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Button("开始新记录") {
+                                    store.startSession(for: port.port.index)
+                                }
+                                .buttonStyle(SoftButtonStyle(prominent: true))
+                                .controlSize(.small)
+                            }
+                            .padding(.top, 4)
+                        }
                     }
 
                     sectionHeader("\(portTitle) 兼容协议")
@@ -4012,7 +4035,7 @@ private struct SettingsView: View {
                             }
                         }
 
-                        SettingsCard(title: "记录行为", icon: "record.circle", subtitle: "接入负载并开始输出功率时自动生成会话；支持长时间超时告警与涓流自动结束。") {
+                        SettingsCard(title: "记录行为", icon: "record.circle", subtitle: "接入负载并开始输出功率时自动生成会话；支持超时告警与涓流自动结束，同一拔插周期结束记录后将保持静默。") {
                             LabeledContent("实时采样") {
                                 Text("前台 1 秒")
                                     .foregroundStyle(.secondary)

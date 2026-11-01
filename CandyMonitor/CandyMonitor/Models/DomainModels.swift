@@ -855,6 +855,7 @@ struct PortViewState: Identifiable, Hashable {
     var pdStatus: PDPortStatus?
     var charging: Bool
     var boundADBDevice: ADBDevice? = nil
+    var isCycleFinished: Bool = false
 
     var id: Int { port.index }
 
@@ -926,6 +927,9 @@ struct PortViewState: Identifiable, Hashable {
     var portSwitchState: Bool? { detail?.enable }
     var chargeStateLabel: String {
         guard connected else { return "未接入" }
+        if isCycleFinished {
+            return powerW > 0.5 ? "静默供电" : "记录已完成"
+        }
         return powerW > 0.5 ? "正在供电" : "已接入"
     }
     var connected: Bool { charging || detail?.connected == true }
