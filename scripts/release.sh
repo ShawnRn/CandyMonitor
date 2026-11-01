@@ -23,7 +23,7 @@ DMG_X86_64="$RELEASE_DIR/CandyMonitor_${VERSION}_x86_64.dmg"
 # 定位签名工具。允许通过环境变量覆盖，默认从当前 DerivedData 中查找。
 SIGN_TOOL="${SIGN_TOOL:-}"
 if [ -z "$SIGN_TOOL" ]; then
-    SIGN_TOOL=$(find "$HOME/Library/Developer/Xcode/DerivedData" -path "*/SourcePackages/artifacts/sparkle/Sparkle/bin/sign_update" -type f 2>/dev/null | head -n 1 || true)
+    SIGN_TOOL=$(find -L "$HOME/Library/Developer/Xcode/DerivedData" -path "*/SourcePackages/artifacts/sparkle/Sparkle/bin/sign_update" -type f 2>/dev/null | head -n 1 || true)
 fi
 if [ -z "$SIGN_TOOL" ] || [ ! -x "$SIGN_TOOL" ]; then
     echo "错误: 找不到 Sparkle sign_update。请先构建项目或设置 SIGN_TOOL=/path/to/sign_update"
